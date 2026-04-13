@@ -1,8 +1,8 @@
 //! Pipe and dup test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona_posix::proc as posix;
 use trona::serial;
+use trona_posix::proc as posix;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -160,16 +160,24 @@ fn test_dup2() -> bool {
 
 pub fn run() -> bool {
     puts(b"  [test_pipe] basic pipe r/w...\n");
-    if !test_basic_pipe() { return false; }
+    if !test_basic_pipe() {
+        return false;
+    }
 
     puts(b"  [test_pipe] EOF on close...\n");
-    if !test_pipe_eof() { return false; }
+    if !test_pipe_eof() {
+        return false;
+    }
 
     puts(b"  [test_pipe] dup...\n");
-    if !test_dup() { return false; }
+    if !test_dup() {
+        return false;
+    }
 
     puts(b"  [test_pipe] dup2...\n");
-    if !test_dup2() { return false; }
+    if !test_dup2() {
+        return false;
+    }
 
     true
 }

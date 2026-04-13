@@ -34,6 +34,10 @@ unsafe extern "C" fn sigchld_handler(_sig: i32) {
 pub fn run() -> bool {
     puts(b"[TEST_SIGNAL] Starting signal tests\n");
 
+    let mut restore_sigusr1 = SIG_DFL;
+    let mut restore_sigusr2 = SIG_DFL;
+    let mut restore_sigchld = SIG_DFL;
+
     let my_pid = unsafe { trona_posix::posix_getpid() };
     if my_pid <= 0 {
         puts(b"[TEST_SIGNAL] FAIL: getpid\n");
@@ -48,6 +52,7 @@ pub fn run() -> bool {
         puts(b"[TEST_SIGNAL] FAIL: posix_signal returned SIG_ERR\n");
         return false;
     }
+    restore_sigusr1 = old;
 
     if unsafe { trona_posix::posix_kill(my_pid, SIGUSR1) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill self SIGUSR1\n");
@@ -73,6 +78,7 @@ pub fn run() -> bool {
         puts(b"[TEST_SIGNAL] FAIL: posix_signal SIGUSR2 SIG_IGN\n");
         return false;
     }
+    restore_sigusr2 = old;
 
     if unsafe { trona_posix::posix_kill(my_pid, SIGUSR2) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill self SIGUSR2\n");
@@ -126,6 +132,7 @@ pub fn run() -> bool {
         puts(b"[TEST_SIGNAL] FAIL: posix_signal SIGCHLD\n");
         return false;
     }
+    restore_sigchld = old;
 
     let child2_pid = trona_posix::posix_fork();
     if child2_pid < 0 {
@@ -229,7 +236,8 @@ pub fn run() -> bool {
 
     // Verify child is stopped via WUNTRACED
     let mut status8: i32 = 0;
-    let ret8 = unsafe { trona_posix::posix_waitpid3(child8_pid, &raw mut status8, WNOHANG as i32 | 2) }; // 2 = WUNTRACED
+    let ret8 =
+        unsafe { trona_posix::posix_waitpid3(child8_pid, &raw mut status8, WNOHANG as i32 | 2) }; // 2 = WUNTRACED
     if ret8 != child8_pid || !wifstopped(status8) {
         puts(b"[TEST_SIGNAL] FAIL: child not reported as stopped\n");
         return false;
@@ -269,6 +277,19 @@ pub fn run() -> bool {
         return false;
     }
     puts(b"[TEST_SIGNAL] Test 9: PASS\n");
+
+    if unsafe { signals::posix_signal(SIGUSR1, restore_sigusr1) } == usize::MAX {
+        puts(b"[TEST_SIGNAL] FAIL: restore SIGUSR1\n");
+        return false;
+    }
+    if unsafe { signals::posix_signal(SIGUSR2, restore_sigusr2) } == usize::MAX {
+        puts(b"[TEST_SIGNAL] FAIL: restore SIGUSR2\n");
+        return false;
+    }
+    if unsafe { signals::posix_signal(SIGCHLD, restore_sigchld) } == usize::MAX {
+        puts(b"[TEST_SIGNAL] FAIL: restore SIGCHLD\n");
+        return false;
+    }
 
     puts(b"[TEST_SIGNAL] All signal tests passed!\n");
     true

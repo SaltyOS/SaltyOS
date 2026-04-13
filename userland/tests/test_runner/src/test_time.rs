@@ -1,9 +1,9 @@
 //! Time API test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona_posix::proc as posix;
 use trona::serial;
 use trona::types::core::Timespec;
+use trona_posix::proc as posix;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -39,7 +39,13 @@ fn test_clock_monotonic() -> bool {
         return false;
     }
 
-    { let mut lb = serial::LineBuf::new(); lb.str(b"  time advanced by "); lb.dec(ns2 - ns1); lb.str(b" ns\n"); lb.flush(); }
+    {
+        let mut lb = serial::LineBuf::new();
+        lb.str(b"  time advanced by ");
+        lb.dec(ns2 - ns1);
+        lb.str(b" ns\n");
+        lb.flush();
+    }
     true
 }
 
@@ -50,7 +56,10 @@ fn test_nanosleep() -> bool {
 
     unsafe { trona_posix::posix_clock_gettime(0, &raw mut before) };
 
-    let req = Timespec { tv_sec: 0, tv_nsec: 50_000_000 }; // 50ms
+    let req = Timespec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    }; // 50ms
     let ret = unsafe { trona_posix::posix_nanosleep(&raw const req, core::ptr::null_mut()) };
     if ret != 0 {
         puts(b"  nanosleep failed\n");
@@ -78,10 +87,14 @@ fn test_nanosleep() -> bool {
 
 pub fn run() -> bool {
     puts(b"  [test_time] clock monotonicity...\n");
-    if !test_clock_monotonic() { return false; }
+    if !test_clock_monotonic() {
+        return false;
+    }
 
     puts(b"  [test_time] nanosleep 50ms...\n");
-    if !test_nanosleep() { return false; }
+    if !test_nanosleep() {
+        return false;
+    }
 
     true
 }

@@ -9,8 +9,6 @@ use trona::serial::LineBuf;
 use trona_posix;
 use trona_posix::mm as posix_mm;
 
-const CAP_MMSRV_EP: u64 = 7;
-
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -23,10 +21,8 @@ fn ensure_tmp_dir() -> bool {
 pub fn run() -> bool {
     puts(b"[TEST_MMAP] Starting memory management tests\n");
 
-    // Initialize posix_mm with the mmsrv endpoint (slot 7)
-    unsafe {
-        posix_mm::posix_mm_init(CAP_MMSRV_EP);
-    }
+    // posix_mm reads mmsrv via trona::caps::mmsrv_ep() now — no explicit
+    // init call needed here.
 
     // Test 1: sbrk
     puts(b"[TEST_MMAP] Test 1: sbrk(4096)\n");
@@ -35,14 +31,22 @@ pub fn run() -> bool {
         puts(b"[TEST_MMAP] FAIL: sbrk returned -1\n");
         return false;
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_MMAP] sbrk returned: "); lb.hex(old_brk); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_MMAP] sbrk returned: ");
+        lb.hex(old_brk);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     // Write and read back
     unsafe {
         let heap = old_brk as *mut u8;
         core::ptr::write_volatile(heap, 0xAA);
         core::ptr::write_volatile(heap.add(4095), 0xBB);
-        if core::ptr::read_volatile(heap) != 0xAA || core::ptr::read_volatile(heap.add(4095)) != 0xBB {
+        if core::ptr::read_volatile(heap) != 0xAA
+            || core::ptr::read_volatile(heap.add(4095)) != 0xBB
+        {
             puts(b"[TEST_MMAP] FAIL: heap read-back mismatch\n");
             return false;
         }
@@ -73,7 +77,13 @@ pub fn run() -> bool {
         puts(b"[TEST_MMAP] FAIL: mmap returned MAP_FAILED\n");
         return false;
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_MMAP] mmap returned: "); lb.hex(page as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_MMAP] mmap returned: ");
+        lb.hex(page as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     // Verify zero-initialized
     unsafe {
@@ -182,26 +192,23 @@ pub fn run() -> bool {
     for i in 0..page_buf.len() {
         page_buf[i] = (i & 0xFF) as u8;
     }
-    let written = unsafe { trona_posix::posix_pwrite(fd, page_buf.as_ptr(), page_buf.len() as u64, 0) };
+    let written =
+        unsafe { trona_posix::posix_pwrite(fd, page_buf.as_ptr(), page_buf.len() as u64, 0) };
     if written != page_buf.len() as i64 {
         puts(b"[TEST_MMAP] FAIL: seed pwrite returned wrong count\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
 
-    let file_map = unsafe {
-        posix_mm::posix_mmap(
-            core::ptr::null_mut(),
-            4096,
-            PROT_READ,
-            MAP_PRIVATE,
-            fd,
-            0,
-        )
-    };
+    let file_map =
+        unsafe { posix_mm::posix_mmap(core::ptr::null_mut(), 4096, PROT_READ, MAP_PRIVATE, fd, 0) };
     if file_map as usize == usize::MAX {
         puts(b"[TEST_MMAP] FAIL: file-backed MAP_PRIVATE mmap failed\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
     unsafe {
@@ -232,7 +239,9 @@ pub fn run() -> bool {
     };
     if shared_map as usize == usize::MAX {
         puts(b"[TEST_MMAP] FAIL: file-backed MAP_SHARED mmap failed\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
     unsafe {
@@ -250,19 +259,25 @@ pub fn run() -> bool {
     let rd10 = unsafe { trona_posix::posix_pread(fd, byte.as_mut_ptr(), 1, 10) };
     if rd10 != 1 || byte[0] != 0xA1 {
         puts(b"[TEST_MMAP] FAIL: writeback byte 10 mismatch\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
     let rd2048 = unsafe { trona_posix::posix_pread(fd, byte.as_mut_ptr(), 1, 2048) };
     if rd2048 != 1 || byte[0] != 0xB2 {
         puts(b"[TEST_MMAP] FAIL: writeback byte 2048 mismatch\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
     let rd4095 = unsafe { trona_posix::posix_pread(fd, byte.as_mut_ptr(), 1, 4095) };
     if rd4095 != 1 || byte[0] != 0xC3 {
         puts(b"[TEST_MMAP] FAIL: writeback byte 4095 mismatch\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
     puts(b"[TEST_MMAP] PASS: file-backed MAP_SHARED writeback OK\n");
@@ -281,7 +296,9 @@ pub fn run() -> bool {
     };
     if fixed_base as usize == usize::MAX {
         puts(b"[TEST_MMAP] FAIL: anonymous mmap for MAP_FIXED failed\n");
-        unsafe { trona_posix::posix_close(fd); }
+        unsafe {
+            trona_posix::posix_close(fd);
+        }
         return false;
     }
 
@@ -290,14 +307,7 @@ pub fn run() -> bool {
     }
 
     let replaced = unsafe {
-        posix_mm::posix_mmap(
-            fixed_base,
-            4096,
-            PROT_READ,
-            MAP_PRIVATE | MAP_FIXED,
-            fd,
-            0,
-        )
+        posix_mm::posix_mmap(fixed_base, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0)
     };
     if replaced != fixed_base {
         puts(b"[TEST_MMAP] FAIL: MAP_FIXED did not preserve requested base\n");
@@ -348,7 +358,9 @@ pub fn run() -> bool {
     }
     if unsafe { trona_posix::posix_pwrite(fd_fixed, fill_page.as_ptr(), 4096, 0) } != 4096 {
         puts(b"[TEST_MMAP] FAIL: seed page 0 failed\n");
-        unsafe { trona_posix::posix_close(fd_fixed); }
+        unsafe {
+            trona_posix::posix_close(fd_fixed);
+        }
         return false;
     }
     for byte in &mut fill_page {
@@ -356,7 +368,9 @@ pub fn run() -> bool {
     }
     if unsafe { trona_posix::posix_pwrite(fd_fixed, fill_page.as_ptr(), 4096, 4096) } != 4096 {
         puts(b"[TEST_MMAP] FAIL: seed page 1 failed\n");
-        unsafe { trona_posix::posix_close(fd_fixed); }
+        unsafe {
+            trona_posix::posix_close(fd_fixed);
+        }
         return false;
     }
     for byte in &mut fill_page {
@@ -364,7 +378,9 @@ pub fn run() -> bool {
     }
     if unsafe { trona_posix::posix_pwrite(fd_fixed, fill_page.as_ptr(), 4096, 8192) } != 4096 {
         puts(b"[TEST_MMAP] FAIL: seed page 2 failed\n");
-        unsafe { trona_posix::posix_close(fd_fixed); }
+        unsafe {
+            trona_posix::posix_close(fd_fixed);
+        }
         return false;
     }
 
@@ -380,7 +396,9 @@ pub fn run() -> bool {
     };
     if span as usize == usize::MAX {
         puts(b"[TEST_MMAP] FAIL: 3-page anonymous span mmap failed\n");
-        unsafe { trona_posix::posix_close(fd_fixed); }
+        unsafe {
+            trona_posix::posix_close(fd_fixed);
+        }
         return false;
     }
 
@@ -480,7 +498,8 @@ pub fn run() -> bool {
         }
         return false;
     }
-    let rd_head_last = unsafe { trona_posix::posix_pread(fd_fixed, byte.as_mut_ptr(), 1, 8192 + 4095) };
+    let rd_head_last =
+        unsafe { trona_posix::posix_pread(fd_fixed, byte.as_mut_ptr(), 1, 8192 + 4095) };
     if rd_head_last != 1 || byte[0] != 0xE2 {
         puts(b"[TEST_MMAP] FAIL: MAP_SHARED replacement writeback last byte mismatch\n");
         unsafe {

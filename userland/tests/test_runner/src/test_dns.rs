@@ -16,9 +16,40 @@ pub fn run() -> bool {
     serial::serial_puts(b"[TEST_DNS] Starting DNS tests\n");
     let mut all_pass = true;
 
+    // Warmup: DHCP completion in netsrv races dnssrv's readiness signal, so
+    // the first resolve can return 0 spuriously before a route is installed.
+    // Poll google.com up to 30 * 500ms = 15s. Failure here is reported as a
+    // hard failure (not silently skipped) so network/dnssrv regressions are
+    // visible.
+    {
+        let req = Timespec {
+            tv_sec: 0,
+            tv_nsec: 500_000_000,
+        };
+        let mut warmed_up = false;
+        for _ in 0..30 {
+            // SAFETY: IPC context is initialized; dnssrv endpoint is
+            // resolved via namesrv lookup inside dns_resolve.
+            let ip = unsafe { trona_posix::dns::dns_resolve(b"google.com") };
+            if ip != 0 {
+                warmed_up = true;
+                break;
+            }
+            // SAFETY: req is a valid Timespec and rem is null.
+            unsafe {
+                let _ = trona_posix::posix_nanosleep(&raw const req, core::ptr::null_mut());
+            }
+        }
+        if !warmed_up {
+            serial::serial_puts(b"  dns: warmup failed -- network/dnssrv unresponsive\n");
+            return false;
+        }
+    }
+
     // Test 1: Resolve "google.com" (should succeed via QEMU DNS forwarder)
     {
-        // SAFETY: IPC context is initialized; dnssrv endpoint at slot 64.
+        // SAFETY: IPC context is initialized; dnssrv endpoint is resolved
+        // via namesrv lookup inside `trona_posix::dns::dns_resolve`.
         let ip = unsafe { trona_posix::dns::dns_resolve(b"google.com") };
         if ip != 0 {
             let mut lb = LineBuf::new();
@@ -40,7 +71,8 @@ pub fn run() -> bool {
 
     // Test 2: Resolve "nonexistent.invalid" (should fail with NXDOMAIN)
     {
-        // SAFETY: IPC context is initialized; dnssrv endpoint at slot 64.
+        // SAFETY: IPC context is initialized; dnssrv endpoint is resolved
+        // via namesrv lookup inside `trona_posix::dns::dns_resolve`.
         let ip = unsafe { trona_posix::dns::dns_resolve(b"nonexistent.invalid") };
         if ip == 0 {
             serial::serial_puts(b"  dns: NXDOMAIN test passed\n");
@@ -52,7 +84,8 @@ pub fn run() -> bool {
 
     // Test 3: Cache test (resolve same hostname twice, second should be cached)
     {
-        // SAFETY: IPC context is initialized; dnssrv endpoint at slot 64.
+        // SAFETY: IPC context is initialized; dnssrv endpoint is resolved
+        // via namesrv lookup inside `trona_posix::dns::dns_resolve`.
         let ip1 = unsafe { trona_posix::dns::dns_resolve(b"example.com") };
         let ip2 = unsafe { trona_posix::dns::dns_resolve(b"example.com") };
         if ip1 != 0 && ip1 == ip2 {
@@ -84,14 +117,14 @@ pub fn run() -> bool {
     // Test 5: Reverse DNS lookup
     {
         // Resolve google.com first, then do reverse lookup on the IP
-        // SAFETY: IPC context is initialized; dnssrv endpoint at slot 64.
+        // SAFETY: IPC context is initialized; dnssrv endpoint is resolved
+        // via namesrv lookup inside `trona_posix::dns::dns_resolve`.
         let ip = unsafe { trona_posix::dns::dns_resolve(b"google.com") };
         if ip != 0 {
             let mut hostname = [0u8; 128];
             // SAFETY: hostname buffer is valid and large enough.
-            let len = unsafe {
-                trona_posix::dns::dns_reverse_lookup(ip, hostname.as_mut_ptr(), 128)
-            };
+            let len =
+                unsafe { trona_posix::dns::dns_reverse_lookup(ip, hostname.as_mut_ptr(), 128) };
             if len > 0 {
                 let mut lb = LineBuf::new();
                 lb.str(b"  dns: reverse lookup -> ");

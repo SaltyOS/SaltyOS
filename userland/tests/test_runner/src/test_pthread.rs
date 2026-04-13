@@ -1,12 +1,13 @@
 //! Pthreads test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::serial;
-use trona_posix::pthread;
-use trona_posix::sync;
-use trona_posix::tls;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use trona::consts::kernel::*;
+use trona::consts::server::TRONA_TIMED_OUT;
+use trona::serial;
+use trona::sync;
+use trona_posix::pthread;
+use trona_posix::tls;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -80,12 +81,8 @@ fn test_detach() -> bool {
         return false;
     }
 
-    // Give the detached thread a chance to finish
-    for _ in 0..100 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-
-    // Join should fail on a detached thread
+    // Join on a detached thread must fail regardless of whether the thread
+    // has finished — no synchronization/delay required.
     let ret = unsafe { pthread::pthread_join(handle, core::ptr::null_mut()) };
     if ret == 0 {
         puts(b"  join on detached should fail\n");
@@ -119,14 +116,24 @@ fn test_mutex_normal() -> bool {
     let mut t2: pthread::PthreadT = 0;
 
     let ret = unsafe {
-        pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_increment, core::ptr::null_mut())
+        pthread::pthread_create(
+            &raw mut t1,
+            core::ptr::null(),
+            thread_increment,
+            core::ptr::null_mut(),
+        )
     };
     if ret != 0 {
         puts(b"  create t1 failed\n");
         return false;
     }
     let ret = unsafe {
-        pthread::pthread_create(&raw mut t2, core::ptr::null(), thread_increment, core::ptr::null_mut())
+        pthread::pthread_create(
+            &raw mut t2,
+            core::ptr::null(),
+            thread_increment,
+            core::ptr::null_mut(),
+        )
     };
     if ret != 0 {
         puts(b"  create t2 failed\n");
@@ -160,26 +167,26 @@ fn test_mutex_recursive() -> bool {
     let mut mtx = sync::TypedMutex::new(sync::MUTEX_RECURSIVE);
 
     let ret = mtx.lock();
-    if ret != 0 {
+    if ret != TRONA_OK {
         puts(b"  first lock failed\n");
         return false;
     }
 
     // Second lock should succeed (recursive)
     let ret = mtx.lock();
-    if ret != 0 {
+    if ret != TRONA_OK {
         puts(b"  second (recursive) lock failed\n");
         return false;
     }
 
     let ret = mtx.unlock();
-    if ret != 0 {
+    if ret != TRONA_OK {
         puts(b"  first unlock failed\n");
         return false;
     }
 
     let ret = mtx.unlock();
-    if ret != 0 {
+    if ret != TRONA_OK {
         puts(b"  second unlock failed\n");
         return false;
     }
@@ -201,12 +208,12 @@ fn test_mutex_errorcheck() -> bool {
         return false;
     }
 
-    // Second lock should return EDEADLK (35)
+    // Second lock should return TRONA_DEADLOCK
     let ret = mtx.lock();
-    if ret != 35 {
+    if ret != TRONA_DEADLOCK {
         let mut lb = serial::LineBuf::new();
-        lb.str(b"  expected EDEADLK(35), got ");
-        lb.dec(ret as u64);
+        lb.str(b"  expected TRONA_DEADLOCK, got ");
+        lb.dec(ret);
         lb.str(b"\n");
         lb.flush();
         // Unlock to avoid deadlock in test
@@ -216,7 +223,7 @@ fn test_mutex_errorcheck() -> bool {
 
     // Unlock by owner should succeed
     let ret = mtx.unlock();
-    if ret != 0 {
+    if ret != TRONA_OK {
         puts(b"  owner unlock failed\n");
         return false;
     }
@@ -234,11 +241,11 @@ static CV_COND: sync::Condvar = sync::Condvar::new();
 static CV_READY: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "C" fn thread_producer(_arg: *mut u8) -> *mut u8 {
-    // Yield a few times to let consumer get set up
-    for _ in 0..10 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-
+    // The main thread (consumer) holds CV_MUTEX at the time this producer
+    // is spawned, so this lock() blocks until the consumer calls
+    // CV_COND.wait() — which atomically releases the mutex. Acquiring the
+    // lock here is therefore a deterministic signal that the consumer is
+    // inside cond.wait, with no sleep/yield assumptions.
     CV_MUTEX.lock();
     CV_READY.store(1, Ordering::Release);
     CV_COND.signal();
@@ -250,17 +257,27 @@ unsafe extern "C" fn thread_producer(_arg: *mut u8) -> *mut u8 {
 fn test_condvar_signal() -> bool {
     CV_READY.store(0, Ordering::Relaxed);
 
+    // Acquire the mutex BEFORE spawning the producer. The producer's first
+    // action is CV_MUTEX.lock(), so it will block until we enter
+    // CV_COND.wait() below. This forces the test to exercise the cond.wait
+    // path deterministically, independent of scheduling order.
+    CV_MUTEX.lock();
+
     let mut producer: pthread::PthreadT = 0;
     let ret = unsafe {
-        pthread::pthread_create(&raw mut producer, core::ptr::null(), thread_producer, core::ptr::null_mut())
+        pthread::pthread_create(
+            &raw mut producer,
+            core::ptr::null(),
+            thread_producer,
+            core::ptr::null_mut(),
+        )
     };
     if ret != 0 {
+        CV_MUTEX.unlock();
         puts(b"  create producer failed\n");
         return false;
     }
 
-    // Consumer waits
-    CV_MUTEX.lock();
     while CV_READY.load(Ordering::Acquire) == 0 {
         CV_COND.wait(&CV_MUTEX);
     }
@@ -289,9 +306,16 @@ static BC_MUTEX: sync::Mutex = sync::Mutex::new();
 static BC_COND: sync::Condvar = sync::Condvar::new();
 static BC_FLAG: AtomicU32 = AtomicU32::new(0);
 static BC_WOKEN: AtomicU32 = AtomicU32::new(0);
+// Incremented by each waiter under BC_MUTEX, used by the broadcaster to
+// observe that all waiters have entered the critical region.
+static BC_WAITERS_ENTERED: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "C" fn thread_bc_waiter(_arg: *mut u8) -> *mut u8 {
     BC_MUTEX.lock();
+    // Serialized under BC_MUTEX: once the counter reaches 3, every waiter
+    // has passed this point. The last waiter to increment will release
+    // BC_MUTEX via BC_COND.wait, letting main acquire it.
+    BC_WAITERS_ENTERED.fetch_add(1, Ordering::Release);
     while BC_FLAG.load(Ordering::Acquire) == 0 {
         BC_COND.wait(&BC_MUTEX);
     }
@@ -303,19 +327,38 @@ unsafe extern "C" fn thread_bc_waiter(_arg: *mut u8) -> *mut u8 {
 fn test_condvar_broadcast() -> bool {
     BC_FLAG.store(0, Ordering::Relaxed);
     BC_WOKEN.store(0, Ordering::Relaxed);
+    BC_WAITERS_ENTERED.store(0, Ordering::Relaxed);
 
     let mut t1: pthread::PthreadT = 0;
     let mut t2: pthread::PthreadT = 0;
     let mut t3: pthread::PthreadT = 0;
 
     unsafe {
-        pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_bc_waiter, core::ptr::null_mut());
-        pthread::pthread_create(&raw mut t2, core::ptr::null(), thread_bc_waiter, core::ptr::null_mut());
-        pthread::pthread_create(&raw mut t3, core::ptr::null(), thread_bc_waiter, core::ptr::null_mut());
+        pthread::pthread_create(
+            &raw mut t1,
+            core::ptr::null(),
+            thread_bc_waiter,
+            core::ptr::null_mut(),
+        );
+        pthread::pthread_create(
+            &raw mut t2,
+            core::ptr::null(),
+            thread_bc_waiter,
+            core::ptr::null_mut(),
+        );
+        pthread::pthread_create(
+            &raw mut t3,
+            core::ptr::null(),
+            thread_bc_waiter,
+            core::ptr::null_mut(),
+        );
     }
 
-    // Let waiters block
-    for _ in 0..50 {
+    // Wait until all three waiters have entered the critical region. The
+    // subsequent BC_MUTEX.lock() then blocks until the last waiter has
+    // released the mutex via BC_COND.wait — a deterministic rendezvous
+    // that does not depend on fixed yield counts.
+    while BC_WAITERS_ENTERED.load(Ordering::Acquire) < 3 {
         trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
@@ -357,10 +400,10 @@ fn test_condvar_timedwait() -> bool {
     let ret = cv.wait_timeout(&mtx, 50_000_000);
     mtx.unlock();
 
-    if ret != 110 {
+    if ret != TRONA_TIMED_OUT {
         let mut lb = serial::LineBuf::new();
-        lb.str(b"  expected ETIMEDOUT(110), got ");
-        lb.dec(ret as u64);
+        lb.str(b"  expected TRONA_TIMED_OUT, got ");
+        lb.dec(ret);
         lb.str(b"\n");
         lb.flush();
         return false;
@@ -387,7 +430,10 @@ unsafe extern "C" fn thread_reader(_arg: *mut u8) -> *mut u8 {
         if concurrent <= max {
             break;
         }
-        if RW_MAX_CONCURRENT.compare_exchange_weak(max, concurrent, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if RW_MAX_CONCURRENT
+            .compare_exchange_weak(max, concurrent, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
             break;
         }
     }
@@ -408,7 +454,12 @@ fn test_rwlock() -> bool {
 
     for i in 0..3 {
         let ret = unsafe {
-            pthread::pthread_create(&raw mut handles[i], core::ptr::null(), thread_reader, core::ptr::null_mut())
+            pthread::pthread_create(
+                &raw mut handles[i],
+                core::ptr::null(),
+                thread_reader,
+                core::ptr::null_mut(),
+            )
         };
         if ret != 0 {
             puts(b"  create reader failed\n");
@@ -417,7 +468,9 @@ fn test_rwlock() -> bool {
     }
 
     for i in 0..3 {
-        unsafe { pthread::pthread_join(handles[i], core::ptr::null_mut()); }
+        unsafe {
+            pthread::pthread_join(handles[i], core::ptr::null_mut());
+        }
     }
 
     // Write lock should be exclusive
@@ -452,8 +505,18 @@ fn test_barrier() -> bool {
     let mut t2: pthread::PthreadT = 0;
 
     unsafe {
-        pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_barrier_worker, core::ptr::null_mut());
-        pthread::pthread_create(&raw mut t2, core::ptr::null(), thread_barrier_worker, core::ptr::null_mut());
+        pthread::pthread_create(
+            &raw mut t1,
+            core::ptr::null(),
+            thread_barrier_worker,
+            core::ptr::null_mut(),
+        );
+        pthread::pthread_create(
+            &raw mut t2,
+            core::ptr::null(),
+            thread_barrier_worker,
+            core::ptr::null_mut(),
+        );
     }
 
     // Main thread is the 3rd barrier participant
@@ -489,12 +552,20 @@ fn test_barrier() -> bool {
 // =========================================================================
 
 static CANCEL_CLEANUP_RAN: AtomicU32 = AtomicU32::new(0);
+// Posted by the cancellable thread on entry so the main thread can
+// deterministically observe that the thread has actually started before
+// issuing pthread_cancel.
+static SEM_CANCEL_STARTED: sync::Semaphore = sync::Semaphore::new(0);
 
 unsafe extern "C" fn cancel_cleanup_handler(_arg: *mut u8) {
     CANCEL_CLEANUP_RAN.store(1, Ordering::Release);
 }
 
 unsafe extern "C" fn thread_cancellable(_arg: *mut u8) -> *mut u8 {
+    // Announce entry before any other work so the main thread's
+    // SEM_CANCEL_STARTED.wait() can proceed as soon as we are scheduled.
+    SEM_CANCEL_STARTED.post();
+
     // Push cleanup handler (stored on stack)
     let mut handler = tls::CleanupHandler {
         routine: cancel_cleanup_handler,
@@ -519,17 +590,20 @@ fn test_cancel() -> bool {
 
     let mut handle: pthread::PthreadT = 0;
     let ret = unsafe {
-        pthread::pthread_create(&raw mut handle, core::ptr::null(), thread_cancellable, core::ptr::null_mut())
+        pthread::pthread_create(
+            &raw mut handle,
+            core::ptr::null(),
+            thread_cancellable,
+            core::ptr::null_mut(),
+        )
     };
     if ret != 0 {
         puts(b"  create cancellable thread failed\n");
         return false;
     }
 
-    // Let thread start
-    for _ in 0..20 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
+    // Wait for the thread to actually start executing.
+    SEM_CANCEL_STARTED.wait();
 
     // Cancel it
     let ret = unsafe { pthread::pthread_cancel(handle) };
@@ -538,11 +612,8 @@ fn test_cancel() -> bool {
         return false;
     }
 
-    // Let cancellation take effect
-    for _ in 0..50 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-
+    // pthread_join blocks until the thread has finished unwinding, so no
+    // additional delay is required for the cancellation to take effect.
     let mut retval: *mut u8 = core::ptr::null_mut();
     let ret = unsafe { pthread::pthread_join(handle, &raw mut retval) };
     if ret != 0 {
@@ -726,9 +797,16 @@ fn test_semaphore_basic() -> bool {
 
 static SEM_PROD: sync::Semaphore = sync::Semaphore::new(0);
 static SEM_RESULT: AtomicU32 = AtomicU32::new(0);
+// Posted by the consumer immediately before entering SEM_PROD.wait so the
+// main thread can observe that the consumer has reached the pre-wait
+// point without relying on timing.
+static SEM_CONSUMER_READY: sync::Semaphore = sync::Semaphore::new(0);
 
 unsafe extern "C" fn thread_sem_consumer(_arg: *mut u8) -> *mut u8 {
-    // Wait for the producer to post
+    // Signal main that we are about to block on SEM_PROD.wait. The
+    // ordering (post before wait) is what makes the main thread's
+    // "consumer is not done yet" assertion meaningful.
+    SEM_CONSUMER_READY.post();
     SEM_PROD.wait();
     SEM_RESULT.store(42, Ordering::Release);
     core::ptr::null_mut()
@@ -739,23 +817,29 @@ fn test_semaphore_producer_consumer() -> bool {
 
     let mut consumer: pthread::PthreadT = 0;
     let ret = unsafe {
-        pthread::pthread_create(&raw mut consumer, core::ptr::null(), thread_sem_consumer, core::ptr::null_mut())
+        pthread::pthread_create(
+            &raw mut consumer,
+            core::ptr::null(),
+            thread_sem_consumer,
+            core::ptr::null_mut(),
+        )
     };
     if ret != 0 {
         puts(b"  create consumer failed\n");
         return false;
     }
 
-    // Let consumer block on wait
-    for _ in 0..30 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
+    // Observe that the consumer has reached its pre-wait point.
+    SEM_CONSUMER_READY.wait();
 
-    // Consumer should still be waiting
+    // Consumer has not yet written SEM_RESULT — it is either about to
+    // enter SEM_PROD.wait or is already blocked in it.
     if SEM_RESULT.load(Ordering::Acquire) != 0 {
         puts(b"  consumer woke too early\n");
         SEM_PROD.post(); // unblock consumer so it can exit
-        unsafe { pthread::pthread_join(consumer, core::ptr::null_mut()); }
+        unsafe {
+            pthread::pthread_join(consumer, core::ptr::null_mut());
+        }
         return false;
     }
 
@@ -837,7 +921,10 @@ pub fn run() -> bool {
         (b"attr_stacksize", test_attr_stacksize),
         (b"rwlock_try", test_rwlock_try),
         (b"semaphore_basic", test_semaphore_basic),
-        (b"semaphore_producer_consumer", test_semaphore_producer_consumer),
+        (
+            b"semaphore_producer_consumer",
+            test_semaphore_producer_consumer,
+        ),
         (b"semaphore_trywait", test_semaphore_trywait),
     ];
 

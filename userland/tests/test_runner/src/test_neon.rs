@@ -89,7 +89,9 @@ fn test_neon_survives_fork() -> bool {
         if child_read == parent_val {
             puts(b"  NEON survives fork (child): OK\n");
             // SAFETY: Exiting the child process with success status.
-            unsafe { trona_posix::posix_exit(0); }
+            unsafe {
+                trona_posix::posix_exit(0);
+            }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  NEON survives fork (child): FAIL (expected ");
@@ -99,7 +101,9 @@ fn test_neon_survives_fork() -> bool {
             lb.str(b")\n");
             lb.flush();
             // SAFETY: Exiting the child process with failure status.
-            unsafe { trona_posix::posix_exit(1); }
+            unsafe {
+                trona_posix::posix_exit(1);
+            }
         }
     }
 
@@ -123,7 +127,9 @@ fn test_neon_survives_fork() -> bool {
     // Wait for child
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process we just forked. status pointer is valid.
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -337,7 +343,9 @@ fn test_neon_no_fpu_threads() -> bool {
             let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
         // SAFETY: Exiting the child process.
-        unsafe { trona_posix::posix_exit(0); }
+        unsafe {
+            trona_posix::posix_exit(0);
+        }
     }
 
     // Parent: yield to let child run (interleave context switches)
@@ -357,7 +365,9 @@ fn test_neon_no_fpu_threads() -> bool {
 
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process. status pointer is valid.
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -430,7 +440,9 @@ fn test_neon_heavy_context_switch() -> bool {
         if child_read == child_pattern {
             puts(b"  NEON heavy ctx switch (child): OK\n");
             // SAFETY: Exiting the child process with success status.
-            unsafe { trona_posix::posix_exit(0); }
+            unsafe {
+                trona_posix::posix_exit(0);
+            }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  NEON heavy ctx switch (child): FAIL (expected ");
@@ -440,7 +452,9 @@ fn test_neon_heavy_context_switch() -> bool {
             lb.str(b")\n");
             lb.flush();
             // SAFETY: Exiting the child process with failure status.
-            unsafe { trona_posix::posix_exit(1); }
+            unsafe {
+                trona_posix::posix_exit(1);
+            }
         }
     }
 
@@ -461,7 +475,9 @@ fn test_neon_heavy_context_switch() -> bool {
 
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process. status pointer is valid.
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_pattern {
         let mut lb = LineBuf::new();
@@ -481,10 +497,20 @@ fn test_neon_heavy_context_switch() -> bool {
 pub fn run() -> bool {
     puts(b"[test_neon] Running NEON tests\n");
     let mut ok = true;
-    if !test_neon_survives_syscall() { ok = false; }
-    if !test_neon_survives_fork() { ok = false; }
-    if !test_neon_all_registers() { ok = false; }
-    if !test_neon_no_fpu_threads() { ok = false; }
-    if !test_neon_heavy_context_switch() { ok = false; }
+    if !test_neon_survives_syscall() {
+        ok = false;
+    }
+    if !test_neon_survives_fork() {
+        ok = false;
+    }
+    if !test_neon_all_registers() {
+        ok = false;
+    }
+    if !test_neon_no_fpu_threads() {
+        ok = false;
+    }
+    if !test_neon_heavy_context_switch() {
+        ok = false;
+    }
     ok
 }

@@ -53,7 +53,8 @@ pub fn run() -> bool {
         if ret != 0 {
             // On re-run the directory may already exist; treat that as success
             let mut st2 = TronaStat::zeroed();
-            let sret = unsafe { trona_posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
+            let sret =
+                unsafe { trona_posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
             if sret != 0 || (st2.st_mode & S_IFMT) != S_IFDIR {
                 puts(b"[TEST_SALTYFS] FAIL: mkdir /mnt/data/testdir failed\n");
                 return false;
@@ -72,7 +73,9 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 3: create + write + read file\n");
     {
         let path = b"/mnt/data/testdir/test.txt\0";
-        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_TRUNC | O_WRONLY) as i32, 0o644) };
+        let fd = unsafe {
+            trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_TRUNC | O_WRONLY) as i32, 0o644)
+        };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for write failed\n");
             return false;
@@ -120,7 +123,8 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 4: large file write + read (8KB)\n");
     {
         let path = b"/mnt/data/testdir/large.bin\0";
-        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
+        let fd =
+            unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open large file for write failed\n");
             return false;
@@ -157,7 +161,9 @@ pub fn run() -> bool {
         let mut read_buf = [0u8; 256];
         let mut data_ok = true;
         while read_total < total_size {
-            let r = unsafe { trona_posix::posix_read(fd, read_buf.as_mut_ptr(), read_buf.len() as u64) };
+            let r = unsafe {
+                trona_posix::posix_read(fd, read_buf.as_mut_ptr(), read_buf.len() as u64)
+            };
             if r <= 0 {
                 break;
             }
@@ -292,7 +298,8 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 8: truncate file\n");
     {
         let path = b"/mnt/data/testdir/trunc.txt\0";
-        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
+        let fd =
+            unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for truncate test failed\n");
             return false;

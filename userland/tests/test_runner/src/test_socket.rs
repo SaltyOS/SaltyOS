@@ -7,6 +7,7 @@ use trona::consts::posix::*;
 use trona::serial;
 use trona::serial::LineBuf;
 use trona::types::core::*;
+use trona_posix::mm as posix_mm;
 use trona_posix::proc as posix;
 use trona_posix::*;
 
@@ -44,7 +45,15 @@ fn test_socketpair() -> bool {
         puts(b"[TEST_SOCKET] FAIL: socketpair returned error\n");
         return false;
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] socketpair fds: "); lb.dec(fds[0] as u64); lb.str(b", "); lb.dec(fds[1] as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_SOCKET] socketpair fds: ");
+        lb.dec(fds[0] as u64);
+        lb.str(b", ");
+        lb.dec(fds[1] as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     if fds[0] < 0 || fds[1] < 0 {
         puts(b"[TEST_SOCKET] FAIL: invalid fds\n");
@@ -55,14 +64,26 @@ fn test_socketpair() -> bool {
     let data = b"hello";
     let written = unsafe { trona_posix::posix_write(fds[0], data.as_ptr(), data.len() as u64) };
     if written != data.len() as i64 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: write returned "); lb.hex(written as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: write returned ");
+            lb.hex(written as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         return false;
     }
 
     let mut buf = [0u8; 32];
     let nread = unsafe { trona_posix::posix_read(fds[1], buf.as_mut_ptr(), buf.len() as u64) };
     if nread != data.len() as i64 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: read returned "); lb.hex(nread as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: read returned ");
+            lb.hex(nread as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         return false;
     }
 
@@ -204,7 +225,13 @@ fn test_scm_rights() -> bool {
         )
     };
     if sent < 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: sendmsg returned "); lb.hex(sent as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: sendmsg returned ");
+            lb.hex(sent as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         unsafe {
             trona_posix::posix_close(file_fd);
             trona_posix::posix_close(fds[0]);
@@ -212,7 +239,13 @@ fn test_scm_rights() -> bool {
         }
         return false;
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] sendmsg sent "); lb.dec(sent as u64); lb.str(b" bytes + 1 fd\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_SOCKET] sendmsg sent ");
+        lb.dec(sent as u64);
+        lb.str(b" bytes + 1 fd\n");
+        lb.flush();
+    }
 
     // recvmsg: receive data + fd on fds[1]
     let mut recv_buf = [0u8; 32];
@@ -228,7 +261,13 @@ fn test_scm_rights() -> bool {
         )
     };
     if rcvd < 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: recvmsg returned "); lb.hex(rcvd as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: recvmsg returned ");
+            lb.hex(rcvd as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         unsafe {
             trona_posix::posix_close(file_fd);
             trona_posix::posix_close(fds[0]);
@@ -248,7 +287,13 @@ fn test_scm_rights() -> bool {
     }
 
     if recv_fd_count != 1 || recv_fds[0] < 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: expected 1 fd, got "); lb.dec(recv_fd_count as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: expected 1 fd, got ");
+            lb.dec(recv_fd_count as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         unsafe {
             trona_posix::posix_close(file_fd);
             trona_posix::posix_close(fds[0]);
@@ -257,7 +302,13 @@ fn test_scm_rights() -> bool {
         return false;
     }
 
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] received fd="); lb.dec(recv_fds[0] as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_SOCKET] received fd=");
+        lb.dec(recv_fds[0] as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     // Verify the received fd works (write to /dev/null should succeed)
     let wr = unsafe { trona_posix::posix_write(recv_fds[0], b"x".as_ptr(), 1) };
@@ -287,22 +338,240 @@ fn test_scm_rights() -> bool {
 fn test_shm() -> bool {
     puts(b"[TEST_SOCKET] Test 4: POSIX shared memory\n");
 
+    // posix_mm reads mmsrv via trona::caps::mmsrv_ep() now — no explicit
+    // init call needed here.
+
     // shm_open
-    let fd = unsafe { trona_posix::posix_shm_open(b"/test_shm\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd =
+        unsafe { trona_posix::posix_shm_open(b"/test_shm\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
     if fd < 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: shm_open returned "); lb.hex(fd as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: shm_open returned ");
+            lb.hex(fd as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         return false;
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] shm_open fd="); lb.dec(fd as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_SOCKET] shm_open fd=");
+        lb.dec(fd as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     // ftruncate to 4096
     let ret = unsafe { trona_posix::posix_ftruncate(fd, 4096) };
     if ret != 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: ftruncate returned "); lb.hex(ret as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: ftruncate returned ");
+            lb.hex(ret as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     puts(b"[TEST_SOCKET] PASS: ftruncate OK\n");
+
+    let shared = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if shared as usize == usize::MAX {
+        puts(b"[TEST_SOCKET] FAIL: MAP_SHARED shm mmap failed\n");
+        unsafe { trona_posix::posix_close(fd) };
+        return false;
+    }
+
+    let fd2 = unsafe { trona_posix::posix_shm_open(b"/test_shm\0".as_ptr(), O_RDWR as i32) };
+    if fd2 < 0 {
+        puts(b"[TEST_SOCKET] FAIL: second shm_open failed\n");
+        unsafe {
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        };
+        return false;
+    }
+
+    let shared_alias = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd2,
+            0,
+        )
+    };
+    if shared_alias as usize == usize::MAX {
+        puts(b"[TEST_SOCKET] FAIL: second MAP_SHARED shm mmap failed\n");
+        unsafe {
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        };
+        return false;
+    }
+
+    let private_snapshot = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE,
+            fd2,
+            0,
+        )
+    };
+    if private_snapshot as usize == usize::MAX {
+        puts(b"[TEST_SOCKET] FAIL: MAP_PRIVATE shm mmap failed\n");
+        unsafe {
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        };
+        return false;
+    }
+
+    unsafe {
+        core::ptr::write_volatile(shared, 0x4A);
+        core::ptr::write_volatile(shared.add(4095), 0x7C);
+        if core::ptr::read_volatile(shared_alias) != 0x4A
+            || core::ptr::read_volatile(shared_alias.add(4095)) != 0x7C
+        {
+            puts(b"[TEST_SOCKET] FAIL: shared SHM alias did not observe writes\n");
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+            return false;
+        }
+
+        if core::ptr::read_volatile(private_snapshot) != 0
+            || core::ptr::read_volatile(private_snapshot.add(4095)) != 0
+        {
+            puts(b"[TEST_SOCKET] FAIL: private SHM mapping was not snapshot-isolated\n");
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+            return false;
+        }
+
+        core::ptr::write_volatile(private_snapshot, 0x11);
+        if core::ptr::read_volatile(shared) != 0x4A {
+            puts(b"[TEST_SOCKET] FAIL: private SHM write leaked into shared mapping\n");
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+            return false;
+        }
+    }
+
+    puts(b"[TEST_SOCKET] PASS: SHM shared/private mmap semantics OK\n");
+
+    let grow_ret = unsafe { trona_posix::posix_ftruncate(fd, 8192) };
+    if grow_ret != 0 {
+        puts(b"[TEST_SOCKET] FAIL: SHM grow ftruncate failed\n");
+        unsafe {
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        }
+        return false;
+    }
+
+    let second_page = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            4096,
+        )
+    };
+    if second_page as usize == usize::MAX {
+        puts(b"[TEST_SOCKET] FAIL: SHM second-page mmap after grow failed\n");
+        unsafe {
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        }
+        return false;
+    }
+
+    unsafe {
+        if core::ptr::read_volatile(second_page) != 0 {
+            puts(b"[TEST_SOCKET] FAIL: grown SHM page was not zero-filled\n");
+            posix_mm::posix_munmap(second_page, 4096);
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+            return false;
+        }
+    }
+
+    let shrink_busy = unsafe { trona_posix::posix_ftruncate(fd, 4096) };
+    if shrink_busy == 0 {
+        puts(b"[TEST_SOCKET] FAIL: SHM shrink succeeded while tail mapping was live\n");
+        unsafe {
+            posix_mm::posix_munmap(second_page, 4096);
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        }
+        return false;
+    }
+
+    unsafe {
+        posix_mm::posix_munmap(second_page, 4096);
+    }
+
+    let shrink_ok = unsafe { trona_posix::posix_ftruncate(fd, 4096) };
+    if shrink_ok != 0 {
+        puts(b"[TEST_SOCKET] FAIL: SHM shrink failed after tail unmap\n");
+        unsafe {
+            posix_mm::posix_munmap(private_snapshot, 4096);
+            posix_mm::posix_munmap(shared_alias, 4096);
+            trona_posix::posix_close(fd2);
+            posix_mm::posix_munmap(shared, 4096);
+            trona_posix::posix_close(fd);
+        }
+        return false;
+    }
+
+    puts(b"[TEST_SOCKET] PASS: SHM resize semantics OK\n");
+
+    unsafe {
+        posix_mm::posix_munmap(private_snapshot, 4096);
+        posix_mm::posix_munmap(shared_alias, 4096);
+        trona_posix::posix_close(fd2);
+        posix_mm::posix_munmap(shared, 4096);
+    }
 
     // Close and cleanup
     unsafe { trona_posix::posix_close(fd) };
@@ -310,7 +579,13 @@ fn test_shm() -> bool {
     // Unlink
     let ret = unsafe { trona_posix::posix_shm_unlink(b"/test_shm\0".as_ptr()) };
     if ret != 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: shm_unlink returned "); lb.hex(ret as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[TEST_SOCKET] FAIL: shm_unlink returned ");
+            lb.hex(ret as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         return false;
     }
     puts(b"[TEST_SOCKET] PASS: shm_open/ftruncate/unlink OK\n");
