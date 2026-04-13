@@ -9,7 +9,7 @@
 [submodule "lib/rust-lang/libc"]
 	path = lib/rust-lang/libc
 	url = https://github.com/SaltyOS/rust-lang-libc.git
-	branch = main
+	branch = libc-0.2
 [submodule "lib/basalt"]
 	path = lib/basalt
 	url = https://github.com/SaltyOS/basalt
