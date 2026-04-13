@@ -31,19 +31,22 @@ pub(crate) unsafe fn find_free_client_slot() -> *mut MmClient {
         let new_cap = cap * 2;
         let new_bytes = new_cap * core::mem::size_of::<MmClient>();
         let new_pages = (new_bytes + 4095) / 4096;
-        let new_ptr = super::self_mmap(new_pages);
-        if new_ptr.is_null() {
+        let new_buf = super::tracked_alloc_pages(new_pages);
+        if new_buf.ptr.is_null() {
             return core::ptr::null_mut();
         }
-        let new_ptr = new_ptr as *mut MmClient;
+        let new_ptr = new_buf.ptr as *mut MmClient;
         // Copy old entries
         for i in 0..cap {
             *new_ptr.add(i) = *ptr.add(i);
         }
         // First free slot is at old cap
         let free = new_ptr.add(cap);
+        let old_buf = *(&raw const super::CLIENTS_BUF);
+        *(&raw mut super::CLIENTS_BUF) = new_buf;
         *(&raw mut super::CLIENTS_PTR) = new_ptr;
         *(&raw mut super::CLIENTS_CAP) = new_cap;
+        super::tracked_free_pages(old_buf);
         trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] clients grown to ");
             _lb.hex(new_cap as u64);
@@ -81,11 +84,11 @@ pub(crate) unsafe fn client_reserve_regions(client: *mut MmClient, additional: u
         };
         let new_pages = (new_bytes + 4095) / 4096;
         let new_pages = if new_pages == 0 { 1 } else { new_pages };
-        let new_ptr = super::self_mmap(new_pages);
-        if new_ptr.is_null() {
+        let new_buf = super::tracked_alloc_pages(new_pages);
+        if new_buf.ptr.is_null() {
             return false;
         }
-        let new_ptr = new_ptr as *mut MmRegion;
+        let new_ptr = new_buf.ptr as *mut MmRegion;
 
         let old_ptr = (*client).regions;
         if !old_ptr.is_null() {
@@ -94,8 +97,11 @@ pub(crate) unsafe fn client_reserve_regions(client: *mut MmClient, additional: u
             }
         }
 
+        let old_buf = (*client).regions_buf;
         (*client).regions = new_ptr;
         (*client).region_cap = new_cap;
+        (*client).regions_buf = new_buf;
+        super::tracked_free_pages(old_buf);
         true
     }
 }
@@ -138,7 +144,11 @@ pub(crate) unsafe fn find_region_by_addr(client: *mut MmClient, addr: u64) -> *m
 ///   MR2 = mmap_base
 ///   MR3 = pid
 ///   + cap transfer: client's VSpace cap
-pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
+pub(crate) unsafe fn handle_mm_register(
+    msg: *const TronaMsg,
+    _caller_badge: u64,
+    reply: *mut TronaMsg,
+) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let heap_base = (*msg).regs[1];
@@ -178,6 +188,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64
             badge: client_badge,
             pid,
             active: true,
+            deregistering: false,
             vspace_cap,
             heap_base,
             heap_current: heap_base,
@@ -185,6 +196,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64
             regions: core::ptr::null_mut(),
             region_count: 0,
             region_cap: 0,
+            regions_buf: TrackedBuffer::zeroed(),
         };
         *(&raw mut super::CLIENT_COUNT) += 1;
 
@@ -202,6 +214,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64
             _lb.hex(mmap_base);
             _lb.str(b"\n");
         });
+        super::debug_log_state(b"[MMSRV] register state", slot);
 
         (*reply).label = TRONA_OK;
     }
@@ -209,7 +222,11 @@ pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64
 
 /// MM_DEREGISTER: procmgr removes a client on exit.
 ///   MR0 = client badge
-pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
+pub(crate) unsafe fn handle_mm_deregister(
+    msg: *const TronaMsg,
+    _caller_badge: u64,
+    reply: *mut TronaMsg,
+) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let client = find_client_by_badge(client_badge);
@@ -218,8 +235,18 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
             return;
         }
 
+        if (*client).deregistering {
+            (*reply).label = TRONA_OK;
+            return;
+        }
+
+        (*client).deregistering = true;
+
         let pid = (*client).pid;
         let vspace_cap = (*client).vspace_cap;
+        let released_region_count = (*client).region_count;
+        let released_region_cap = (*client).region_cap;
+        let released_region_pages = (*client).regions_buf.pages;
 
         // Tear down tracked mappings before releasing MO/VSpace caps.
         // Exec reuses the same VSpace object, so dropping only the metadata
@@ -233,36 +260,30 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
                 if (*r).active {
                     crate::mmap::flush_writeback_region(r, (*r).base, (*r).length);
                     if vspace_cap != 0 && (*r).length != 0 {
-                        if (*r).mo_cap != 0 {
-                            let page_count = (*r).length / 4096;
-                            if page_count != 0 {
-                                let err = trona::invoke::vspace_unmap_mo(
-                                    vspace_cap,
-                                    (*r).base,
-                                    page_count,
-                                );
-                                if err != 0 {
-                                    trona::uerror!(|_lb| {
-                                        _lb.str(b"[MMSRV] DEREGISTER: unmap_mo failed badge=");
-                                        _lb.hex(client_badge);
-                                        _lb.str(b" base=");
-                                        _lb.hex((*r).base);
-                                        _lb.str(b" pages=");
-                                        _lb.hex(page_count);
-                                        _lb.str(b" err=");
-                                        _lb.hex(err as u64);
-                                        _lb.str(b"\n");
-                                    });
-                                }
+                        let page_count = (*r).length / 4096;
+                        let mut unmap_err = 0i32;
+                        let mut unmap_addr = 0u64;
+                        for page in 0..page_count {
+                            let page_addr = (*r).base + page * 4096;
+                            let err = trona::invoke::vspace_unmap(vspace_cap, page_addr);
+                            if err as u64 == TRONA_NOT_FOUND {
+                                continue;
                             }
-                        } else {
-                            let page_count = (*r).length / 4096;
-                            for page in 0..page_count {
-                                let _ = trona::invoke::vspace_unmap(
-                                    vspace_cap,
-                                    (*r).base + page * 4096,
-                                );
+                            if err != 0 && unmap_err == 0 {
+                                unmap_err = err;
+                                unmap_addr = page_addr;
                             }
+                        }
+                        if unmap_err != 0 {
+                            trona::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] DEREGISTER: unmap failed badge=");
+                                _lb.hex(client_badge);
+                                _lb.str(b" addr=");
+                                _lb.hex(unmap_addr);
+                                _lb.str(b" err=");
+                                _lb.hex(unmap_err as u64);
+                                _lb.str(b"\n");
+                            });
                         }
                     }
                     crate::mmap::retire_region(client, r);
@@ -276,7 +297,19 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
         }
 
         (*client).active = false;
+        (*client).deregistering = false;
         (*client).badge = 0;
+        (*client).pid = 0;
+        (*client).vspace_cap = 0;
+        (*client).heap_base = 0;
+        (*client).heap_current = 0;
+        (*client).mmap_next = 0;
+        (*client).regions = core::ptr::null_mut();
+        (*client).region_count = 0;
+        (*client).region_cap = 0;
+        let old_regions_buf = (*client).regions_buf;
+        (*client).regions_buf = TrackedBuffer::zeroed();
+        super::tracked_free_pages(old_regions_buf);
         *(&raw mut super::CLIENT_COUNT) -= 1;
 
         trona::udebug!(|_lb| {
@@ -284,8 +317,15 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
             _lb.hex(client_badge);
             _lb.str(b" pid=");
             _lb.hex(pid as u64);
+            _lb.str(b" released_regions=");
+            _lb.hex(released_region_count as u64);
+            _lb.str(b" released_cap=");
+            _lb.hex(released_region_cap as u64);
+            _lb.str(b" released_pages=");
+            _lb.hex(released_region_pages as u64);
             _lb.str(b"\n");
         });
+        super::debug_log_state(b"[MMSRV] deregister state", core::ptr::null());
 
         (*reply).label = TRONA_OK;
     }
@@ -294,7 +334,11 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
 /// MM_GET_CLIENT_STATS: return memory stats for a client identified by PID.
 /// Request: regs[0] = pid
 /// Reply: regs[0]=heap_base, regs[1]=heap_current, regs[2]=region_count, regs[3]=total_pages
-pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const TronaMsg, _badge: u64, reply: *mut TronaMsg) {
+pub(crate) unsafe fn handle_mm_get_client_stats(
+    msg: *const TronaMsg,
+    _badge: u64,
+    reply: *mut TronaMsg,
+) {
     unsafe {
         let pid = (*msg).regs[0] as u32;
         let ptr = *(&raw const super::CLIENTS_PTR);

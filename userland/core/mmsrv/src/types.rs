@@ -1,29 +1,30 @@
 use trona::types::core::Cap;
 
-pub(crate) const MAX_UT_SOURCES: usize = 32;
-
-#[derive(Clone, Copy)]
-pub(crate) struct UntypedSource {
-    pub(crate) cap: Cap,
-    pub(crate) active: bool,
-}
-
-impl UntypedSource {
-    pub(crate) const fn empty() -> Self {
-        UntypedSource {
-            cap: 0,
-            active: false,
-        }
-    }
-}
-
 pub(crate) const REGION_HEAP: u8 = 0;
 pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
 pub(crate) const REGION_SHARED_RO: u8 = 3;
 pub(crate) const REGION_FILE_SHARED: u8 = 4;
 pub(crate) const REGION_IPC: u8 = 5;
+pub(crate) const REGION_IMAGE_RO: u8 = 6;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
+
+#[derive(Clone, Copy)]
+pub(crate) struct TrackedBuffer {
+    pub(crate) ptr: *mut u8,
+    pub(crate) pages: usize,
+    pub(crate) mo_cap: Cap,
+}
+
+impl TrackedBuffer {
+    pub(crate) const fn zeroed() -> Self {
+        Self {
+            ptr: core::ptr::null_mut(),
+            pages: 0,
+            mo_cap: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct MmRegion {
@@ -74,6 +75,7 @@ pub(crate) struct MmClient {
     pub(crate) badge: u64,
     pub(crate) pid: u32,
     pub(crate) active: bool,
+    pub(crate) deregistering: bool,
     /// Cap slot in mmsrv's CSpace holding the client's VSpace cap.
     pub(crate) vspace_cap: Cap,
     pub(crate) heap_base: u64,
@@ -82,6 +84,7 @@ pub(crate) struct MmClient {
     pub(crate) regions: *mut MmRegion,
     pub(crate) region_count: usize,
     pub(crate) region_cap: usize,
+    pub(crate) regions_buf: TrackedBuffer,
 }
 
 impl MmClient {
@@ -90,6 +93,7 @@ impl MmClient {
             badge: 0,
             pid: 0,
             active: false,
+            deregistering: false,
             vspace_cap: 0,
             heap_base: 0,
             heap_current: 0,
@@ -97,6 +101,7 @@ impl MmClient {
             regions: core::ptr::null_mut(),
             region_count: 0,
             region_cap: 0,
+            regions_buf: TrackedBuffer::zeroed(),
         }
     }
 }
@@ -108,6 +113,7 @@ pub(crate) struct ShmObject {
     pub(crate) page_count: u32,
     pub(crate) frame_caps: *mut Cap,
     pub(crate) frame_cap_capacity: u32,
+    pub(crate) frame_caps_buf: TrackedBuffer,
 }
 
 impl ShmObject {
@@ -118,6 +124,7 @@ impl ShmObject {
             page_count: 0,
             frame_caps: core::ptr::null_mut(),
             frame_cap_capacity: 0,
+            frame_caps_buf: TrackedBuffer::zeroed(),
         }
     }
 }
