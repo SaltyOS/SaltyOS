@@ -14,8 +14,9 @@ use crate::{QUEUE_SIZE, QUEUE_PHYS, QUEUE_AVAIL_OFF, QUEUE_USED_OFF, QUEUE_EVENT
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCIDRV_EP: u64 = 64;
-const CAP_MMSRV_EP: u64 = 7;
+
+// Service-local role `Require=pcidrv:pcidrv_ep` via generated `svc_caps`
+// crate; system role `mmsrv` via substrate `trona::caps::*` getters.
 
 /// Slot for dynamically received IoPort cap from pcidrv
 const CAP_RECEIVED_IOPORT: u64 = 80;
@@ -201,7 +202,8 @@ pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
     msg.regs[1] = VIRTIO_BLK_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -229,7 +231,8 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -368,7 +371,7 @@ fn virtio_negotiate() -> bool {
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
         return false;

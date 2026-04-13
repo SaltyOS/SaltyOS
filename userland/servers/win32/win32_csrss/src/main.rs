@@ -3,8 +3,6 @@
 //!
 //! Minimal Win32 subsystem server providing:
 //! - Import resolution for PE binaries (kernel32.dll functions)
-//! - Console I/O delegation to the console server
-//! - Per-client console mode tracking
 //!
 //! Registers as "win32/csrss" with namesrv so procmgr can look up
 //! the endpoint and pass it to PE processes via AT_SALTYOS_WIN32SRV.
@@ -19,6 +17,7 @@ use trona::consts::posix::O_RDONLY;
 use trona::consts::server::*;
 use trona::ipc;
 use trona::protocol::namesrv::*;
+use trona::protocol::procmgr::*;
 use trona::protocol::server::*;
 use trona::protocol::vfs::*;
 use trona::protocol::win32::*;
@@ -30,45 +29,15 @@ use trona::types::pe::*;
 // ======================================================================
 
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_SERVER_EP: u64 = 68;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESRV_EP: u64 = 64;   // NeedEP namesrv:64
-const CAP_CONSOLE_EP: u64 = 65;   // NeedEP console:65
-const CAP_VFS_EP: u64 = 66;       // NeedEP vfs:66
-const KERNEL32_PATH: &[u8] = b"/initrd/kernel32.dll";
+
+// All system roles flow through the substrate `trona::caps::*` getters
+// (populated by procmgr's populate_cap_table for post-procmgr services).
+const KERNEL32_PATH: &[u8] = b"/Windows/System32/kernel32.dll";
 const MAX_IMPORT_NAME: usize = 144;
 const MAX_EXPORT_NAME: usize = 128;
 const MAX_PE_SECTIONS: usize = 64;
 
 const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
-
-// ======================================================================
-// Per-client state
-// ======================================================================
-
-const MAX_CLIENTS: usize = 64;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ClientState {
-    badge: u64,
-    active: bool,
-    input_mode: u32,
-    output_mode: u32,
-}
-
-impl ClientState {
-    const fn zeroed() -> Self {
-        ClientState {
-            badge: 0,
-            active: false,
-            input_mode: DEFAULT_INPUT_MODE,
-            output_mode: DEFAULT_OUTPUT_MODE,
-        }
-    }
-}
-
-static mut CLIENTS: [ClientState; MAX_CLIENTS] = [ClientState::zeroed(); MAX_CLIENTS];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -95,13 +64,21 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn max_u32(a: u32, b: u32) -> u32 {
-    if a >= b { a } else { b }
+    if a >= b {
+        a
+    } else {
+        b
+    }
 }
 
 unsafe fn pack_path(msg: *mut TronaMsg, offset: usize, path: &[u8]) -> u8 {
     unsafe {
         let avail = (20usize.saturating_sub(offset + 1)) * 8;
-        let limit = if path.len() < avail { path.len() } else { avail };
+        let limit = if path.len() < avail {
+            path.len()
+        } else {
+            avail
+        };
         let path_len = limit as u8;
         (*msg).regs[offset] = path_len as u64;
         for i in (offset + 1)..20 {
@@ -119,13 +96,13 @@ unsafe fn vfs_open_readonly(path: &[u8]) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_OPEN;
+        msg.label = VFS_POSIX_OPEN;
         msg.regs[0] = 0;
         msg.regs[1] = O_RDONLY as u64;
         let path_len = pack_path(&raw mut msg, 2, path);
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
-        let err = ipc::call_ctx(ipc_ctx(), CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             return -1;
         }
@@ -140,7 +117,7 @@ unsafe fn vfs_close(fd: i32) {
         msg.label = VFS_CLOSE;
         msg.length = 1;
         msg.regs[0] = fd as u64;
-        let _ = ipc::call_ctx(ipc_ctx(), CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let _ = ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
     }
 }
 
@@ -158,7 +135,8 @@ unsafe fn vfs_pread_exact(fd: i32, offset: u64, buf: &mut [u8]) -> bool {
             msg.regs[1] = chunk as u64;
             msg.regs[2] = offset + done as u64;
 
-            let err = ipc::call_ctx(ipc_ctx(), CAP_VFS_EP, &raw const msg, &raw mut reply);
+            let err =
+                ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
                 return false;
             }
@@ -260,7 +238,9 @@ unsafe fn resolve_export_rva_by_ordinal(
             return None;
         }
         let func_rva_off = rva_to_file_offset(
-            export_dir.export_address_table_rva.checked_add(index.checked_mul(4)?)?,
+            export_dir
+                .export_address_table_rva
+                .checked_add(index.checked_mul(4)?)?,
             size_of_headers,
             sections,
         )?;
@@ -361,7 +341,11 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
         }
         let sections = &sections[..coff.number_of_sections as usize];
 
-        let export_off = match rva_to_file_offset(export_dirent.virtual_address, opt.size_of_headers, sections) {
+        let export_off = match rva_to_file_offset(
+            export_dirent.virtual_address,
+            opt.size_of_headers,
+            sections,
+        ) {
             Some(v) => v,
             None => {
                 vfs_close(fd);
@@ -379,18 +363,20 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
         if !name.is_empty() {
             for i in 0..export_dir.number_of_name_pointers {
                 let name_rva_slot = export_dir.name_pointer_rva.checked_add(i.checked_mul(4)?)?;
-                let name_rva_off = match rva_to_file_offset(name_rva_slot, opt.size_of_headers, sections) {
-                    Some(v) => v,
-                    None => continue,
-                };
+                let name_rva_off =
+                    match rva_to_file_offset(name_rva_slot, opt.size_of_headers, sections) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 let export_name_rva = match read_pod::<u32>(fd, name_rva_off) {
                     Some(v) => v,
                     None => continue,
                 };
-                let export_name_off = match rva_to_file_offset(export_name_rva, opt.size_of_headers, sections) {
-                    Some(v) => v,
-                    None => continue,
-                };
+                let export_name_off =
+                    match rva_to_file_offset(export_name_rva, opt.size_of_headers, sections) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 let mut export_name = [0u8; MAX_EXPORT_NAME];
                 let export_name_len = match read_c_string(fd, export_name_off, &mut export_name) {
                     Some(v) => v,
@@ -400,11 +386,14 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
                     continue;
                 }
 
-                let ordinal_slot = export_dir.ordinal_table_rva.checked_add(i.checked_mul(2)?)?;
-                let ordinal_off = match rva_to_file_offset(ordinal_slot, opt.size_of_headers, sections) {
-                    Some(v) => v,
-                    None => continue,
-                };
+                let ordinal_slot = export_dir
+                    .ordinal_table_rva
+                    .checked_add(i.checked_mul(2)?)?;
+                let ordinal_off =
+                    match rva_to_file_offset(ordinal_slot, opt.size_of_headers, sections) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 let ordinal_index = match read_pod::<u16>(fd, ordinal_off) {
                     Some(v) => v as u32,
                     None => continue,
@@ -412,18 +401,27 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
                 if ordinal_index >= export_dir.address_table_entries {
                     continue;
                 }
-                let func_rva_slot = export_dir.export_address_table_rva.checked_add(ordinal_index.checked_mul(4)?)?;
-                let func_rva_off = match rva_to_file_offset(func_rva_slot, opt.size_of_headers, sections) {
-                    Some(v) => v,
-                    None => continue,
-                };
+                let func_rva_slot = export_dir
+                    .export_address_table_rva
+                    .checked_add(ordinal_index.checked_mul(4)?)?;
+                let func_rva_off =
+                    match rva_to_file_offset(func_rva_slot, opt.size_of_headers, sections) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 resolved = read_pod::<u32>(fd, func_rva_off);
                 if resolved.is_some() {
                     break;
                 }
             }
         } else {
-            resolved = resolve_export_rva_by_ordinal(fd, &export_dir, sections, opt.size_of_headers, ordinal);
+            resolved = resolve_export_rva_by_ordinal(
+                fd,
+                &export_dir,
+                sections,
+                opt.size_of_headers,
+                ordinal,
+            );
         }
 
         vfs_close(fd);
@@ -432,127 +430,7 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
-}
-
-unsafe fn find_or_create_client(badge: u64) -> *mut ClientState {
-    unsafe {
-        let clients = &raw mut CLIENTS;
-        // Find existing
-        for i in 0..MAX_CLIENTS {
-            if (*clients)[i].active && (*clients)[i].badge == badge {
-                return &raw mut (*clients)[i];
-            }
-        }
-        // Allocate new
-        for i in 0..MAX_CLIENTS {
-            if !(*clients)[i].active {
-                (*clients)[i].badge = badge;
-                (*clients)[i].active = true;
-                (*clients)[i].input_mode = DEFAULT_INPUT_MODE;
-                (*clients)[i].output_mode = DEFAULT_OUTPUT_MODE;
-                return &raw mut (*clients)[i];
-            }
-        }
-        core::ptr::null_mut()
-    }
-}
-
-unsafe fn remove_client(badge: u64) {
-    unsafe {
-        let clients = &raw mut CLIENTS;
-        for i in 0..MAX_CLIENTS {
-            if (*clients)[i].active && (*clients)[i].badge == badge {
-                (*clients)[i].active = false;
-                return;
-            }
-        }
-    }
-}
-
-// ======================================================================
-// Console I/O delegation
-// ======================================================================
-
-/// Forward a console write to the console server via CONSOLE_WRITE IPC.
-unsafe fn handle_console_write(msg: *const TronaMsg, reply: *mut TronaMsg) {
-    unsafe {
-        let byte_count = (*msg).regs[0];
-        if byte_count == 0 || byte_count > 144 {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return;
-        }
-
-        // Build CONSOLE_WRITE message for the console server
-        let mut con_msg = TronaMsg::zeroed();
-        let mut con_reply = TronaMsg::zeroed();
-        con_msg.label = CONSOLE_WRITE;
-        con_msg.regs[0] = byte_count;
-        con_msg.length = 1 + ((byte_count + 7) / 8);
-
-        // Copy data bytes from incoming message
-        let src = &(*msg).regs[1] as *const u64 as *const u8;
-        let dst = &raw mut con_msg.regs[1] as *mut u8;
-        for i in 0..byte_count as usize {
-            *dst.add(i) = *src.add(i);
-        }
-
-        let err = ipc::call_ctx(
-            ipc_ctx(),
-            CAP_CONSOLE_EP,
-            &raw const con_msg,
-            &raw mut con_reply,
-        );
-        if err == 0 && con_reply.label == TRONA_OK {
-            (*reply).label = TRONA_OK;
-            (*reply).regs[0] = byte_count;
-            (*reply).length = 1;
-        } else {
-            (*reply).label = TRONA_INVALID_OPERATION;
-        }
-    }
-}
-
-/// Forward a console read to the console server.
-/// For the minimal implementation, we delegate to VFS stdin reads.
-unsafe fn handle_console_read(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
-    unsafe {
-        let max_bytes = (*msg).regs[0];
-        if max_bytes == 0 || max_bytes > 152 {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return;
-        }
-
-        // Read from VFS fd 0 (stdin) for the calling process.
-        // In the minimal implementation, we send a VFS_READ for fd 0.
-        let mut vfs_msg = TronaMsg::zeroed();
-        let mut vfs_reply = TronaMsg::zeroed();
-        vfs_msg.label = VFS_READ;
-        vfs_msg.length = 2;
-        vfs_msg.regs[0] = 0; // fd 0 = stdin
-        vfs_msg.regs[1] = max_bytes;
-
-        let err = ipc::call_ctx(
-            ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const vfs_msg,
-            &raw mut vfs_reply,
-        );
-        if err == 0 && vfs_reply.label == TRONA_OK {
-            let actual = vfs_reply.regs[0];
-            (*reply).label = TRONA_OK;
-            (*reply).regs[0] = actual;
-            (*reply).length = 1 + ((actual + 7) / 8);
-            // Copy data from VFS reply
-            let src = &vfs_reply.regs[1] as *const u64 as *const u8;
-            let dst = &raw mut (*reply).regs[1] as *mut u8;
-            for i in 0..actual as usize {
-                *dst.add(i) = *src.add(i);
-            }
-        } else {
-            (*reply).label = if err != 0 { TRONA_INVALID_OPERATION } else { vfs_reply.label };
-        }
-    }
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 /// Handle import resolution: look up a Win32 API function name and return
@@ -581,46 +459,6 @@ unsafe fn handle_resolve_import(msg: *const TronaMsg, reply: *mut TronaMsg) {
     }
 }
 
-/// Handle GetConsoleMode request.
-unsafe fn handle_get_console_mode(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
-    unsafe {
-        let cli = find_or_create_client(badge);
-        if cli.is_null() {
-            (*reply).label = TRONA_OUT_OF_MEMORY;
-            return;
-        }
-        let handle_type = (*msg).regs[0]; // 0=input, 1=output
-        let mode = if handle_type == 0 {
-            (*cli).input_mode
-        } else {
-            (*cli).output_mode
-        };
-        (*reply).label = TRONA_OK;
-        (*reply).regs[0] = mode as u64;
-        (*reply).length = 1;
-    }
-}
-
-/// Handle SetConsoleMode request.
-unsafe fn handle_set_console_mode(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
-    unsafe {
-        let cli = find_or_create_client(badge);
-        if cli.is_null() {
-            (*reply).label = TRONA_OUT_OF_MEMORY;
-            return;
-        }
-        let handle_type = (*msg).regs[0];
-        let new_mode = (*msg).regs[1] as u32;
-        if handle_type == 0 {
-            (*cli).input_mode = new_mode;
-        } else {
-            (*cli).output_mode = new_mode;
-        }
-        (*reply).label = TRONA_OK;
-        (*reply).length = 0;
-    }
-}
-
 // ======================================================================
 // Entry point
 // ======================================================================
@@ -633,6 +471,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Register with namesrv as "win32/csrss"
     register_with_namesrv();
+    register_with_procmgr();
 
     signal_ready();
 
@@ -645,7 +484,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let mut badge: u64 = 0;
 
     // Initial recv
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe {
+        ipc::recv_ctx(
+            ipc_ctx(),
+            trona::caps::service_ep(),
+            &raw mut msg,
+            &raw mut badge,
+        )
+    };
     if err != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[WIN32_CSRSS] initial recv failed\n");
@@ -660,28 +506,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             W32_RESOLVE_IMPORT => {
                 unsafe { handle_resolve_import(&raw const msg, &raw mut reply) };
             }
-            W32_CONSOLE_WRITE => {
-                unsafe { handle_console_write(&raw const msg, &raw mut reply) };
-            }
-            W32_CONSOLE_READ => {
-                unsafe { handle_console_read(&raw const msg, &raw mut reply, badge) };
-            }
-            W32_GET_CONSOLE_MODE => {
-                unsafe { handle_get_console_mode(&raw const msg, &raw mut reply, badge) };
-            }
-            W32_SET_CONSOLE_MODE => {
-                unsafe { handle_set_console_mode(&raw const msg, &raw mut reply, badge) };
-            }
-            W32_CLIENT_REGISTER => {
-                unsafe {
-                    let _ = find_or_create_client(badge);
-                }
-                reply.label = TRONA_OK;
-            }
-            W32_CLIENT_EXIT => {
-                unsafe { remove_client(badge) };
-                reply.label = TRONA_OK;
-            }
             _ => {
                 reply.label = TRONA_INVALID_OPERATION;
             }
@@ -690,7 +514,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let err = unsafe {
             ipc::reply_recv_ctx(
                 ipc_ctx(),
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 &raw const reply,
                 &raw mut msg,
                 &raw mut badge,
@@ -722,10 +546,10 @@ fn register_with_namesrv() {
     }
 
     unsafe {
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const reg_msg,
             &raw mut reg_reply,
         );
@@ -736,6 +560,33 @@ fn register_with_namesrv() {
         } else {
             trona::uerror!(|_lb| {
                 _lb.str(b"[WIN32_CSRSS] namesrv registration failed\n");
+            });
+        }
+    }
+}
+
+fn register_with_procmgr() {
+    let mut reg_msg = TronaMsg::zeroed();
+    let mut reg_reply = TronaMsg::zeroed();
+    reg_msg.label = PM_REGISTER_PERSONALITY_PROVIDER;
+    reg_msg.length = 1;
+    reg_msg.regs[0] = trona::SUBSYSTEM_WIN32 as u64;
+
+    unsafe {
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            trona::caps::procmgr_ep(),
+            &raw const reg_msg,
+            &raw mut reg_reply,
+        );
+        if err == 0 && reg_reply.label == TRONA_OK {
+            trona::uinfo!(|_lb| {
+                _lb.str(b"[WIN32_CSRSS] registered with procmgr personality layer\n");
+            });
+        } else {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[WIN32_CSRSS] procmgr personality registration failed\n");
             });
         }
     }

@@ -14,18 +14,9 @@
 //!     available; netsrv signals netdrv (via badged notification) when TX
 //!     frames are queued.
 //!
-//! Cap layout:
-//!   0  = self TCB
-//!   1  = self VSpace
-//!   2  = self CSpace
-//!   5  = namesrv endpoint
-//!   7  = mmsrv endpoint
-//!   14 = readiness notification
-//!   64 = pcidrv endpoint
-//!   68 = server endpoint (pre-created service EP)
-//!   84 = netsrv's RX notification cap (received during DRIVER_REGISTER)
-//!   81 = IRQ handler cap (received from pcidrv via PCI_GET_CAPS extra cap #1)
-//!   82 = IRQ notification (retyped from untyped, sent to netsrv via IPC)
+//! Startup caps are role-based. System caps come from `trona::caps::*()`,
+//! the pcidrv dependency comes from generated `svc_caps::*()`, and a few
+//! IRQ/notification slots are runtime-local.
 
 #![no_std]
 #![no_main]
@@ -49,10 +40,7 @@ use trona::types::core::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_SERVER_EP: u64 = 68;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESRV_EP: u64 = 5;
-const CAP_MMSRV_EP: u64 = 7;
+// System roles via substrate `trona::caps::*` getters.
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
 const CAP_NETSRV_RX_NTFN: u64 = 84;
@@ -93,7 +81,7 @@ fn irq_badge_bits() -> u64 {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 fn log_frame_bytes(prefix: &[u8], frame: &[u8]) {
@@ -156,9 +144,10 @@ fn register_namesrv() {
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
+        let err =
+            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
                 _lb.str(b"[netdrv] namesrv registration failed\n");
@@ -187,29 +176,31 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
         return false;
     }
 
-    // Step 1: Allocate a Notification object via mmsrv
+    // Step 1: Allocate a Notification object via rsrcsrv (owner=self)
     // SAFETY: IPC context is valid; set up receive slot for cap transfer.
     unsafe {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_IRQ_NOTIFICATION, 0);
     }
     let mut msg = TronaMsg::zeroed();
-    msg.label = MM_ALLOC_OBJECT;
-    msg.regs[0] = OBJ_NOTIFICATION;
-    msg.regs[1] = 0;
-    msg.length = 2;
+    msg.label = RES_ALLOC_OBJECT;
+    msg.regs[0] = 0;
+    msg.regs[1] = OBJ_NOTIFICATION;
+    msg.regs[2] = 0;
+    msg.regs[3] = 0;
+    msg.length = 4;
     let mut alloc_reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
+    // SAFETY: IPC context is valid; making RPC to rsrcsrv.
     let err = unsafe {
         ipc::call_ctx(
             ipc_ctx(),
-            CAP_MMSRV_EP,
+            trona::caps::rsrcsrv_ep(),
             &raw const msg,
             &raw mut alloc_reply,
         )
     };
     if err != 0 || alloc_reply.label != TRONA_OK {
         trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
+            _lb.str(b"[netdrv] Failed to allocate Notification via rsrcsrv: ");
             _lb.dec(if err != 0 {
                 err as u64
             } else {
@@ -488,7 +479,9 @@ fn handle_driver_register(msg: &TronaMsg, reply: &mut TronaMsg) {
     map_msg.length = 4;
     let mut map_reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
+    let err = unsafe {
+        ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const map_msg, &raw mut map_reply)
+    };
     if err != 0 || map_reply.label != TRONA_OK {
         trona::uerror!(|_lb| {
             _lb.str(b"[netdrv] Failed to map SHM\n");
@@ -581,7 +574,7 @@ fn event_loop(device_ok: bool) -> ! {
                 let err = unsafe {
                     ipc::recv_timed_ctx(
                         ctx,
-                        CAP_SERVER_EP,
+                        trona::caps::service_ep(),
                         POLL_TIMEOUT_NS,
                         &raw mut msg,
                         &raw mut badge,
@@ -594,7 +587,12 @@ fn event_loop(device_ok: bool) -> ! {
             } else {
                 // SAFETY: IPC context is valid; server EP was set up by procmgr.
                 unsafe {
-                    ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+                    ipc::recv_ctx(
+                        ctx,
+                        trona::caps::service_ep(),
+                        &raw mut msg,
+                        &raw mut badge,
+                    );
                 }
             }
         }
@@ -628,7 +626,7 @@ fn event_loop(device_ok: bool) -> ! {
                     unsafe {
                         ipc::reply_recv_ctx(
                             ctx,
-                            CAP_SERVER_EP,
+                            trona::caps::service_ep(),
                             &raw const reply,
                             &raw mut msg,
                             &raw mut badge,
@@ -648,7 +646,7 @@ fn event_loop(device_ok: bool) -> ! {
                 unsafe {
                     ipc::reply_recv_ctx(
                         ctx,
-                        CAP_SERVER_EP,
+                        trona::caps::service_ep(),
                         &raw const reply,
                         &raw mut msg,
                         &raw mut badge,

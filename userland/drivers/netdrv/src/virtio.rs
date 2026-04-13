@@ -16,8 +16,9 @@ use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCIDRV_EP: u64 = 64;
-const CAP_MMSRV_EP: u64 = 7;
+
+// Service-local role `Require=pcidrv:pcidrv_ep` via generated `svc_caps`
+// crate; system role `mmsrv` via substrate `trona::caps::*` getters.
 
 /// Slot for dynamically received BAR cap from pcidrv (IoPort or device untyped)
 const CAP_RECEIVED_BAR: u64 = 80;
@@ -269,7 +270,8 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer to our thread-local IPC context.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -299,7 +301,8 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -375,7 +378,7 @@ fn mmap_alloc(hint_vaddr: u64, num_pages: u64) -> Option<u64> {
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() is valid.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }

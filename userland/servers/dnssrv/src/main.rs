@@ -5,15 +5,8 @@
 //! Clients send DNS_RESOLVE requests; dnssrv checks its cache first, then
 //! forwards cache misses to netsrv via NET_DNS_RESOLVE / NET_DNS_RESOLVE_PTR.
 //!
-//! Cap layout:
-//!   0  = self TCB
-//!   2  = self CSpace
-//!   5  = namesrv endpoint
-//!   7  = mmsrv endpoint
-//!   14 = readiness notification
-//!   64 = netsrv endpoint (NeedEP=netsrv:64)
-//!   65 = namesrv endpoint #2 (NeedEP=namesrv:65)
-//!   68 = server endpoint (pre-created service EP)
+//! Startup caps are role-based. System caps come from `trona::caps::*()`,
+//! and the service-local netsrv dependency comes from generated `svc_caps::*()`.
 
 #![no_std]
 #![no_main]
@@ -33,12 +26,9 @@ use trona::types::core::*;
 // ---------------------------------------------------------------------------
 
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_NAMESRV_EP: u64 = 5;
-const CAP_MMSRV_EP: u64 = 7;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NETSRV_EP: u64 = 64;
-const CAP_NAMESRV_EP2: u64 = 65;
-const CAP_SERVER_EP: u64 = 68;
+
+// System roles (`namesrv`, `mmsrv`) via substrate `trona::caps::*` getters;
+// service-local role `Require=netsrv:netsrv_ep` via generated `svc_caps`.
 
 // ---------------------------------------------------------------------------
 // DNS cache
@@ -95,7 +85,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 fn clock_monotonic_ns() -> u64 {
@@ -238,11 +228,11 @@ fn register_namesrv() {
             *dst.add(i) = name[i];
             i += 1;
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -314,7 +304,7 @@ fn handle_resolve(msg: &TronaMsg, reply: &mut TronaMsg) {
     let err = unsafe {
         ipc::call_ctx(
             ipc_ctx(),
-            CAP_NETSRV_EP,
+            svc_caps::netsrv_ep(),
             &raw const netsrv_msg,
             &raw mut netsrv_reply,
         )
@@ -386,7 +376,7 @@ fn handle_reverse(msg: &TronaMsg, reply: &mut TronaMsg) {
     let err = unsafe {
         ipc::call_ctx(
             ipc_ctx(),
-            CAP_NETSRV_EP,
+            svc_caps::netsrv_ep(),
             &raw const netsrv_msg,
             &raw mut netsrv_reply,
         )
@@ -441,7 +431,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // SAFETY: IPC context valid; CAP_SERVER_EP is our service endpoint.
     unsafe {
-        ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+        ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge);
     }
 
     loop {
@@ -462,7 +452,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         unsafe {
             ipc::reply_recv_ctx(
                 ctx,
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 &raw const reply,
                 &raw mut msg,
                 &raw mut badge,

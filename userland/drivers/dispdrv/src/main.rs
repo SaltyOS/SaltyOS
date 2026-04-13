@@ -33,12 +33,7 @@ const DAMAGE_WORDS: usize = MAX_DAMAGE_SCANLINES / DAMAGE_WORD_BITS;
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_NAMESRV_EP: u64 = 5;   // Standard well-known slot (consts::CAP_NAMESRV_EP)
-const CAP_MMSRV_EP: u64 = 7;
-const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
-const CAP_READINESS_NTFN: u64 = 14;
 const CAP_RING_NTFN: u64 = 69;   // Terminal ring notification (received from posix_ttysrv)
-const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
 const TERM_RING_VADDR: u64 = 0x0000_0000_0060_0000;
 const TERM_RING_HDR_SIZE: usize = 16;
 const TERMINAL_BATCH_TIMEOUT_NS: u64 = 1_000_000;
@@ -251,7 +246,17 @@ unsafe fn recv_timed_ctx(
 }
 
 fn signal_ready() {
-    let _ = syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let ntfn = trona::caps::readiness_ntfn();
+    let r = syscall(SYS_SIGNAL, ntfn, 1, 0, 0, 0, 0);
+    trona::udebug!(|_lb| {
+        _lb.str(b"[dispdrv] signal_ready ntfn=");
+        _lb.hex(ntfn);
+        _lb.str(b" err=");
+        _lb.hex(r.error);
+        _lb.str(b" value=");
+        _lb.hex(r.value);
+        _lb.str(b"\n");
+    });
 }
 
 fn pack_color(r: u8, g: u8, b: u8, rp: u8, gp: u8, bp: u8) -> u32 {
@@ -283,6 +288,7 @@ fn mark_damage(state: &mut DisplayState, y_start: u32, y_end: u32) {
 
 /// XOR-invert a glyph cell in the shadow buffer for cursor display.
 fn invert_cursor_cell(state: &mut DisplayState, col: u32, row: u32) {
+    if state.shadow.is_null() { return; }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let px = col * gw;
@@ -368,6 +374,7 @@ fn repaint_all_cells(state: &mut DisplayState) {
 }
 
 fn flush_damage(state: &mut DisplayState) {
+    if state.shadow.is_null() || state.vram.is_null() { return; }
     // Erase previously drawn cursor (un-invert)
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
@@ -497,6 +504,7 @@ fn effective_bg(state: &DisplayState) -> u32 {
 /// Render a glyph's pixels into the shadow buffer without updating the cell buffer.
 /// Used by both `draw_glyph` (normal rendering) and `repaint_all_cells` (DECSCNM).
 fn render_glyph_pixels(state: &mut DisplayState, c: u8, col: u32, row: u32) {
+    if state.shadow.is_null() { return; }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let px = col * gw;
@@ -591,6 +599,7 @@ fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
 }
 
 fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u32) {
+    if state.shadow.is_null() { return; }
     let pitch = state.pitch as usize;
     let bpp_bytes = (state.bpp / 8) as usize;
 
@@ -616,6 +625,7 @@ fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u3
 }
 
 fn scroll_up_region(state: &mut DisplayState, top: u32, bottom: u32) {
+    if state.shadow.is_null() { return; }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let rows = bottom - top;
@@ -660,6 +670,7 @@ fn scroll_up(state: &mut DisplayState) {
 }
 
 fn scroll_down_region(state: &mut DisplayState, top: u32, bottom: u32) {
+    if state.shadow.is_null() { return; }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let rows = bottom - top;
@@ -698,6 +709,7 @@ fn scroll_down_region(state: &mut DisplayState, top: u32, bottom: u32) {
 }
 
 fn insert_lines(state: &mut DisplayState, at_row: u32, count: u32) {
+    if state.shadow.is_null() { return; }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let max = state.scroll_bottom;
@@ -738,6 +750,7 @@ fn insert_lines(state: &mut DisplayState, at_row: u32, count: u32) {
 }
 
 fn delete_lines(state: &mut DisplayState, at_row: u32, count: u32) {
+    if state.shadow.is_null() { return; }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let max = state.scroll_bottom;
@@ -779,6 +792,7 @@ fn delete_lines(state: &mut DisplayState, at_row: u32, count: u32) {
 }
 
 fn insert_chars(state: &mut DisplayState, count: u32) {
+    if state.shadow.is_null() { return; }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let col = state.text_col;
@@ -828,6 +842,7 @@ fn insert_chars(state: &mut DisplayState, count: u32) {
 }
 
 fn delete_chars(state: &mut DisplayState, count: u32) {
+    if state.shadow.is_null() { return; }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let col = state.text_col;
@@ -1111,7 +1126,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 
     let (err, mapped) = invoke::vspace_map_device_range(
         CAP_SELF_VSPACE,
-        CAP_FB_UNTYPED,
+        trona::caps::fb_untyped(),
         0,
         FB_MAP_VADDR,
         num_pages,
@@ -1188,10 +1203,10 @@ fn register_with_namesrv() -> bool {
     }
 
     unsafe {
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const reg_msg,
             &raw mut reg_reply,
         );
@@ -1356,7 +1371,12 @@ fn handle_setup_ring(state: &mut DisplayState, msg: &TronaMsg, reply: &mut Trona
     let mut map_reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; nested call to mmsrv during handler.
     let map_err = unsafe {
-        ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply)
+        ipc::call_ctx(
+            ipc_ctx(),
+            trona::caps::mmsrv_ep(),
+            &raw const map_msg,
+            &raw mut map_reply,
+        )
     };
     if map_err != 0 || map_reply.label != TRONA_OK {
         trona::uerror!(|_lb| {
@@ -1404,66 +1424,76 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         _lb.str(b"[dispdrv] Display server starting\n");
     });
 
-    // Read framebuffer info from boot info page
-    let fb = match unsafe { framebuffer::read_framebuffer_info() } {
-        Some(fb) => fb,
-        None => {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[dispdrv] No framebuffer detected\n");
-            });
-            signal_ready();
-            idle();
+    let fb = unsafe { framebuffer::read_framebuffer_info() };
+
+    let mut vram_ptr: *mut u8 = core::ptr::null_mut();
+    let mut shadow_ptr: *mut u8 = core::ptr::null_mut();
+    let mut fb_width = 0u32;
+    let mut fb_height = 0u32;
+    let mut fb_pitch = 0u32;
+    let mut fb_bpp = 0u8;
+    let mut fb_red_pos = 0u8;
+    let mut fb_green_pos = 0u8;
+    let mut fb_blue_pos = 0u8;
+    let mut fb_red_size = 0u8;
+    let mut fb_green_size = 0u8;
+    let mut fb_blue_size = 0u8;
+
+    if let Some(ref fb) = fb {
+        fb_width = fb.width;
+        fb_height = fb.height;
+        fb_pitch = fb.pitch;
+        fb_bpp = fb.bpp;
+        fb_red_pos = fb.red_pos;
+        fb_green_pos = fb.green_pos;
+        fb_blue_pos = fb.blue_pos;
+        fb_red_size = fb.red_size;
+        fb_green_size = fb.green_size;
+        fb_blue_size = fb.blue_size;
+
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[dispdrv] FB: ");
+            _lb.dec(fb.width as u64); _lb.str(b"x"); _lb.dec(fb.height as u64);
+            _lb.str(b" bpp="); _lb.dec(fb.bpp as u64);
+            _lb.str(b" pitch="); _lb.dec(fb.pitch as u64);
+            _lb.str(b"\n");
+        });
+
+        if map_framebuffer(fb) {
+            vram_ptr = FB_MAP_VADDR as *mut u8;
+            let fb_size = fb.height as u64 * fb.pitch as u64;
+            shadow_ptr = alloc_shadow_buffer(fb_size);
+
+            if !shadow_ptr.is_null() {
+                // SAFETY: Both VRAM and shadow are mapped with sufficient size.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        vram_ptr as *const u8, shadow_ptr, fb_size as usize,
+                    );
+                }
+            }
         }
-    };
-
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[dispdrv] FB: ");
-        _lb.dec(fb.width as u64);
-        _lb.str(b"x");
-        _lb.dec(fb.height as u64);
-        _lb.str(b" bpp=");
-        _lb.dec(fb.bpp as u64);
-        _lb.str(b" pitch=");
-        _lb.dec(fb.pitch as u64);
-        _lb.str(b"\n");
-    });
-
-    // Map framebuffer with write-combining (WRITE_THROUGH flag)
-    if !map_framebuffer(&fb) {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[dispdrv] Failed to map framebuffer\n");
-        });
-        signal_ready();
-        idle();
     }
 
-    // Allocate shadow buffer via mmsrv
-    let fb_size = fb.height as u64 * fb.pitch as u64;
-    let shadow_ptr = alloc_shadow_buffer(fb_size);
-    if shadow_ptr.is_null() {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[dispdrv] Failed to allocate shadow buffer\n");
-        });
-        signal_ready();
-        idle();
+    if fb.is_none() {
+        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] No framebuffer detected, running degraded\n"); });
+    } else if vram_ptr.is_null() {
+        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] Framebuffer mapping failed, running degraded\n"); });
+    } else if shadow_ptr.is_null() {
+        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] Shadow buffer allocation failed, running degraded\n"); });
     }
 
-    // Copy current VRAM content into shadow buffer (preserve boot output)
-    // SAFETY: Both VRAM and shadow are mapped with sufficient size.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            FB_MAP_VADDR as *const u8,
-            shadow_ptr,
-            fb_size as usize,
-        );
-    }
+    let fg_val = if !shadow_ptr.is_null() {
+        pack_color(0xCC, 0xCC, 0xCC, fb_red_pos, fb_green_pos, fb_blue_pos)
+    } else { 0 };
+    let bg_val = if !shadow_ptr.is_null() {
+        pack_color(0x00, 0x00, 0x00, fb_red_pos, fb_green_pos, fb_blue_pos)
+    } else { 0 };
 
-    let fg_val = pack_color(0xCC, 0xCC, 0xCC, fb.red_pos, fb.green_pos, fb.blue_pos);
-    let bg_val = pack_color(0x00, 0x00, 0x00, fb.red_pos, fb.green_pos, fb.blue_pos);
+    let max_cols = if fb_width > 0 { fb_width / font::GLYPH_WIDTH } else { 0 };
+    let max_rows = if fb_height > 0 { fb_height / font::GLYPH_HEIGHT } else { 0 };
 
-    // Default tab stops: every 8th column
     let mut default_tabs: u128 = 0;
-    let max_cols = fb.width / font::GLYPH_WIDTH;
     {
         let mut c = 0u32;
         while c < max_cols && c < 128 {
@@ -1473,24 +1503,24 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
 
     let mut state = DisplayState {
-        vram: FB_MAP_VADDR as *mut u8,
+        vram: vram_ptr,
         shadow: shadow_ptr,
-        width: fb.width,
-        height: fb.height,
-        pitch: fb.pitch,
-        bpp: fb.bpp,
-        red_pos: fb.red_pos,
-        green_pos: fb.green_pos,
-        blue_pos: fb.blue_pos,
-        red_size: fb.red_size,
-        green_size: fb.green_size,
-        blue_size: fb.blue_size,
+        width: fb_width,
+        height: fb_height,
+        pitch: fb_pitch,
+        bpp: fb_bpp,
+        red_pos: fb_red_pos,
+        green_pos: fb_green_pos,
+        blue_pos: fb_blue_pos,
+        red_size: fb_red_size,
+        green_size: fb_green_size,
+        blue_size: fb_blue_size,
         text_col: 0,
         text_row: 0,
         max_cols,
-        max_rows: fb.height / font::GLYPH_HEIGHT,
+        max_rows,
         scroll_top: 0,
-        scroll_bottom: fb.height / font::GLYPH_HEIGHT,
+        scroll_bottom: max_rows,
         fg: fg_val,
         bg: bg_val,
         default_fg: fg_val,
@@ -1511,7 +1541,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         autowrap: true,
         vt_state: vt100::VtState::Normal,
         csi_parser: vt100::CsiParser::new(),
-        damage_min_y: fb.height,
+        damage_min_y: fb_height,
         damage_max_y: 0,
         damage_rows: [0; DAMAGE_WORDS],
         term_ring_base: core::ptr::null_mut(),
@@ -1523,7 +1553,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         primary_fg: fg_val,
         primary_bg: bg_val,
         primary_scroll_top: 0,
-        primary_scroll_bottom: fb.height / font::GLYPH_HEIGHT,
+        primary_scroll_bottom: max_rows,
         g0_charset: 0,
         g1_charset: 0,
         active_charset: 0,
@@ -1548,50 +1578,44 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         alt_cells: core::ptr::null_mut(),
     };
 
-    // Disable kernel console so we own the framebuffer
-    syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[dispdrv] Kernel console disabled, display server owns FB\n");
-    });
+    if !vram_ptr.is_null() && !shadow_ptr.is_null() {
+        syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[dispdrv] Kernel console disabled, display server owns FB\n");
+        });
 
-    // Allocate cell buffer for character-level storage
-    {
-        let grid = (state.max_cols * state.max_rows) as usize;
-        let cell_bytes = grid * core::mem::size_of::<Cell>();
-        let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
-        let ptr = unsafe {
-            trona_posix::mm::posix_mmap(
-                core::ptr::null_mut(),
-                cell_len,
-                0x3,  // PROT_READ | PROT_WRITE
-                0x22, // MAP_PRIVATE | MAP_ANONYMOUS
-                -1,
-                0,
-            )
-        };
-        if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
-            state.cells = ptr as *mut Cell;
-            // Initialize all cells to space with default colors
-            for i in 0..grid {
-                // SAFETY: Just-allocated buffer, i < grid.
-                unsafe {
-                    *state.cells.add(i) = Cell::blank(fg_val, bg_val);
+        {
+            let grid = (max_cols * max_rows) as usize;
+            let cell_bytes = grid * core::mem::size_of::<Cell>();
+            let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
+            let ptr = unsafe {
+                trona_posix::mm::posix_mmap(
+                    core::ptr::null_mut(),
+                    cell_len,
+                    0x3,
+                    0x22,
+                    -1,
+                    0,
+                )
+            };
+            if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
+                state.cells = ptr as *mut Cell;
+                for i in 0..grid {
+                    // SAFETY: Just-allocated buffer, i < grid.
+                    unsafe { *state.cells.add(i) = Cell::blank(fg_val, bg_val); }
                 }
             }
         }
+
+        let w = state.width;
+        let h = state.height;
+        let bg = state.bg;
+        fill_rect(&mut state, 0, 0, w, h, bg);
+        flush_damage(&mut state);
     }
 
-    // Clear screen to background color for a clean terminal
-    let w = state.width;
-    let h = state.height;
-    let bg = state.bg;
-    fill_rect(&mut state, 0, 0, w, h, bg);
-    flush_damage(&mut state);
-
-    // Register with namesrv
     register_with_namesrv();
 
-    // Signal readiness
     signal_ready();
     trona::uinfo!(|_lb| {
         _lb.str(b"[dispdrv] Ready, entering server loop\n");
@@ -1608,7 +1632,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RING_NTFN, 0);
     }
 
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe {
+        ipc::recv_ctx(
+            ipc_ctx(),
+            trona::caps::service_ep(),
+            &raw mut msg,
+            &raw mut badge,
+        )
+    };
     if err != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[dispdrv] initial recv failed err=");
@@ -1627,7 +1658,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 flush_damage(&mut state);
             }
             let err = unsafe {
-                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                ipc::recv_ctx(
+                    ipc_ctx(),
+                    trona::caps::service_ep(),
+                    &raw mut msg,
+                    &raw mut badge,
+                )
             };
             if err != 0 {
                 trona::uerror!(|_lb| {
@@ -1645,7 +1681,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 let timed_err = unsafe {
                     recv_timed_ctx(
                         ipc_ctx(),
-                        CAP_SERVER_EP,
+                        trona::caps::service_ep(),
                         TERMINAL_BATCH_TIMEOUT_NS,
                         &raw mut msg,
                         &raw mut badge,
@@ -1655,7 +1691,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 if timed_err != 0 {
                     flush_damage(&mut state);
                     let err = unsafe {
-                        ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                        ipc::recv_ctx(
+                            ipc_ctx(),
+                            trona::caps::service_ep(),
+                            &raw mut msg,
+                            &raw mut badge,
+                        )
                     };
                     if err != 0 {
                         trona::uerror!(|_lb| {
@@ -1708,7 +1749,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let err = unsafe {
             ipc::reply_recv_ctx(
                 ipc_ctx(),
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 &raw const reply,
                 &raw mut msg,
                 &raw mut badge,
