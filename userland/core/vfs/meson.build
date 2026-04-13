@@ -9,12 +9,20 @@ if 'vfs' in userland_debug_list
   _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
 endif
 
+# Worker pool mode
+if get_option('vfs_worker_pool')
+  _prog_rust_args += ['--cfg', 'vfs_worker_pool']
+  _prog_rust_args += ['--cfg', 'vfs_cpus_' + get_option('max_cpus').to_string()]
+endif
+
 # Step 1: Rust -> .o
 vfs_obj = custom_target('vfs_obj',
   input: files('src/main.rs'),
   output: 'vfs.o',
   depfile: 'vfs.d',
-  command: [rustc,
+  command: ['env',
+    'VFS_WORKER_COUNT_OVERRIDE=' + get_option('vfs_worker_count_override').to_string(),
+    rustc,
     _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=vfs',

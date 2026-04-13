@@ -1,8 +1,7 @@
 //! SaltyOS VFS Server
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Virtual filesystem with ramfs (in-memory filesystem) and devfs.
-//! Mounts initrd CPIO as read-only /initrd/. Device files at /dev/.
+//! VFS server with ramfs, devfs, procfs, tmpfs, saltyfs. FHS-compliant layout.
 
 #![no_std]
 #![no_main]
@@ -10,437 +9,26 @@
 extern crate trona;
 extern crate trona_loader;
 
-mod bulk;
-mod client;
-mod consts;
+mod arena;
+mod backend;
+mod boot;
 mod fileops;
-mod mount;
-mod path;
-mod pipe;
-mod posix;
-mod ramfs;
-mod types;
-mod vfs_mem;
-mod win32;
+mod fs;
+mod ipc;
+mod owner;
+mod personality;
+mod server;
+mod vfs_core;
 
-use posix::{inet, misc, poll, socket};
+pub use server::state::*;
 
 use trona::consts::kernel::*;
-use trona::consts::posix::*;
 use trona::consts::server::*;
-use trona_loader::cpio;
-use trona::ipc;
-use trona::protocol::mmsrv::*;
 use trona::protocol::namesrv::*;
-use trona::protocol::posix::*;
-use trona::protocol::procmgr::*;
-use trona::protocol::server::*;
-use trona::protocol::vfs::*;
 use trona::serial;
 use trona::types::core::*;
-use trona::types::posix::*;
 
-use consts::*;
-use types::*;
-
-// ======================================================================
-// Global state
-// ======================================================================
-
-pub(crate) static mut INODES_PTR: *mut RamfsInode = core::ptr::null_mut();
-pub(crate) static mut INODES_CAP: usize = 0;
-pub(crate) static mut NEXT_INO: u32 = 1;
-
-pub(crate) static mut WRITABLE_POOL_PTR: *mut [u8; WRITABLE_SIZE] = core::ptr::null_mut();
-pub(crate) static mut WRITABLE_USED_PTR: *mut u8 = core::ptr::null_mut();
-pub(crate) static mut WRITABLE_NEXT_PTR: *mut u32 = core::ptr::null_mut();
-pub(crate) static mut WRITABLE_CAP: usize = 0;
-
-pub(crate) static mut SYMLINK_POOL_PTR: *mut [u8; MAX_PATH_LEN] = core::ptr::null_mut();
-pub(crate) static mut SYMLINK_USED_PTR: *mut u8 = core::ptr::null_mut();
-pub(crate) static mut SYMLINK_CAP: usize = 0;
-
-pub(crate) static mut CLIENTS_PTR: *mut ClientState = core::ptr::null_mut();
-pub(crate) static mut CLIENTS_CAP: usize = 0;
-
-pub(crate) static mut FB_WIDTH: u32 = 0;
-pub(crate) static mut FB_HEIGHT: u32 = 0;
-pub(crate) static mut FB_PITCH: u32 = 0;
-pub(crate) static mut FB_BPP: u8 = 0;
-pub(crate) static mut FB_RED_POS: u8 = 0;
-pub(crate) static mut FB_RED_SIZE: u8 = 0;
-pub(crate) static mut FB_GREEN_POS: u8 = 0;
-pub(crate) static mut FB_GREEN_SIZE: u8 = 0;
-pub(crate) static mut FB_BLUE_POS: u8 = 0;
-pub(crate) static mut FB_BLUE_SIZE: u8 = 0;
-
-pub(crate) static mut SOCKETS_PTR: *mut SocketState = core::ptr::null_mut();
-pub(crate) static mut SOCKETS_CAP: usize = 0;
-pub(crate) static mut NEXT_SOCK_ID: u32 = 1;
-
-pub(crate) static mut POLL_WAITERS_PTR: *mut PollWaiter = core::ptr::null_mut();
-pub(crate) static mut POLL_WAITERS_CAP: usize = 0;
-
-pub(crate) static mut EPOLLS_PTR: *mut EpollInstance = core::ptr::null_mut();
-pub(crate) static mut EPOLLS_CAP: usize = 0;
-
-pub(crate) static mut SHM_DATA_PTR: *mut ShmData = core::ptr::null_mut();
-pub(crate) static mut SHM_CAP: usize = 0;
-
-pub(crate) static mut PIPES_PTR: *mut PipeState = core::ptr::null_mut();
-pub(crate) static mut PIPES_CAP: usize = 0;
-pub(crate) static mut NEXT_PIPE_ID: u32 = 1;
-
-pub(crate) static mut PTY_PENDING: [[PtyPendingReader; MAX_PTY_WAITERS]; MAX_PTYS] =
-    [[PtyPendingReader::zeroed(); MAX_PTY_WAITERS]; MAX_PTYS];
-pub(crate) static mut PTY_PENDING_COUNT: [usize; MAX_PTYS] = [0; MAX_PTYS];
-
-pub(crate) static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
-pub(crate) static mut CURRENT_RECV_SLOT: u64 = 0;
-
-pub(crate) static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::zeroed(); MAX_MOUNTS];
-pub(crate) static mut ROOT_UNDERLAY_IDX: i32 = -1;
-pub(crate) static mut MOUNT_TRIED: u8 = 0;
-pub(crate) static mut VFS_SHM_ACTIVE: bool = false;
-
-pub(crate) static mut URANDOM_KEY: [u8; 32] = [0u8; 32];
-pub(crate) static mut URANDOM_CTR: u64 = 0;
-pub(crate) static mut URANDOM_BUF: [u8; 64] = [0u8; 64];
-pub(crate) static mut URANDOM_BUF_POS: usize = 64;
-pub(crate) static mut URANDOM_COUNTER: u64 = 0;
-const URANDOM_RESEED_INTERVAL: u64 = 1024;
-
-pub(crate) static mut PROC_ROOT_INO: u32 = 0;
-
-// ======================================================================
-// Pool access macros
-// ======================================================================
-
-#[macro_export]
-macro_rules! INODES {
-    () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::INODES_PTR, $crate::max_inodes()) }
-    };
-}
-
-#[macro_export]
-macro_rules! WRITABLE_POOL {
-    () => {
-        unsafe {
-            core::slice::from_raw_parts_mut($crate::WRITABLE_POOL_PTR, $crate::max_writable())
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! WRITABLE_USED {
-    () => {
-        unsafe {
-            core::slice::from_raw_parts_mut($crate::WRITABLE_USED_PTR, $crate::max_writable())
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! CLIENTS {
-    () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::CLIENTS_PTR, $crate::max_clients()) }
-    };
-}
-
-#[macro_export]
-macro_rules! SOCKETS {
-    () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::SOCKETS_PTR, $crate::max_sockets()) }
-    };
-}
-
-#[macro_export]
-macro_rules! POLL_WAITERS {
-    () => {
-        unsafe {
-            core::slice::from_raw_parts_mut($crate::POLL_WAITERS_PTR, $crate::max_poll_waiters())
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! EPOLLS {
-    () => {
-        unsafe {
-            core::slice::from_raw_parts_mut($crate::EPOLLS_PTR, $crate::max_epoll_instances())
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! SHM_DATA {
-    () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::SHM_DATA_PTR, $crate::max_shm_objects()) }
-    };
-}
-
-#[macro_export]
-macro_rules! PIPES {
-    () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::PIPES_PTR, $crate::max_pipes()) }
-    };
-}
-
-// ======================================================================
-// Capacity accessor functions
-// ======================================================================
-
-pub(crate) fn max_inodes() -> usize {
-    unsafe { *(&raw const INODES_CAP) }
-}
-
-pub(crate) fn max_writable() -> usize {
-    unsafe { *(&raw const WRITABLE_CAP) }
-}
-
-pub(crate) fn max_clients() -> usize {
-    unsafe { *(&raw const CLIENTS_CAP) }
-}
-
-pub(crate) fn max_sockets() -> usize {
-    unsafe { *(&raw const SOCKETS_CAP) }
-}
-
-pub(crate) fn max_poll_waiters() -> usize {
-    unsafe { *(&raw const POLL_WAITERS_CAP) }
-}
-
-pub(crate) fn max_epoll_instances() -> usize {
-    unsafe { *(&raw const EPOLLS_CAP) }
-}
-
-pub(crate) fn max_shm_objects() -> usize {
-    unsafe { *(&raw const SHM_CAP) }
-}
-
-pub(crate) fn max_shm_pages() -> usize {
-    MAX_SHM_PAGES
-}
-
-pub(crate) fn max_pipes() -> usize {
-    unsafe { *(&raw const PIPES_CAP) }
-}
-
-// ======================================================================
-// Pool allocation functions
-// ======================================================================
-
-pub(crate) unsafe fn vfs_grow_pool_with_min(
-    ptr_loc: *mut *mut u8,
-    cap_loc: *mut usize,
-    item_size: usize,
-    min_required: usize,
-) -> i32 {
-    let old_ptr = unsafe { *ptr_loc };
-    let old_cap = unsafe { *cap_loc };
-    if old_cap == 0 {
-        return -1;
-    }
-    let growth = if old_cap < 128 {
-        old_cap
-    } else if old_cap < 1024 {
-        old_cap / 2
-    } else {
-        256
-    };
-    let new_cap = core::cmp::max(min_required, old_cap + growth);
-    let new_bytes = match new_cap.checked_mul(item_size) {
-        Some(b) if b > 0 => b,
-        _ => return -1,
-    };
-    let new_pages = (new_bytes + 4095) / 4096;
-    let new_ptr = unsafe { crate::vfs_mem::map_anon((new_pages * 4096) as u64) };
-    if new_ptr.is_null() || new_ptr == usize::MAX as *mut u8 {
-        return -1;
-    }
-    let old_bytes = old_cap * item_size;
-    unsafe {
-        core::ptr::copy_nonoverlapping(old_ptr, new_ptr, old_bytes);
-        core::ptr::write_bytes(new_ptr.add(old_bytes), 0, new_pages * 4096 - old_bytes);
-    }
-    if !old_ptr.is_null() {
-        let old_pages = (old_bytes + 4095) / 4096;
-        unsafe {
-            crate::vfs_mem::unmap(old_ptr, (old_pages * 4096) as u64);
-        }
-    }
-    unsafe {
-        *ptr_loc = new_ptr;
-        *cap_loc = new_cap;
-    }
-    0
-}
-
-pub(crate) unsafe fn vfs_grow_pool(
-    ptr_loc: *mut *mut u8,
-    cap_loc: *mut usize,
-    item_size: usize,
-) -> i32 {
-    vfs_grow_pool_with_min(ptr_loc, cap_loc, item_size, 0)
-}
-
-pub(crate) unsafe fn vfs_alloc_array<T>(count: usize) -> *mut T {
-    unsafe {
-        let bytes = core::mem::size_of::<T>().checked_mul(count).unwrap_or(0);
-        if bytes == 0 {
-            return core::ptr::null_mut();
-        }
-        let pages = (bytes + 4095) / 4096;
-        let ptr = crate::vfs_mem::map_anon((pages * 4096) as u64);
-        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return core::ptr::null_mut();
-        }
-        core::ptr::write_bytes(ptr, 0, pages * 4096);
-        ptr as *mut T
-    }
-}
-
-pub(crate) unsafe fn vfs_grow_array_with_min<T: Copy>(
-    old_ptr: *mut T,
-    old_cap: usize,
-    min_required: usize,
-) -> (*mut T, usize) {
-    if old_cap == 0 || old_ptr.is_null() {
-        return (core::ptr::null_mut(), 0);
-    }
-    let growth = if old_cap < 128 {
-        old_cap
-    } else if old_cap < 1024 {
-        old_cap / 2
-    } else {
-        256
-    };
-    let new_cap = core::cmp::max(min_required, old_cap + growth);
-    let new_ptr = vfs_alloc_array::<T>(new_cap);
-    if new_ptr.is_null() {
-        return (core::ptr::null_mut(), 0);
-    }
-    unsafe {
-        for i in 0..old_cap {
-            *new_ptr.add(i) = *old_ptr.add(i);
-        }
-    }
-    let old_bytes = old_cap * core::mem::size_of::<T>();
-    let old_pages = (old_bytes + 4095) / 4096;
-    unsafe {
-        crate::vfs_mem::unmap(old_ptr as *mut u8, (old_pages * 4096) as u64);
-    }
-    (new_ptr, new_cap)
-}
-
-pub(crate) unsafe fn vfs_grow_array<T: Copy>(old_ptr: *mut T, old_cap: usize) -> (*mut T, usize) {
-    vfs_grow_array_with_min(old_ptr, old_cap, 0)
-}
-
-unsafe fn init_dynamic_state_storage() -> i32 {
-    unsafe fn alloc_pool<T>(
-        ptr_loc: *mut *mut T,
-        cap_loc: *mut usize,
-        initial_count: usize,
-    ) -> i32 {
-        let bytes = match core::mem::size_of::<T>().checked_mul(initial_count) {
-            Some(b) if b > 0 => b,
-            _ => return -1,
-        };
-        let pages = (bytes + 4095) / 4096;
-        let ptr = unsafe { crate::vfs_mem::map_anon((pages * 4096) as u64) };
-        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return -1;
-        }
-        unsafe {
-            core::ptr::write_bytes(ptr, 0, pages * 4096);
-            *ptr_loc = ptr as *mut T;
-            *cap_loc = initial_count;
-        }
-        0
-    }
-
-    unsafe {
-        if alloc_pool(&raw mut INODES_PTR, &raw mut INODES_CAP, INITIAL_INODES) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(
-            &raw mut WRITABLE_POOL_PTR,
-            &raw mut WRITABLE_CAP,
-            INITIAL_WRITABLE,
-        ) != 0
-        {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        let writable_used_bytes = INITIAL_WRITABLE;
-        let writable_used_pages = (writable_used_bytes + 4095) / 4096;
-        let ptr = crate::vfs_mem::map_anon((writable_used_pages * 4096) as u64);
-        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        core::ptr::write_bytes(ptr, 0, writable_used_pages * 4096);
-        WRITABLE_USED_PTR = ptr;
-
-        let next_bytes = INITIAL_WRITABLE * core::mem::size_of::<u32>();
-        let next_pages = (next_bytes + 4095) / 4096;
-        let next_ptr = crate::vfs_mem::map_anon((next_pages * 4096) as u64);
-        if next_ptr.is_null() || next_ptr == usize::MAX as *mut u8 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        let next_arr = next_ptr as *mut u32;
-        for i in 0..INITIAL_WRITABLE {
-            *next_arr.add(i) = u32::MAX;
-        }
-        WRITABLE_NEXT_PTR = next_arr;
-
-        if alloc_pool(
-            &raw mut SYMLINK_POOL_PTR,
-            &raw mut SYMLINK_CAP,
-            INITIAL_SYMLINKS,
-        ) != 0
-        {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        let sym_used_pages = (INITIAL_SYMLINKS + 4095) / 4096;
-        let sym_used_ptr = crate::vfs_mem::map_anon((sym_used_pages * 4096) as u64);
-        if sym_used_ptr.is_null() || sym_used_ptr == usize::MAX as *mut u8 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        core::ptr::write_bytes(sym_used_ptr, 0, sym_used_pages * 4096);
-        SYMLINK_USED_PTR = sym_used_ptr;
-
-        if alloc_pool(&raw mut CLIENTS_PTR, &raw mut CLIENTS_CAP, INITIAL_CLIENTS) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(&raw mut SOCKETS_PTR, &raw mut SOCKETS_CAP, INITIAL_SOCKETS) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(
-            &raw mut POLL_WAITERS_PTR,
-            &raw mut POLL_WAITERS_CAP,
-            INITIAL_POLL_WAITERS,
-        ) != 0
-        {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(&raw mut EPOLLS_PTR, &raw mut EPOLLS_CAP, INITIAL_EPOLLS) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(&raw mut SHM_DATA_PTR, &raw mut SHM_CAP, INITIAL_SHM) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-        if alloc_pool(&raw mut PIPES_PTR, &raw mut PIPES_CAP, INITIAL_PIPES) != 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[VFS] Growable pools initialized: inodes=128 clients=16 sockets=32 pipes=16\n");
-        });
-
-        0
-    }
-}
+use server::consts::*;
 
 // ======================================================================
 // Helper functions
@@ -451,7 +39,7 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
@@ -680,218 +268,6 @@ unsafe fn init_fb_info() {
     }
 }
 
-unsafe fn init_ramfs() {
-    unsafe {
-        for i in 0..max_inodes() {
-            INODES!()[i].active = 0;
-        }
-        for i in 0..max_writable() {
-            WRITABLE_USED!()[i] = 0;
-        }
-
-        let root = ramfs::alloc_inode();
-        (*root).ftype = FTYPE_DIRECTORY;
-        (*root).mode = S_IFDIR_L | 0o755;
-        (*root).nlink = 2;
-
-        let dev_dir = ramfs::alloc_inode();
-        (*dev_dir).ftype = FTYPE_DIRECTORY;
-        (*dev_dir).mode = S_IFDIR_L | 0o755;
-        (*dev_dir).nlink = 2;
-        (*dev_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"dev".as_ptr(), 3, (*dev_dir).ino);
-
-        let console = ramfs::alloc_inode();
-        (*console).ftype = FTYPE_CHAR_DEVICE;
-        (*console).mode = S_IFCHR_L | 0o666;
-        (*console).dev_type = DEV_CONSOLE;
-        (*console).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"console".as_ptr(), 7, (*console).ino);
-
-        let null_dev = ramfs::alloc_inode();
-        (*null_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*null_dev).mode = S_IFCHR_L | 0o666;
-        (*null_dev).dev_type = DEV_NULL;
-        (*null_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"null".as_ptr(), 4, (*null_dev).ino);
-
-        let zero_dev = ramfs::alloc_inode();
-        (*zero_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*zero_dev).mode = S_IFCHR_L | 0o666;
-        (*zero_dev).dev_type = DEV_ZERO;
-        (*zero_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"zero".as_ptr(), 4, (*zero_dev).ino);
-
-        let fb0_dev = ramfs::alloc_inode();
-        (*fb0_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*fb0_dev).mode = S_IFCHR_L | 0o666;
-        (*fb0_dev).dev_type = DEV_FB0;
-        (*fb0_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"fb0".as_ptr(), 3, (*fb0_dev).ino);
-
-        let pts_dir = ramfs::alloc_inode();
-        (*pts_dir).ftype = FTYPE_DIRECTORY;
-        (*pts_dir).mode = S_IFDIR_L | 0o755;
-        (*pts_dir).nlink = 2;
-        (*pts_dir).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"pts".as_ptr(), 3, (*pts_dir).ino);
-
-        let pts0 = ramfs::alloc_inode();
-        (*pts0).ftype = FTYPE_CHAR_DEVICE;
-        (*pts0).mode = S_IFCHR_L | 0o666;
-        (*pts0).dev_type = DEV_PTY_SLAVE;
-        (*pts0).size = 0;
-        (*pts0).parent_ino = (*pts_dir).ino;
-        ramfs::dir_add_entry(pts_dir, b"0".as_ptr(), 1, (*pts0).ino);
-
-        let tty_dev = ramfs::alloc_inode();
-        (*tty_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*tty_dev).mode = S_IFCHR_L | 0o666;
-        (*tty_dev).dev_type = DEV_PTY_SLAVE;
-        (*tty_dev).size = 0;
-        (*tty_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"tty".as_ptr(), 3, (*tty_dev).ino);
-
-        let urandom_dev = ramfs::alloc_inode();
-        (*urandom_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*urandom_dev).mode = S_IFCHR_L | 0o666;
-        (*urandom_dev).dev_type = DEV_URANDOM;
-        (*urandom_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"urandom".as_ptr(), 7, (*urandom_dev).ino);
-
-        let random_dev = ramfs::alloc_inode();
-        (*random_dev).ftype = FTYPE_CHAR_DEVICE;
-        (*random_dev).mode = S_IFCHR_L | 0o666;
-        (*random_dev).dev_type = DEV_URANDOM;
-        (*random_dev).parent_ino = (*dev_dir).ino;
-        ramfs::dir_add_entry(dev_dir, b"random".as_ptr(), 6, (*random_dev).ino);
-
-        let proc_dir = ramfs::alloc_inode();
-        (*proc_dir).ftype = FTYPE_PROC_FILE;
-        (*proc_dir).dev_type = PROC_FILE_ROOT;
-        (*proc_dir).mode = S_IFDIR_L | 0o555;
-        (*proc_dir).readonly = 1;
-        (*proc_dir).nlink = 2;
-        (*proc_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"proc".as_ptr(), 4, (*proc_dir).ino);
-        PROC_ROOT_INO = (*proc_dir).ino;
-
-        let proc_net_dir = ramfs::alloc_inode();
-        (*proc_net_dir).ftype = FTYPE_PROC_FILE;
-        (*proc_net_dir).dev_type = PROC_FILE_NET_DIR;
-        (*proc_net_dir).mode = S_IFDIR_L | 0o555;
-        (*proc_net_dir).readonly = 1;
-        (*proc_net_dir).nlink = 2;
-        (*proc_net_dir).parent_ino = (*proc_dir).ino;
-        ramfs::dir_add_entry(proc_dir, b"net".as_ptr(), 3, (*proc_net_dir).ino);
-
-        let proc_route = ramfs::alloc_inode();
-        (*proc_route).ftype = FTYPE_PROC_FILE;
-        (*proc_route).dev_type = PROC_FILE_NET_ROUTE;
-        (*proc_route).mode = S_IFREG_L | 0o444;
-        (*proc_route).readonly = 1;
-        (*proc_route).parent_ino = (*proc_net_dir).ino;
-        ramfs::dir_add_entry(proc_net_dir, b"route".as_ptr(), 5, (*proc_route).ino);
-
-        let proc_arp = ramfs::alloc_inode();
-        (*proc_arp).ftype = FTYPE_PROC_FILE;
-        (*proc_arp).dev_type = PROC_FILE_NET_ARP;
-        (*proc_arp).mode = S_IFREG_L | 0o444;
-        (*proc_arp).readonly = 1;
-        (*proc_arp).parent_ino = (*proc_net_dir).ino;
-        ramfs::dir_add_entry(proc_net_dir, b"arp".as_ptr(), 3, (*proc_arp).ino);
-
-        let proc_dev = ramfs::alloc_inode();
-        (*proc_dev).ftype = FTYPE_PROC_FILE;
-        (*proc_dev).dev_type = PROC_FILE_NET_DEV;
-        (*proc_dev).mode = S_IFREG_L | 0o444;
-        (*proc_dev).readonly = 1;
-        (*proc_dev).parent_ino = (*proc_net_dir).ino;
-        ramfs::dir_add_entry(proc_net_dir, b"dev".as_ptr(), 3, (*proc_dev).ino);
-
-        let mnt_dir = ramfs::alloc_inode();
-        (*mnt_dir).ftype = FTYPE_DIRECTORY;
-        (*mnt_dir).mode = S_IFDIR_L | 0o755;
-        (*mnt_dir).nlink = 2;
-        (*mnt_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"mnt".as_ptr(), 3, (*mnt_dir).ino);
-
-        let initrd_dir = ramfs::alloc_inode();
-        (*initrd_dir).ftype = FTYPE_DIRECTORY;
-        (*initrd_dir).mode = S_IFDIR_L | 0o555;
-        (*initrd_dir).readonly = 1;
-        (*initrd_dir).nlink = 2;
-        (*initrd_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"initrd".as_ptr(), 6, (*initrd_dir).ino);
-
-        let tmp_dir = ramfs::alloc_inode();
-        (*tmp_dir).ftype = FTYPE_DIRECTORY;
-        (*tmp_dir).mode = S_IFDIR_L | 0o1777;
-        (*tmp_dir).nlink = 2;
-        (*tmp_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"tmp".as_ptr(), 3, (*tmp_dir).ino);
-
-        let etc_dir = ramfs::alloc_inode();
-        (*etc_dir).ftype = FTYPE_DIRECTORY;
-        (*etc_dir).mode = S_IFDIR_L | 0o755;
-        (*etc_dir).nlink = 2;
-        (*etc_dir).parent_ino = (*root).ino;
-        ramfs::dir_add_entry(root, b"etc".as_ptr(), 3, (*etc_dir).ino);
-
-        let hosts = ramfs::alloc_inode();
-        (*hosts).ftype = FTYPE_PROC_FILE;
-        (*hosts).dev_type = PROC_FILE_ETC_HOSTS;
-        (*hosts).mode = S_IFREG_L | 0o444;
-        (*hosts).readonly = 1;
-        (*hosts).parent_ino = (*etc_dir).ino;
-        ramfs::dir_add_entry(etc_dir, b"hosts".as_ptr(), 5, (*hosts).ino);
-
-        let host = ramfs::alloc_inode();
-        (*host).ftype = FTYPE_PROC_FILE;
-        (*host).dev_type = PROC_FILE_ETC_HOSTS;
-        (*host).mode = S_IFREG_L | 0o444;
-        (*host).readonly = 1;
-        (*host).parent_ino = (*etc_dir).ino;
-        ramfs::dir_add_entry(etc_dir, b"host".as_ptr(), 4, (*host).ino);
-
-        let resolv_conf = ramfs::alloc_inode();
-        (*resolv_conf).ftype = FTYPE_PROC_FILE;
-        (*resolv_conf).dev_type = PROC_FILE_ETC_RESOLV_CONF;
-        (*resolv_conf).mode = S_IFREG_L | 0o444;
-        (*resolv_conf).readonly = 1;
-        (*resolv_conf).parent_ino = (*etc_dir).ino;
-        ramfs::dir_add_entry(etc_dir, b"resolv.conf".as_ptr(), 11, (*resolv_conf).ino);
-
-        let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = ramfs::read_boot_info_initrd_size();
-
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[VFS] Initrd size: ");
-            _lb.hex(initrd_size as u64);
-            _lb.str(b" bytes\n");
-        });
-
-        let mut offset: usize = 0;
-        let mut entry = CpioEntryExt::zeroed();
-        let mut file_count: u32 = 0;
-
-        while cpio::cpio_next_ext(initrd, initrd_size, &raw mut offset, &raw mut entry) != 0 {
-            if entry.name_len == 1 && *entry.name == b'.' {
-                continue;
-            }
-            if ramfs::mount_initrd_entry(initrd_dir, &entry) {
-                file_count += 1;
-            }
-        }
-
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[VFS] Mounted ");
-            _lb.hex(file_count as u64);
-            _lb.str(b" initrd files\n");
-        });
-    }
-}
-
 // ======================================================================
 // Entry point
 // ======================================================================
@@ -901,6 +277,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     trona::uinfo!(|_lb| {
         _lb.str(b"[VFS] SaltyOS VFS server starting\n");
     });
+
+    let mut state = match owner::VfsState::new() {
+        Some(state) => state,
+        None => {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[VFS] FATAL: failed to allocate VfsState\n");
+            });
+            idle();
+        }
+    };
 
     unsafe {
         let derr = init_dynamic_state_storage();
@@ -916,7 +302,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     unsafe {
         urandom_init();
-        init_ramfs();
+        boot::init_boot_env(&mut state);
         init_fb_info();
     }
 
@@ -924,7 +310,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         _lb.str(b"[VFS] Filesystem ready\n");
     });
 
-    if VFS_CAP_NAMESRV_EP != 0 {
+    if trona::caps::namesrv_ep() != 0 {
         let mut reg_msg = TronaMsg::zeroed();
         let mut reg_reply = TronaMsg::zeroed();
         let svc_name = b"vfs";
@@ -939,10 +325,10 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
 
         unsafe {
-            ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-            let err = ipc::call_ctx(
+            trona::ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+            let err = trona::ipc::call_ctx(
                 ipc_ctx(),
-                VFS_CAP_NAMESRV_EP,
+                trona::caps::namesrv_ep(),
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
@@ -971,525 +357,104 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
     }
 
-    // Eagerly establish the root underlay mount (saltyfs/rootfs) during startup.
-    // Doing this outside request handling avoids nested namesrv+cap-transfer mount setup
-    // on the first /bin/* open path (e.g., procmgr VFS fallback loads).
-    unsafe {
-        mount::setup_saltyfs_mount();
-    }
-
     signal_ready();
 
-    unsafe {
-        let slot = match trona::slot_alloc::slot_alloc() {
-            Some(s) => s,
-            None => {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[VFS] FATAL: no receive slot for pager IPC\n");
-                });
-                idle();
-            }
-        };
-        CURRENT_RECV_SLOT = slot;
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
-    }
-
-    if unsafe { !inet::prepare_inet_callback_endpoint() } {
+    if unsafe { !backend::prepare_backend_callback_endpoint() } {
         trona::uerror!(|_lb| {
-            _lb.str(b"[VFS] failed to prepare netsrv callback endpoint\n");
+            _lb.str(b"[VFS] failed to prepare backend callback endpoint\n");
         });
         idle();
     }
 
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-    let mut recv_source: u64 = 0;
-    let recv_endpoints = [CAP_SERVER_EP, VFS_CAP_NETSRV_CALLBACK_EP];
-    let mut have_message = true;
-
-    let err = unsafe {
-        ipc::recv_any_ctx(
-            ipc_ctx(),
-            recv_endpoints.as_ptr(),
-            recv_endpoints.len(),
-            &raw mut msg,
-            &raw mut badge,
-            &raw mut recv_source,
-        )
-    };
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[VFS] initial recv failed\n");
+    if unsafe { !backend::ensure_mmsrv_pager_callback_registered() } {
+        trona::uwarn!(|_lb| {
+            _lb.str(b"[VFS] WARN: mmsrv pager callback EP registration failed; using service fallback\n");
         });
-        idle();
     }
 
-    loop {
-        let mut reply = TronaMsg::zeroed();
-        let mut skip_reply = true;
-
-        if have_message {
-            skip_reply = false;
-
-            if recv_source == IPC_RECV_SOURCE_NOTIFICATION {
-                unsafe {
-                    misc::handle_pty_notification(badge);
+    #[cfg(not(vfs_worker_pool))]
+    {
+        // Allocate receive slot.
+        unsafe {
+            let slot = match trona::slot_alloc::slot_alloc() {
+                Some(s) => s,
+                None => {
+                    trona::uerror!(|_lb| {
+                        _lb.str(b"[VFS] FATAL: no receive slot\n");
+                    });
+                    idle();
                 }
-                skip_reply = true;
-            } else if recv_source == 1 {
-                // Async completion from netsrv. netsrv rebadges the transferred
-                // callback endpoint locally, so callback identity is enforced by
-                // the badge on the dedicated callback EP.
-                if badge == consts::NETSRV_CALLBACK_BADGE {
-                    unsafe {
-                        inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
-                    }
-                } else {
-                    reply.label = TRONA_INVALID_OPERATION;
-                }
-                // reply to netsrv to complete the callback IPC — do NOT skip reply
+            };
+            state.current_recv_slot = slot;
+            state.worker_recv_slots[0] = slot;
+
+            // Receive-slot statics are still consumed by the IPC loop helpers.
+            CURRENT_RECV_SLOT = slot;
+            set_worker_recv_slot(0, slot);
+            trona::ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
+        }
+
+        let recv_endpoints = [trona::caps::service_ep(), VFS_CAP_BACKEND_CALLBACK_EP];
+
+        // Enter the owner loop — never returns.
+        unsafe { owner::loop_::run_owner_loop(&mut state, &recv_endpoints) }
+    }
+
+    #[cfg(vfs_worker_pool)]
+    {
+        let (workers, overridden) = ipc::loop_::compute_vfs_worker_count();
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[VFS] worker pool mode: ");
+            _lb.dec(workers as u64);
+            if overridden {
+                _lb.str(b" workers (override)\n");
             } else {
-                unsafe {
-                    match msg.label {
-                        VFS_OPEN => {
-                            fileops::handle_open(&raw const msg, &raw mut reply, badge);
-                        }
-                        VFS_READ => {
-                            let fd = msg.regs[0] as i32;
-                            let cli = client::get_client(badge);
-                            if !cli.is_null()
-                                && fd >= 0
-                                && fd < (*cli).objects_cap as i32
-                                && (*(*cli).objects.add(fd as usize)).active != 0
-                            {
-                                match (*(*cli).objects.add(fd as usize)).obj_type {
-                                    OBJ_TYPE_INET_SOCKET => {
-                                        skip_reply = inet::handle_inet_read(
-                                            &raw const msg,
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                            badge,
-                                        );
-                                    }
-                                    OBJ_TYPE_SOCKET => {
-                                        skip_reply = socket::handle_socket_read(
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                            badge,
-                                        );
-                                    }
-                                    OBJ_TYPE_PIPE => {
-                                        skip_reply = pipe::handle_pipe_read(
-                                            &raw const msg,
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                            badge,
-                                        );
-                                    }
-                                    OBJ_TYPE_DEVICE => {
-                                        if (*(*cli).objects.add(fd as usize)).dev_type == DEV_PTY_SLAVE {
-                                            skip_reply = misc::handle_pty_dev_read(
-                                                &raw const msg,
-                                                (*cli).objects.add(fd as usize),
-                                                (*cli).posix_ext.add(fd as usize),
-                                                &raw mut reply,
-                                                badge,
-                                            );
-                                        } else {
-                                            fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                                        }
-                                    }
-                                    OBJ_TYPE_MOUNT => {
-                                        let fde = &mut *(*cli).objects.add(fd as usize);
-                                        let ext = &*(*cli).posix_ext.add(fd as usize);
-                                        let mount_idx = ext.mount_idx as usize;
-                                        let remote_ino = ext.mount_remote_ino;
-                                        let count = msg.regs[1];
-                                        if *(&raw const VFS_SHM_ACTIVE) {
-                                            mount::mount_read_shm(
-                                                mount_idx,
-                                                remote_ino,
-                                                fde.offset,
-                                                count,
-                                                0,
-                                                &raw mut reply,
-                                            );
-                                            if reply.label == TRONA_OK {
-                                                let bytes_read = reply.regs[0];
-                                                let copy_len = bytes_read.min(152);
-                                                reply.length = 1 + (copy_len + 7) / 8;
-                                                let src = VFS_SALTYFS_SHM_VADDR as *const u8;
-                                                let dst = &raw mut reply.regs[1] as *mut u8;
-                                                for j in 0..copy_len as usize {
-                                                    *dst.add(j) = *src.add(j);
-                                                }
-                                            }
-                                        } else {
-                                            let capped = count.min(152);
-                                            mount::mount_read_inline(
-                                                mount_idx,
-                                                remote_ino,
-                                                fde.offset,
-                                                capped,
-                                                &raw mut reply,
-                                            );
-                                        }
-                                        if reply.label == TRONA_OK {
-                                            let bytes_read = reply.regs[0];
-                                            fde.offset += bytes_read;
-                                        }
-                                    }
-                                    _ => {
-                                        fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                                    }
-                                }
-                            } else {
-                                fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                            }
-                        },
-                        VFS_WRITE => {
-                            let fd = msg.regs[0] as i32;
-                            let cli = client::get_client(badge);
-                            if !cli.is_null()
-                                && fd >= 0
-                                && fd < (*cli).objects_cap as i32
-                                && (*(*cli).objects.add(fd as usize)).active != 0
-                            {
-                                match (*(*cli).objects.add(fd as usize)).obj_type {
-                                    OBJ_TYPE_INET_SOCKET => {
-                                        skip_reply = inet::handle_inet_write(
-                                            &raw const msg,
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                        );
-                                    }
-                                    OBJ_TYPE_SOCKET => {
-                                        skip_reply = socket::handle_socket_write(
-                                            &raw const msg,
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                        );
-                                    }
-                                    OBJ_TYPE_PIPE => {
-                                        skip_reply = pipe::handle_pipe_write(
-                                            &raw const msg,
-                                            (*cli).objects.add(fd as usize),
-                                            (*cli).posix_ext.add(fd as usize),
-                                            &raw mut reply,
-                                            badge,
-                                        );
-                                    }
-                                    OBJ_TYPE_MOUNT => {
-                                        let fde = &mut *(*cli).objects.add(fd as usize);
-                                        let ext = &*(*cli).posix_ext.add(fd as usize);
-                                        if !client::flags_allow_write(fde.flags) {
-                                            reply.label = TRONA_INVALID_OPERATION;
-                                        } else {
-                                            let mount_idx = ext.mount_idx as usize;
-                                            let remote_ino = ext.mount_remote_ino;
-                                            let count = msg.regs[1];
-                                            let mut offset = fde.offset;
-                                            if (fde.flags & O_APPEND) != 0 {
-                                                if let Some((sz, _, _, _, _)) =
-                                                    mount::mount_stat(mount_idx, remote_ino)
-                                                {
-                                                    offset = sz;
-                                                }
-                                            }
-                                            if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
-                                                let max_inline: u64 = 18 * 8;
-                                                let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
-                                                let safe_count = count.min(max_inline).min(shm_limit);
-                                                let src = &msg.regs[2] as *const u64 as *const u8;
-                                                let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
-                                                for j in 0..safe_count as usize {
-                                                    *dst.add(j) = *src.add(j);
-                                                }
-                                                mount::mount_write_shm(
-                                                    mount_idx,
-                                                    remote_ino,
-                                                    offset,
-                                                    safe_count,
-                                                    0,
-                                                    &raw mut reply,
-                                                );
-                                            } else {
-                                                let capped = count.min(136);
-                                                let src = &msg.regs[2] as *const u64 as *const u8;
-                                                mount::mount_write_inline(
-                                                    mount_idx,
-                                                    remote_ino,
-                                                    offset,
-                                                    src,
-                                                    capped,
-                                                    &raw mut reply,
-                                                );
-                                            }
-                                            if reply.label == TRONA_OK {
-                                                let written = reply.regs[0];
-                                                fde.offset = offset + written;
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                                    }
-                                }
-                            } else {
-                                fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                            }
-                        },
-                    VFS_CLOSE => {
-                        let fd = msg.regs[0] as i32;
-                        let cli = client::get_client(badge);
-                        if !cli.is_null()
-                            && fd >= 0
-                            && fd < (*cli).objects_cap as i32
-                            && (*(*cli).objects.add(fd as usize)).active != 0
-                        {
-                            match (*(*cli).objects.add(fd as usize)).obj_type {
-                                OBJ_TYPE_INET_SOCKET => {
-                                    inet::close_inet_socket((*cli).objects.add(fd as usize), (*cli).posix_ext.add(fd as usize));
-                                }
-                                OBJ_TYPE_SOCKET => {
-                                    socket::close_socket((*cli).objects.add(fd as usize), (*cli).posix_ext.add(fd as usize));
-                                }
-                                OBJ_TYPE_PIPE => {
-                                    pipe::close_pipe((*cli).objects.add(fd as usize), (*cli).posix_ext.add(fd as usize));
-                                }
-                                OBJ_TYPE_EPOLL => {
-                                    let ep_idx = (*(*cli).posix_ext.add(fd as usize)).epoll_id as usize;
-                                    if ep_idx < max_epoll_instances() {
-                                        EPOLLS!()[ep_idx].active = 0;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        fileops::handle_close(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_STAT => {
-                        fileops::handle_stat(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_LSEEK => {
-                        fileops::handle_lseek(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_FSTAT => {
-                        fileops::handle_fstat(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_UNLINK => {
-                        fileops::handle_unlink(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_RENAME => {
-                        fileops::handle_rename(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_MKDIR => {
-                        fileops::handle_mkdir(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_RMDIR => {
-                        fileops::handle_rmdir(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_OPENDIR => {
-                        fileops::handle_opendir(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_READDIR => {
-                        let fd = msg.regs[0] as i32;
-                        let cli = client::get_client(badge);
-                        if !cli.is_null()
-                            && fd >= 0
-                            && fd < (*cli).objects_cap as i32
-                            && (*(*cli).objects.add(fd as usize)).active != 0
-                            && (*(*cli).objects.add(fd as usize)).obj_type == OBJ_TYPE_MOUNT
-                        {
-                            let fde = &mut *(*cli).objects.add(fd as usize);
-                            let ext = &mut *(*cli).posix_ext.add(fd as usize);
-                            let mount_idx = ext.mount_idx as usize;
-                            let remote_ino = ext.mount_remote_ino;
-                            mount::mount_readdir(
-                                mount_idx,
-                                ext as *mut PosixObjExt,
-                                remote_ino,
-                                &raw mut reply,
-                            );
-                        } else {
-                            fileops::handle_readdir(&raw const msg, &raw mut reply, badge);
-                        }
-                    }
-                    VFS_PIPE => {
-                        pipe::handle_pipe(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_DUP => {
-                        pipe::handle_dup(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_DUP2 => {
-                        pipe::handle_dup2(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_DUP3 => {
-                        pipe::handle_dup3(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_CLONE_FDS => {
-                        pipe::handle_clone_fds(&raw const msg, &raw mut reply);
-                    }
-                    VFS_MKFIFO => {
-                        fileops::handle_mkfifo(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_CLIENT_EXIT => {
-                        client::handle_client_exit(&raw const msg, &raw mut reply);
-                        skip_reply = true;
-                    }
-                    VFS_PREAD => {
-                        fileops::handle_pread(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_PWRITE => {
-                        fileops::handle_pwrite(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_BULK_SETUP => {
-                        bulk::handle_bulk_setup(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_BULK_READ => {
-                        bulk::handle_bulk_read(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_BULK_PWRITE => {
-                        bulk::handle_bulk_pwrite(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_PAGER_READ => {
-                        misc::handle_pager_read(&raw const msg, &raw mut reply);
-                    }
-                    VFS_PAGER_WRITE => {
-                        misc::handle_pager_write(&raw const msg, &raw mut reply);
-                    }
-                    VFS_RESOLVE_BACKING => {
-                        misc::handle_resolve_backing(&raw const msg, &raw mut reply, badge);
-                    }
-                    VFS_DUMP_PENDING => {
-                        trona::uinfo!(|_lb| {
-                            _lb.str(b"[VFS] dump: pending inet ops, reply slot state\n");
+                _lb.str(b" workers (auto)\n");
+            }
+        });
+
+        unsafe {
+            WORKER_RECV_SLOT_COUNT = workers;
+            for worker_idx in 0..workers {
+                let slot = match trona::slot_alloc::slot_alloc() {
+                    Some(s) => s,
+                    None => {
+                        trona::uerror!(|_lb| {
+                            _lb.str(b"[VFS] FATAL: no worker receive slot for pager IPC\n");
                         });
-                        posix::inet::dump_pending_inet();
-                        reply.label = TRONA_OK;
+                        idle();
                     }
-                    _ => {
-                        // Try POSIX personality dispatch
-                        if let Some(sr) = posix::dispatch(
-                            &raw const msg,
-                            &raw mut reply,
-                            badge,
-                        ) {
-                            skip_reply = sr;
-                        } else {
-                            reply.label = TRONA_INVALID_OPERATION;
-                        }
-                    }
+                };
+                set_worker_recv_slot(worker_idx, slot);
+                if worker_idx == 0 {
+                    CURRENT_RECV_SLOT = slot;
+                    trona::ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
                 }
             }
         }
 
-        unsafe {
-            if CURRENT_RECV_SLOT != 0 {
-                let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, CURRENT_RECV_SLOT);
-                ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CURRENT_RECV_SLOT, 0);
-            }
-        }
-        }
-
-        unsafe {
-            let now_ns = poll::monotonic_now_ns();
-            poll::expire_poll_timeouts(now_ns);
-            misc::expire_pty_read_timeouts(now_ns);
-        }
-        let timeout_ns = unsafe {
-            let now_ns = poll::monotonic_now_ns();
-            let poll_timeout_ns = poll::next_poll_timeout_ns(now_ns);
-            let pty_timeout_ns = misc::next_pty_read_timeout_ns(now_ns);
-            match (poll_timeout_ns, pty_timeout_ns) {
-                (0, other) => other,
-                (other, 0) => other,
-                (lhs, rhs) => core::cmp::min(lhs, rhs),
-            }
+        let sc_cap = trona::caps::sc_cap();
+        let recv_endpoints = [trona::caps::service_ep(), VFS_CAP_BACKEND_CALLBACK_EP];
+        let config = trona::worker::WorkerConfig {
+            worker_count: workers,
+            endpoints: recv_endpoints.as_ptr(),
+            endpoint_count: recv_endpoints.len(),
+            untyped: CAP_UNTYPED_START,
+            self_tcb: CAP_SELF_TCB,
+            self_sc: sc_cap,
+            stack_pages: 32,
+            pool_budget_us: 0,
+            pool_period_us: 0,
+            cspace_depth: 0,
+            on_enter: Some(ipc::loop_::vfs_worker_on_enter),
+            next_timeout_ns: Some(ipc::loop_::vfs_worker_next_timeout_ns),
+            on_timeout: Some(ipc::loop_::vfs_worker_on_timeout),
         };
-
-        let err = if skip_reply {
-            if timeout_ns == 0 {
-                unsafe {
-                    ipc::recv_any_ctx(
-                        ipc_ctx(),
-                        recv_endpoints.as_ptr(),
-                        recv_endpoints.len(),
-                        &raw mut msg,
-                        &raw mut badge,
-                        &raw mut recv_source,
-                    )
-                }
-            } else {
-                unsafe {
-                    ipc::recv_any_timed_ctx(
-                        ipc_ctx(),
-                        recv_endpoints.as_ptr(),
-                        recv_endpoints.len(),
-                        timeout_ns,
-                        &raw mut msg,
-                        &raw mut badge,
-                        &raw mut recv_source,
-                    )
-                }
-            }
-        } else {
-            if timeout_ns == 0 {
-                unsafe {
-                    ipc::reply_recv_any_ctx(
-                        ipc_ctx(),
-                        recv_endpoints.as_ptr(),
-                        recv_endpoints.len(),
-                        &raw const reply,
-                        &raw mut msg,
-                        &raw mut badge,
-                        &raw mut recv_source,
-                    )
-                }
-            } else {
-                unsafe {
-                    ipc::reply_recv_any_timed_ctx(
-                        ipc_ctx(),
-                        recv_endpoints.as_ptr(),
-                        recv_endpoints.len(),
-                        timeout_ns,
-                        &raw const reply,
-                        &raw mut msg,
-                        &raw mut badge,
-                        &raw mut recv_source,
-                    )
-                }
-            }
-        };
-        if err == TRONA_CANCELLED as i32 || err == TRONA_TIMED_OUT as i32 {
-            unsafe {
-                let now_ns = poll::monotonic_now_ns();
-                poll::expire_poll_timeouts(now_ns);
-                misc::expire_pty_read_timeouts(now_ns);
-            }
-            have_message = false;
-            continue;
-        }
-        if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] reply_recv failed err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
-            });
-            break;
-        }
-        have_message = true;
+        unsafe { trona::worker::run_workers(&config, ipc::loop_::vfs_worker_handler) }
     }
-
-    idle();
 }
 
-fn idle() -> ! {
+pub(crate) fn idle() -> ! {
     loop {
         trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
