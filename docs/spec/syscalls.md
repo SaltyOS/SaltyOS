@@ -536,25 +536,38 @@ long sys_send_timed(
     cap_t endpoint,      // RDI: Endpoint capability
     uint64_t msg_info,   // RSI: Message info word
     uint64_t mr0,        // RDX: Message register 0
-    uint64_t timeout_ns  // R10: Timeout in nanoseconds
+    uint64_t mr1,        // R10: Message register 1
+    uint64_t mr2,        // R8:  Message register 2
+    uint64_t mr3         // R9:  Message register 3
 );
 ```
 
 **Arguments:**
 - `endpoint`: Capability to endpoint (must have SEND right)
 - `msg_info`: Packed message info (label, length, extra_caps)
-- `mr0`: First message register
-- `timeout_ns`: Maximum time to wait for a receiver, in nanoseconds
+- `mr0`..`mr3`: Message registers (same layout as `Send`)
+
+**IPC buffer:**
+- The kernel reads `IpcBuffer.timeout_ns` (offset `0x150`) for the
+  timeout. The caller MUST populate this field before issuing the
+  syscall. The `lib/trona/substrate::sys_send_timed` wrapper writes it
+  automatically and returns `InvalidOperation` if the calling thread has
+  no IPC buffer bound.
 
 **Returns:**
 - `0`: Success (message delivered)
 - `1` (InvalidCapability): Invalid capability
+- `2` (InvalidOperation): Trona wrapper called with no IPC buffer bound
 - `3` (InsufficientRights): Missing SEND right
 - `12` (Cancelled): Timeout expired before a receiver arrived
 
 **Behavior:**
 - Like Send, but returns with `Cancelled` if no receiver arrives within the timeout
-- If timeout_ns is 0, behaves like NBSend
+- If `IpcBuffer.timeout_ns` is 0, behaves like NBSend (immediate return)
+- If the thread has no IPC buffer at all, the kernel uses 0 as the
+  timeout and the call effectively becomes NBSend; the trona wrapper
+  pre-empts this case with `InvalidOperation` to avoid a silent ABI
+  surprise
 
 ---
 
@@ -564,22 +577,29 @@ Blocking receive with a timeout.
 
 ```c
 long sys_recv_timed(
-    cap_t endpoint,      // RDI: Endpoint capability
-    uint64_t timeout_ns  // RSI: Timeout in nanoseconds
+    cap_t endpoint       // RDI: Endpoint capability
 );
 ```
 
 **Arguments:**
 - `endpoint`: Capability to endpoint (must have RECV right)
-- `timeout_ns`: Maximum time to wait for a sender, in nanoseconds
+
+**IPC buffer:**
+- The kernel reads `IpcBuffer.timeout_ns` (offset `0x150`) for the
+  timeout. The caller MUST populate this field before issuing the
+  syscall. The `lib/trona/substrate::sys_recv_timed` wrapper writes it
+  automatically and returns `InvalidOperation` if the calling thread has
+  no IPC buffer bound.
 
 **Returns:**
 - RAX = `0`: Success, badge in RDX (sender badge; message written to IPC buffer)
 - RAX = `1` (InvalidCapability): Invalid capability
+- RAX = `2` (InvalidOperation): Trona wrapper called with no IPC buffer bound
 - RAX = `12` (Cancelled): Timeout expired before a sender arrived
 
 **Behavior:**
 - Like Recv, but returns with `Cancelled` if no sender arrives within the timeout
+- If `IpcBuffer.timeout_ns` is 0, returns `Cancelled` immediately (poll semantics)
 - On success, the message is written to the thread's IPC buffer and the sender badge is returned in RDX
 
 ---
