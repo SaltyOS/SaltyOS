@@ -1,0 +1,18 @@
+console "/usr/libexec/getty Pc" xterm on secure
+tty0 "/usr/libexec/getty Pc" xterm on secure
+pts/0 none unknown on secure
+pts/1 none unknown on secure
+pts/2 none unknown on secure
+pts/3 none unknown on secure
+pts/4 none unknown on secure
+pts/5 none unknown on secure
+pts/6 none unknown on secure
+pts/7 none unknown on secure
+pts/8 none unknown on secure
+pts/9 none unknown on secure
+pts/10 none unknown on secure
+pts/11 none unknown on secure
+pts/12 none unknown on secure
+pts/13 none unknown on secure
+pts/14 none unknown on secure
+pts/15 none unknown on secure

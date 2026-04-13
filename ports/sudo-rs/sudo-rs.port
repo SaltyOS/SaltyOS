@@ -1,0 +1,29 @@
+[port]
+name = sudo-rs
+version = 0.2.5
+description = Memory-safe sudo/su implementation in Rust
+homepage = https://github.com/trifectatechfoundation/sudo-rs
+license = Apache-2.0 OR MIT
+
+[source]
+url = https://github.com/trifectatechfoundation/sudo-rs/archive/refs/tags/v${version}.tar.gz
+subdir = sudo-rs-${version}
+sha256 = SKIP
+
+[build]
+type = cargo
+configure =
+    --no-default-features
+
+[depends]
+build = openssl, freebsd-utils
+runtime = freebsd-utils
+
+[env]
+OPENSSL_DIR = ${PORTDIR}/../openssl/${ARCH_STAGE}
+OPENSSL_STATIC = 1
+LIBRARY_PATH = ${PORTDIR}/../freebsd-utils/${ARCH_STAGE}/usr/lib
+
+[install]
+usr/bin/sudo = sudo
+usr/bin/visudo = visudo
