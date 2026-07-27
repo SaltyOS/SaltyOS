@@ -1,72 +1,57 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! devfs `VopVector` — per-vnode operations for the device filesystem.
+//
+//! devfs `VopVector` — per-device routing for the synthetic
+//! `/dev` namespace.
 //!
-//! Lookup and readdir handle both the root directory (static registration
-//! table + synthetic `pts/` entry) and the `pts/` subdirectory (dynamic
-//! PTY slave entries synthesized on-the-fly).
+//! `lookup` walks the static registration table for the root
+//! directory and the dynamic per-PTY entries for the `pts/`
+//! subdirectory. Character devices route `read` / `write` per
+//! `DevKind`:
 //!
-//! Read/write dispatch per-device I/O:
-//! - `Console` → IPC to `console` server.
-//! - `Null` → read returns 0 (EOF), write swallows bytes.
-//! - `Zero` → read fills with zeroes, write swallows bytes.
-//! - `Urandom` → read from ChaCha20 CSPRNG, write swallows bytes.
-//! - `Fb0` → not supported for sequential read/write (mmap only).
-//! - `Ptmx` / `PtySlave` → IPC to `posix_ttysrv`.
-//! - `Tty` → resolved at open time to the caller's controlling tty.
+//! - `Null` — read returns 0 (EOF), write drops.
+//! - `Zero` — read fills with zeros, write drops.
+//! - `Urandom` — read fills from the caller-visible `KernelRng` cap.
+//! - `Console` — write forwards to substrate's serial sink; read
+//!   returns 0.
+//! - `Tty` / `Ptmx` / `PtySlave` — routed through
+//!   `posix_ttysrv` by the POSIX device layer.
+//! - `Fb0` — routed through the POSIX device layer to dispdrv.
 
-use trona::consts::kernel::*;
-use trona::ipc;
-use trona::protocol::server::*;
-use trona::types::core::*;
+use crate::core::cred::VfsCred;
+use crate::core::error::VfsError;
+use crate::core::file::{VAttr, VStatfs};
+use crate::core::outcome::{Parked, Ready, VopOutcome};
+use crate::core::vnode::{VnodeHandle, VnodeKind};
+use crate::core::vop::ReaddirEmit;
+use crate::core::vop_context::{OwnerVopCtx, VopDataCtx};
 
-use crate::server::consts::VFS_CAP_POSIX_TTYSRV_EP;
-use crate::vfs_core::cred::VfsCred;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::{VAttr, VStatfs};
-use crate::vfs_core::vnode::{VnodeHandle, VT_CHR, VT_DIR};
-use crate::vfs_core::vop::ReaddirEmit;
-use crate::vfs_core::vop_context::{VopContext, VopDataContext};
+use super::{DEVFS_REGISTRATIONS, DevKind, DevfsMountData, DevfsVnodeData};
 
-use super::{
-    alloc_vdata, record_vnode, DevKind, DevfsMountData, DevfsVnodeData,
-    DEVFS_REGISTRATIONS,
-};
-
-// =========================================================================
-// Helpers
-// =========================================================================
-
-/// Extract the `DevfsVnodeData` pointer from a VopContext.
 #[inline]
-unsafe fn vdata(ctx: &VopContext) -> *mut DevfsVnodeData {
+unsafe fn vdata(ctx: &OwnerVopCtx<'_>) -> *mut DevfsVnodeData {
     ctx.data as *mut DevfsVnodeData
 }
 
-/// Extract the `DevfsVnodeData` pointer from a VopDataContext.
 #[inline]
-unsafe fn vdata_d(ctx: &VopDataContext) -> *mut DevfsVnodeData {
+unsafe fn vdata_d(ctx: &VopDataCtx) -> *mut DevfsVnodeData {
     ctx.data as *mut DevfsVnodeData
 }
 
-/// Extract the `DevfsMountData` pointer from a VopContext.
 #[inline]
-unsafe fn mdata(ctx: &VopContext) -> *mut DevfsMountData {
+unsafe fn mdata(ctx: &OwnerVopCtx<'_>) -> *mut DevfsMountData {
     ctx.mount_data as *mut DevfsMountData
 }
 
-/// Extract the `DevfsMountData` pointer from a VopDataContext.
 #[inline]
-unsafe fn mdata_d(ctx: &VopDataContext) -> *mut DevfsMountData {
+unsafe fn mdata_d(ctx: &VopDataCtx) -> *mut DevfsMountData {
     ctx.mount_data as *mut DevfsMountData
 }
 
-/// Compare two byte slices for equality.
-#[inline]
 fn name_eq(a: *const u8, a_len: u8, b: &[u8]) -> bool {
     if a_len as usize != b.len() {
         return false;
     }
-    for i in 0..b.len() {
+    for i in 0..a_len as usize {
         if unsafe { *a.add(i) } != b[i] {
             return false;
         }
@@ -74,729 +59,423 @@ fn name_eq(a: *const u8, a_len: u8, b: &[u8]) -> bool {
     true
 }
 
-/// Format a u32 into a decimal ASCII buffer. Returns the number of bytes written.
-fn u32_to_ascii(val: u32, buf: &mut [u8]) -> usize {
-    if val == 0 {
-        if !buf.is_empty() {
-            buf[0] = b'0';
+unsafe fn lookup_handle_by_id(md: *const DevfsMountData, id: u64) -> VnodeHandle {
+    unsafe {
+        for i in 0..(*md).count {
+            if (*md).vnode_ids[i] == id {
+                return (*md).vnode_handles[i];
+            }
         }
-        return 1;
+        VnodeHandle::INVALID
     }
-    let mut tmp = [0u8; 10];
-    let mut n = val;
-    let mut i = 0usize;
-    while n > 0 {
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    if i > buf.len() {
-        return 0;
-    }
-    for j in 0..i {
-        buf[j] = tmp[i - 1 - j];
-    }
-    i
-}
-
-/// Parse a decimal ASCII string to u32. Returns `None` on invalid input.
-fn ascii_to_u32(ptr: *const u8, len: u8) -> Option<u32> {
-    if len == 0 || len > 10 {
-        return None;
-    }
-    let mut val: u32 = 0;
-    for i in 0..len as usize {
-        let ch = unsafe { *ptr.add(i) };
-        if ch < b'0' || ch > b'9' {
-            return None;
-        }
-        val = val.checked_mul(10)?.checked_add((ch - b'0') as u32)?;
-    }
-    Some(val)
-}
-
-/// Get the IPC context.
-#[inline]
-fn ipc_ctx() -> *mut IpcContext {
-    crate::ipc_ctx()
 }
 
 // =========================================================================
-// Lookup
+// MetaOps
 // =========================================================================
 
-/// Look up a child by name in a devfs directory vnode.
-///
-/// For the root directory: searches `DEVFS_REGISTRATIONS` by name, plus the
-/// synthetic `pts` entry and `.` / `..`.
-///
-/// For the `pts/` directory: parses the name as a decimal integer and
-/// returns the vnode for `/dev/pts/N`. Lazily allocates the PTY slave
-/// vnode on first access via the arena alloc callback.
-unsafe fn devfs_lookup(
-    ctx: &VopContext,
+pub(crate) unsafe fn devfs_lookup(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        if (*dir_vdata).kind != DevKind::PtsDir && (*ctx.vnode).kind != VnodeKind::Directory {
+            return Err(VfsError::NotDir);
+        }
+        if name_len == 1 && *name == b'.' {
+            return Ok(Ready(ctx.handle));
+        }
+        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
+            // Both `/dev` and `/dev/pts` map `..` to themselves
+            // until the cross-mount walk reaches in.
+            return Ok(Ready(ctx.handle));
+        }
+
         let md = mdata(ctx);
 
-        // "." — self reference.
-        if name_len == 1 && *name == b'.' {
-            return Ok(ctx.handle);
-        }
-
-        // ".." — parent. Root's parent is itself.
-        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
-            if (*dvd).kind == DevKind::PtsDir {
-                // Parent of pts/ is the devfs root — handle at index 0.
-                return Ok((*md).vnode_handles[0]);
-            }
-            return Ok(ctx.handle);
-        }
-
-        match (*dvd).kind {
-            DevKind::PtsDir => {
-                // Parse "N" → PTY slave index.
-                let slot = ascii_to_u32(name, name_len).ok_or(VfsError::NotFound)?;
-
-                // Check if a vnode already exists for this PTY slot.
-                for i in 0..(*md).count {
-                    let vd = &(*md).vdata[i];
-                    if vd.kind == DevKind::PtySlave && vd.sub_id == slot {
-                        return Ok((*md).vnode_handles[i]);
+        // /dev (root) — match against `DEVFS_REGISTRATIONS` plus
+        // the synthetic `pts` directory.
+        if (*dir_vdata).kind != DevKind::PtsDir {
+            for reg in DEVFS_REGISTRATIONS {
+                if name_eq(name, name_len, reg.name) {
+                    let mut id: u64 = 1;
+                    for r in DEVFS_REGISTRATIONS {
+                        if ::core::ptr::eq(r as *const _, reg as *const _) {
+                            return Ok(Ready(lookup_handle_by_id(md, id)));
+                        }
+                        id += 1;
                     }
                 }
-
-                // Lazy-allocate a vnode for this PTY slave via the arena.
-                let id = (*md).count as u64;
-                let vd = alloc_vdata(ctx.mount_data);
-                if vd.is_null() {
-                    return Err(VfsError::NoSpace);
-                }
-                (*vd).kind = DevKind::PtySlave;
-                (*vd).sub_id = slot;
-                (*vd).mode = 0o020666;
-
-                let (child_vh, child_vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-                (*child_vp).vtype = VT_CHR;
-                (*child_vp).id = id;
-                (*child_vp).nlink = 1;
-                (*child_vp).mount = ctx.mount_handle;
-                (*child_vp).ops = (*ctx.vnode).ops;
-                (*child_vp).data = vd as *mut u8;
-
-                record_vnode(ctx.mount_data, child_vh, id);
-
-                Ok(child_vh)
             }
-            _ => {
-                // Root directory lookup: search static registrations.
-                // id=0 is root, id=1..N are registrations, id=N+1 is pts dir.
-                let reg_count = DEVFS_REGISTRATIONS.len();
-                for (idx, reg) in DEVFS_REGISTRATIONS.iter().enumerate() {
-                    if name_eq(name, name_len, reg.name) {
-                        let vnode_idx = idx + 1; // +1 because id=0 is root
-                        return Ok((*md).vnode_handles[vnode_idx]);
-                    }
-                }
-
-                // Check "pts" directory.
-                if name_eq(name, name_len, b"pts") {
-                    let pts_idx = reg_count + 1; // root(0) + regs(1..N) + pts
-                    return Ok((*md).vnode_handles[pts_idx]);
-                }
-
-                // Not found.
-                Ok(VnodeHandle::INVALID)
+            if name_eq(name, name_len, b"pts") {
+                let pts_id = 1 + DEVFS_REGISTRATIONS.len() as u64;
+                return Ok(Ready(lookup_handle_by_id(md, pts_id)));
             }
+            return Ok(Ready(VnodeHandle::INVALID));
+        }
+
+        // /dev/pts/0 — console PTY slave. Additional PTY slaves
+        // will be registered into devfs when the allocation
+        // callback path grows a VFS-side notification.
+        if name_eq(name, name_len, b"0") {
+            let pty0_id = 2 + DEVFS_REGISTRATIONS.len() as u64;
+            return Ok(Ready(lookup_handle_by_id(md, pty0_id)));
+        }
+        Ok(Ready(VnodeHandle::INVALID))
+    }
+}
+
+pub(crate) unsafe fn devfs_open(ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    unsafe {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        match (*vdata).kind {
+            DevKind::Console
+            | DevKind::Null
+            | DevKind::Zero
+            | DevKind::Urandom
+            | DevKind::Ptmx
+            | DevKind::Tty
+            | DevKind::PtySlave
+            | DevKind::Fb0
+            | DevKind::PtsDir => Ok(Ready(())),
         }
     }
 }
 
-// =========================================================================
-// Readdir
-// =========================================================================
-
-/// Enumerate directory entries.
-///
-/// `cookie` is an opaque cursor: 0 = start, incremented by 1 per entry.
-/// Entries are emitted in a stable order:
-/// - Root: ".", "..", then each registration name, then "pts".
-/// - pts/: ".", "..", then one entry per allocated PTY slave vnode.
-unsafe fn devfs_readdir(
-    ctx: &VopDataContext,
-    cookie: *mut u64,
-    emit: ReaddirEmit<'_>,
-) -> VfsResult<()> {
-    unsafe {
-        let vd = vdata_d(ctx);
-        let md = mdata_d(ctx);
-        let mut pos = *cookie;
-
-        match (*vd).kind {
-            DevKind::PtsDir => {
-                let attr = VAttr::zeroed();
-
-                // "."
-                if pos == 0 {
-                    if !emit(ctx.id, b".".as_ptr(), 1, 4 /* DT_DIR */, &attr) {
-                        *cookie = pos + 1;
-                        return Ok(());
-                    }
-                    pos += 1;
-                }
-
-                // ".."
-                if pos == 1 {
-                    let root_id = (*md).vnode_ids[0];
-                    if !emit(root_id, b"..".as_ptr(), 2, 4, &attr) {
-                        *cookie = pos + 1;
-                        return Ok(());
-                    }
-                    pos += 1;
-                }
-
-                // Dynamic PTY slave entries.
-                let base = 2u64;
-                for i in 0..(*md).count {
-                    let vd_i = &(*md).vdata[i];
-                    if vd_i.kind != DevKind::PtySlave {
-                        continue;
-                    }
-                    let entry_pos = base + vd_i.sub_id as u64;
-                    if pos > entry_pos {
-                        continue;
-                    }
-                    if pos < entry_pos {
-                        pos = entry_pos;
-                    }
-
-                    let mut nbuf = [0u8; 10];
-                    let nlen = u32_to_ascii(vd_i.sub_id, &mut nbuf);
-                    if nlen == 0 {
-                        continue;
-                    }
-                    if !emit(
-                        (*md).vnode_ids[i],
-                        nbuf.as_ptr(),
-                        nlen as u8,
-                        2, // DT_CHR
-                        &attr,
-                    ) {
-                        *cookie = entry_pos + 1;
-                        return Ok(());
-                    }
-                    pos = entry_pos + 1;
-                }
-
-                *cookie = pos;
-                Ok(())
-            }
-            _ => {
-                // Root directory.
-                let attr = VAttr::zeroed();
-                let reg_count = DEVFS_REGISTRATIONS.len();
-
-                // "."
-                if pos == 0 {
-                    if !emit(ctx.id, b".".as_ptr(), 1, 4, &attr) {
-                        *cookie = pos + 1;
-                        return Ok(());
-                    }
-                    pos += 1;
-                }
-
-                // ".."
-                if pos == 1 {
-                    if !emit(ctx.id, b"..".as_ptr(), 2, 4, &attr) {
-                        *cookie = pos + 1;
-                        return Ok(());
-                    }
-                    pos += 1;
-                }
-
-                // Static device entries.
-                let mut idx = (pos as usize).saturating_sub(2);
-                while idx < reg_count {
-                    let entry_pos = (idx + 2) as u64;
-                    if pos > entry_pos {
-                        idx += 1;
-                        continue;
-                    }
-                    let reg = &DEVFS_REGISTRATIONS[idx];
-                    if !emit(
-                        (idx + 1) as u64,
-                        reg.name.as_ptr(),
-                        reg.name.len() as u8,
-                        2, // DT_CHR
-                        &attr,
-                    ) {
-                        *cookie = entry_pos + 1;
-                        return Ok(());
-                    }
-                    pos = entry_pos + 1;
-                    idx += 1;
-                }
-
-                // "pts" directory entry.
-                let pts_pos = (2 + reg_count) as u64;
-                if pos <= pts_pos {
-                    emit(
-                        (reg_count + 1) as u64,
-                        b"pts".as_ptr(),
-                        3,
-                        4, // DT_DIR
-                        &attr,
-                    );
-                    pos = pts_pos + 1;
-                }
-
-                *cookie = pos;
-                Ok(())
-            }
-        }
-    }
+pub(crate) unsafe fn devfs_close(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-// =========================================================================
-// Getattr
-// =========================================================================
-
-unsafe fn devfs_getattr(ctx: &VopContext, attr: *mut VAttr) -> VfsResult<()> {
+pub(crate) unsafe fn devfs_getattr(ctx: &mut OwnerVopCtx<'_>, attr: *mut VAttr) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*attr).fs_instance_id = fs_id;
+        (*attr).backend_node_id = (*ctx.vnode).id();
+        (*attr).backend_seq = 0;
+        (*attr).kind = (*ctx.vnode).kind;
+        (*attr).mode = (*vdata).mode;
         (*attr).uid = 0;
         (*attr).gid = 0;
         (*attr).nlink = (*ctx.vnode).nlink;
+        (*attr).size = 0;
+        (*attr).blocks = 0;
         (*attr).atime = 0;
         (*attr).mtime = 0;
         (*attr).ctime = 0;
-        (*attr).btime = 0;
-        (*attr).blocks = 0;
-        (*attr).dev_id = 0;
-
-        match (*vd).kind {
-            DevKind::PtsDir => {
-                (*attr).mode = 0o040755;
-                (*attr).size = 0;
-                (*attr).rdev = 0;
-            }
-            _ if (*ctx.vnode).vtype == VT_DIR => {
-                // Root directory.
-                (*attr).mode = 0o040755;
-                (*attr).size = 0;
-                (*attr).rdev = 0;
-            }
-            _ => {
-                // Character device.
-                (*attr).mode = (*vd).mode;
-                (*attr).size = 0;
-                // Encode rdev as (kind << 8 | sub_id) for consumer identification.
-                (*attr).rdev = (((*vd).kind as u32) << 8) | ((*vd).sub_id & 0xFF);
-            }
-        }
-
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-// =========================================================================
-// Access
-// =========================================================================
-
-unsafe fn devfs_access(
-    _ctx: &VopContext,
+pub(crate) unsafe fn devfs_access(
+    _ctx: &mut OwnerVopCtx<'_>,
     _mode: u32,
     _cred: *const VfsCred,
-) -> VfsResult<()> {
-    Ok(())
+) -> VopOutcome<()> {
+    Ok(Ready(()))
+}
+
+pub(crate) unsafe fn devfs_inactive(ctx: &mut OwnerVopCtx<'_>) -> VopOutcome<()> {
+    unsafe {
+        crate::owner::pager_rpc::release_mo_binding_for_vnode(ctx.state, ctx.handle);
+    }
+    Ok(Ready(()))
 }
 
 // =========================================================================
-// Open / Close
+// DataOps
 // =========================================================================
 
-unsafe fn devfs_open(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
-}
-
-unsafe fn devfs_close(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
-}
-
-// =========================================================================
-// Read
-// =========================================================================
-
-unsafe fn devfs_read(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn devfs_read(
+    ctx: &VopDataCtx,
     _offset: u64,
     dst: *mut u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-
-        match (*vd).kind {
-            DevKind::Console => {
-                let mut creq = TronaMsg::zeroed();
-                let mut creply = TronaMsg::zeroed();
-                creq.label = CONSOLE_READ;
-                creq.length = 0;
-
-                let err = ipc::call_ctx(
-                    ipc_ctx(),
-                    trona::caps::console_ep(),
-                    &raw const creq,
-                    &raw mut creply,
-                );
-                if err != 0 || creply.label != TRONA_OK {
-                    return Err(VfsError::Io);
-                }
-
-                let read_count = creply.regs[0];
-                if read_count == 0 {
-                    return Ok(0);
-                }
-
-                let actual = if read_count > len { len } else { read_count };
-                let src = &creply.regs[1] as *const u64 as *const u8;
-                for i in 0..actual as usize {
-                    *dst.add(i) = *src.add(i);
-                }
-                Ok(actual)
-            }
-
-            DevKind::Null => Ok(0),
-
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        match (*vdata).kind {
+            DevKind::Null => Ok(Ready(0)),
             DevKind::Zero => {
-                for i in 0..len as usize {
-                    *dst.add(i) = 0;
-                }
-                Ok(len)
+                ::core::ptr::write_bytes(dst, 0, len as usize);
+                Ok(Ready(len))
             }
-
             DevKind::Urandom => {
-                let mut i: u64 = 0;
-                while i + 8 <= len {
-                    let v = crate::urandom_next();
-                    let bytes = v.to_le_bytes();
-                    for j in 0..8 {
-                        *dst.add(i as usize + j) = bytes[j];
-                    }
-                    i += 8;
-                }
-                if i < len {
-                    let v = crate::urandom_next();
-                    let bytes = v.to_le_bytes();
-                    let mut j = 0usize;
-                    while i < len {
-                        *dst.add(i as usize) = bytes[j];
-                        i += 1;
-                        j += 1;
-                    }
-                }
-                Ok(len)
-            }
-
-            DevKind::Fb0 => Err(VfsError::NotSupported),
-            DevKind::Tty => Err(VfsError::NotSupported),
-
-            DevKind::PtySlave => {
-                let pty_id = (*vd).sub_id as u64;
-                let mut treq = TronaMsg::zeroed();
-                let mut treply = TronaMsg::zeroed();
-                treq.label = POSIX_TTYSRV_PTY_READ;
-                treq.regs[0] = pty_id;
-                treq.regs[1] = len;
-                treq.length = 2;
-
-                let err = ipc::call_ctx(
-                    ipc_ctx(),
-                    VFS_CAP_POSIX_TTYSRV_EP,
-                    &raw const treq,
-                    &raw mut treply,
+                let r = trona_kernel::syscall::rng_read_bytes(
+                    trona_runtime::client::caps::kernel_rng_cap().addr(),
+                    dst,
+                    len as usize,
                 );
-                if err != 0 || treply.label != TRONA_OK {
+                if r.error != 0 {
                     return Err(VfsError::Io);
                 }
-
-                let actual = treply.regs[0];
-                if actual > 0 {
-                    let src = &treply.regs[1] as *const u64 as *const u8;
-                    for i in 0..actual as usize {
-                        *dst.add(i) = *src.add(i);
-                    }
-                }
-                Ok(actual)
+                Ok(Ready(r.value))
             }
-
-            DevKind::Ptmx => {
-                let pty_id = (*vd).sub_id as u64;
-                let mut treq = TronaMsg::zeroed();
-                let mut treply = TronaMsg::zeroed();
-                treq.label = POSIX_TTYSRV_PTY_READ;
-                treq.regs[0] = pty_id;
-                treq.regs[1] = len;
-                treq.regs[2] = 1; // master side
-                treq.length = 3;
-
-                let err = ipc::call_ctx(
-                    ipc_ctx(),
-                    VFS_CAP_POSIX_TTYSRV_EP,
-                    &raw const treq,
-                    &raw mut treply,
-                );
-                if err != 0 || treply.label != TRONA_OK {
-                    return Err(VfsError::Io);
-                }
-
-                let actual = treply.regs[0];
-                if actual > 0 {
-                    let src = &treply.regs[1] as *const u64 as *const u8;
-                    for i in 0..actual as usize {
-                        *dst.add(i) = *src.add(i);
-                    }
-                }
-                Ok(actual)
+            DevKind::Console => Ok(Ready(0)),
+            DevKind::Fb0 | DevKind::Ptmx | DevKind::Tty | DevKind::PtySlave => {
+                Err(VfsError::NotSup)
             }
-
             DevKind::PtsDir => Err(VfsError::IsDir),
         }
     }
 }
 
-// =========================================================================
-// Write
-// =========================================================================
-
-unsafe fn devfs_write(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn devfs_write(
+    ctx: &VopDataCtx,
     _offset: u64,
     src: *const u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-
-        match (*vd).kind {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        match (*vdata).kind {
+            DevKind::Null | DevKind::Zero => Ok(Ready(len)),
             DevKind::Console => {
-                let mut sent: u64 = 0;
-                while sent < len {
-                    let mut creq = TronaMsg::zeroed();
-                    let mut creply = TronaMsg::zeroed();
-                    let mut chunk = len - sent;
-                    if chunk > 24 {
-                        chunk = 24;
-                    }
-
-                    creq.label = CONSOLE_WRITE;
-                    creq.length = 1 + (chunk + 7) / 8;
-                    creq.regs[0] = chunk;
-
-                    let cdst = &raw mut creq.regs[1] as *mut u8;
-                    for i in 0..chunk as usize {
-                        *cdst.add(i) = *src.add(sent as usize + i);
-                    }
-
-                    let err = ipc::call_ctx(
-                        ipc_ctx(),
-                        trona::caps::console_ep(),
-                        &raw const creq,
-                        &raw mut creply,
-                    );
-                    if err != 0 || creply.label != TRONA_OK {
-                        break;
-                    }
-                    sent += chunk;
+                // Forward to substrate's serial sink. The full
+                // console subsystem registration lands with the
+                // console personality; this immediate path keeps
+                // boot-time `printf` traffic visible while the
+                // wire is being built.
+                for i in 0..len as usize {
+                    let b = *src.add(i);
+                    trona_runtime::debug::serial::serial_putc(b);
                 }
-                if sent > 0 {
-                    Ok(sent)
-                } else {
-                    Err(VfsError::Io)
-                }
+                Ok(Ready(len))
             }
-
-            DevKind::Null | DevKind::Zero | DevKind::Urandom => Ok(len),
-
-            DevKind::Fb0 => Err(VfsError::NotSupported),
-            DevKind::Tty => Err(VfsError::NotSupported),
-
-            DevKind::PtySlave => {
-                let pty_id = (*vd).sub_id as u64;
-                let mut sent: u64 = 0;
-                while sent < len {
-                    let mut treq = TronaMsg::zeroed();
-                    let mut treply = TronaMsg::zeroed();
-                    let mut chunk = len - sent;
-                    if chunk > 136 {
-                        chunk = 136;
-                    }
-                    treq.label = POSIX_TTYSRV_PTY_WRITE;
-                    treq.regs[0] = pty_id;
-                    treq.regs[1] = chunk;
-                    let tdst = &raw mut treq.regs[2] as *mut u8;
-                    for i in 0..chunk as usize {
-                        *tdst.add(i) = *src.add(sent as usize + i);
-                    }
-                    treq.length = 2 + (chunk + 7) / 8;
-                    let err = ipc::call_ctx(
-                        ipc_ctx(),
-                        VFS_CAP_POSIX_TTYSRV_EP,
-                        &raw const treq,
-                        &raw mut treply,
-                    );
-                    if err != 0 || treply.label != TRONA_OK {
-                        break;
-                    }
-                    sent += chunk;
-                }
-                if sent > 0 {
-                    Ok(sent)
-                } else {
-                    Err(VfsError::Io)
-                }
+            DevKind::Urandom => Err(VfsError::Inval),
+            DevKind::Fb0 | DevKind::Ptmx | DevKind::Tty | DevKind::PtySlave => {
+                Err(VfsError::NotSup)
             }
-
-            DevKind::Ptmx => {
-                let pty_id = (*vd).sub_id as u64;
-                let mut sent: u64 = 0;
-                while sent < len {
-                    let mut treq = TronaMsg::zeroed();
-                    let mut treply = TronaMsg::zeroed();
-                    let mut chunk = len - sent;
-                    if chunk > 136 {
-                        chunk = 136;
-                    }
-                    treq.label = POSIX_TTYSRV_PTY_MASTER_WRITE;
-                    treq.regs[0] = pty_id;
-                    treq.regs[1] = chunk;
-                    let tdst = &raw mut treq.regs[2] as *mut u8;
-                    for i in 0..chunk as usize {
-                        *tdst.add(i) = *src.add(sent as usize + i);
-                    }
-                    treq.length = 2 + (chunk + 7) / 8;
-                    let err = ipc::call_ctx(
-                        ipc_ctx(),
-                        VFS_CAP_POSIX_TTYSRV_EP,
-                        &raw const treq,
-                        &raw mut treply,
-                    );
-                    if err != 0 || treply.label != TRONA_OK {
-                        break;
-                    }
-                    sent += chunk;
-                }
-                if sent > 0 || len == 0 {
-                    Ok(sent)
-                } else {
-                    Err(VfsError::Io)
-                }
-            }
-
             DevKind::PtsDir => Err(VfsError::IsDir),
         }
     }
 }
 
-// =========================================================================
-// Ioctl
-// =========================================================================
-
-unsafe fn devfs_ioctl(
-    ctx: &VopDataContext,
+/// Device ioctl entry. tty-class devices (`/dev/console`, tty, ptmx,
+/// pts/N) route to posix_ttysrv; the framebuffer routes to dispdrv.
+/// Both park a `PendingOp` and the completion router projects the
+/// backend reply into the per-command POSIX shape — this is the single
+/// async ioctl path (no per-device special-casing in the personality
+/// layer). `null` / `zero` / `urandom` vend no ioctls.
+pub(crate) unsafe fn devfs_ioctl(
+    ctx: &VopDataCtx,
     cmd: u32,
     arg: u64,
-    reply: *mut TronaMsg,
-) -> VfsResult<()> {
+) -> crate::core::vop::IoctlResult {
     unsafe {
-        let vd = vdata_d(ctx);
-
-        match (*vd).kind {
-            DevKind::PtySlave | DevKind::Ptmx => {
-                let pty_id = (*vd).sub_id as u64;
-                let mut treq = TronaMsg::zeroed();
-                let mut treply = TronaMsg::zeroed();
-                treq.label = POSIX_TTYSRV_PTY_IOCTL;
-                treq.regs[0] = pty_id;
-                treq.regs[1] = cmd as u64;
-                treq.regs[2] = arg;
-                treq.length = 3;
-
-                let err = ipc::call_ctx(
-                    ipc_ctx(),
-                    VFS_CAP_POSIX_TTYSRV_EP,
-                    &raw const treq,
-                    &raw mut treply,
-                );
-                if err != 0 || treply.label != TRONA_OK {
-                    return Err(VfsError::Io);
-                }
-                if !reply.is_null() {
-                    *reply = treply;
-                }
-                Ok(())
-            }
-            DevKind::Fb0 => Err(VfsError::NotSupported),
-            _ => Err(VfsError::NotSupported),
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::NotSup);
         }
+        let Some(state) = ctx.state_mut() else {
+            return Err(VfsError::Io);
+        };
+        let pty_id = match (*vdata).kind {
+            // `/dev/tty` routes to the caller session's bound ctty pty
+            // (resolved at open); falls back to pty0 when unbound.
+            DevKind::Tty => Some(
+                ctx.open_object
+                    .and_then(|h| state.open_objects.get(h))
+                    .map(|o| o.ctty_pty)
+                    .filter(|&p| p != u32::MAX)
+                    .unwrap_or(0),
+            ),
+            DevKind::Console | DevKind::Ptmx => Some(0u32),
+            DevKind::PtySlave => Some((*vdata).sub_id),
+            _ => None,
+        };
+        if let Some(pty_id) = pty_id {
+            // ctty-control ioctls are keyed by posix_ttysrv on the caller's
+            // POSIX session (TIOCSCTTY / TIOCSPGRP / TIOCGSID / TIOCNOTTY).
+            // Only init knows the session, so resolve it asynchronously
+            // (park on init) and re-issue the pty ioctl at finalize — a
+            // blocking VFS→init query here would risk the init↔VFS reactor
+            // cycle. These cmds are POSIX-only, so the reply is `PosixIoctl`.
+            let needs_session = matches!(
+                cmd as u64,
+                trona_protocol::posix_abi::tty::TIOCSCTTY
+                    | trona_protocol::posix_abi::tty::TIOCSPGRP
+                    | trona_protocol::posix_abi::tty::TIOCGSID
+                    | trona_protocol::posix_abi::tty::TIOCNOTTY
+            );
+            if needs_session {
+                // `FillIoctlReply` needs the vnode key; resolve it from the
+                // vop's vnode handle. The `client` handle is injected by
+                // `do_ioctl_from_fd` (the dispatch layer that holds it) when
+                // it attaches the reply lease.
+                let vkey = {
+                    let Some(meta) =
+                        crate::core::vop_context::OwnerVopCtx::from_state(state, ctx.vnode_handle)
+                    else {
+                        return Err(VfsError::Io);
+                    };
+                    (*meta.vnode).key
+                };
+                let plan = [crate::owner::init_rpc::InitStep {
+                    label: trona_protocol::posix::INIT_PGRP_SESSION,
+                    sub_op: trona_protocol::posix::INIT_PGRP_SUB_GET_SID_PGID_BY_BADGE,
+                    arg: ctx.caller_badge,
+                }];
+                return match crate::owner::init_rpc::begin_init_read_deferred(
+                    state,
+                    &plan,
+                    crate::owner::init_rpc::InitReadState::Ctty {
+                        client: crate::server::types::ClientHandle::INVALID,
+                        action: crate::owner::init_rpc::CttyAction::Ioctl {
+                            pty_id,
+                            cmd,
+                            arg,
+                            vkey,
+                            reply: crate::ops::IoctlReplyIntent::PosixIoctl,
+                        },
+                        sid: 0,
+                        pgid: 0,
+                    },
+                    0,
+                    ctx.caller_badge,
+                ) {
+                    Some(handle) => Ok(Parked(handle)),
+                    None => Err(VfsError::Io),
+                };
+            }
+            return match crate::personality::posix::device::issue_pty_ioctl(
+                state, pty_id, cmd, arg, 0, 0,
+            ) {
+                Ok(handle) => Ok(Parked(handle)),
+                Err(e) => Err(e),
+            };
+        }
+        // Framebuffer ioctls keep their dedicated path in the
+        // personality layer (`handle_fb_ioctl_for_fd`): fb's reply
+        // protocol returns raw display dimensions for the client to
+        // assemble into `fb_var_screeninfo` / `fb_fix_screeninfo`,
+        // which is incompatible with the generic struct-bytes ioctl
+        // reply shape. devfs unifies only the tty-class ioctls here.
+        Err(VfsError::NotSup)
     }
 }
 
-// =========================================================================
-// Statfs (data-level — pseudo-filesystem)
-// =========================================================================
+pub(crate) unsafe fn devfs_readdir(
+    ctx: &VopDataCtx,
+    cookie: *mut u64,
+    emit: ReaddirEmit<'_>,
+) -> VopOutcome<()> {
+    unsafe {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
+            return Err(VfsError::Io);
+        }
+        // Only `pts/` and the root directory carry directory
+        // semantics. Every other DevKind is a leaf char device.
+        if !matches!((*vdata).kind, DevKind::PtsDir) && ctx.vtype != VnodeKind::Directory as u8 {
+            return Err(VfsError::NotDir);
+        }
 
-unsafe fn devfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> VfsResult<()> {
+        let mut pos = *cookie;
+        let attr = VAttr::zeroed();
+
+        if pos == 0 {
+            if !emit(ctx.id, b".".as_ptr(), 1, 4, &attr) {
+                *cookie = pos + 1;
+                return Ok(Ready(()));
+            }
+            pos += 1;
+        }
+        if pos == 1 {
+            if !emit(ctx.id, b"..".as_ptr(), 2, 4, &attr) {
+                *cookie = pos + 1;
+                return Ok(Ready(()));
+            }
+            pos += 1;
+        }
+
+        // Root only: enumerate static device names + pts.
+        if (*vdata).kind != DevKind::PtsDir {
+            let base = 2u64;
+            let mut idx = 0u64;
+            for reg in DEVFS_REGISTRATIONS {
+                let entry_pos = base + idx;
+                if pos > entry_pos {
+                    idx += 1;
+                    continue;
+                }
+                // DT_CHR = 2.
+                let id = idx + 1;
+                if !emit(id, reg.name.as_ptr(), reg.name.len() as u8, 2, &attr) {
+                    *cookie = entry_pos + 1;
+                    return Ok(Ready(()));
+                }
+                pos = entry_pos + 1;
+                idx += 1;
+            }
+            let pts_pos = base + idx;
+            if pos <= pts_pos {
+                let pts_id = 1 + DEVFS_REGISTRATIONS.len() as u64;
+                // DT_DIR = 4.
+                if !emit(pts_id, b"pts".as_ptr(), 3, 4, &attr) {
+                    *cookie = pts_pos + 1;
+                    return Ok(Ready(()));
+                }
+                pos = pts_pos + 1;
+            }
+        }
+        // PtsDir: PTY 0 is the boot console PTY; further slaves
+        // arrive through the future registration path.
+        let _ = mdata_d(ctx);
+        if (*vdata).kind == DevKind::PtsDir {
+            let entry_pos = 2u64;
+            if pos <= entry_pos
+                && !emit(
+                    2 + DEVFS_REGISTRATIONS.len() as u64,
+                    b"0".as_ptr(),
+                    1,
+                    2,
+                    &attr,
+                )
+            {
+                *cookie = entry_pos + 1;
+                return Ok(Ready(()));
+            }
+            pos = entry_pos + 1;
+        }
+
+        *cookie = pos;
+        Ok(Ready(()))
+    }
+}
+
+pub(crate) unsafe fn devfs_statfs(ctx: &VopDataCtx, out: *mut VStatfs) -> VopOutcome<()> {
     unsafe {
         let md = mdata_d(ctx);
         (*out).bsize = 4096;
+        (*out).frsize = 4096;
         (*out).blocks = 0;
         (*out).bfree = 0;
         (*out).bavail = 0;
         (*out).files = (*md).count as u64;
         (*out).ffree = (super::MAX_DEVFS_VNODES - (*md).count) as u64;
-        (*out).fs_type = [0; 16];
-        let ft = &mut (*out).fs_type;
-        ft[..5].copy_from_slice(b"devfs");
-        (*out).flags = 0;
-        (*out).name_max = 255;
-        Ok(())
+        (*out).favail = (*out).ffree;
+        (*out).fsid = ctx.fs_instance_id.0;
+        (*out).flag = 0;
+        (*out).namemax = 255;
+        (*out).set_fs_name(b"devfs");
+        Ok(Ready(()))
     }
 }
-
-// =========================================================================
-// Inactive
-// =========================================================================
-
-/// devfs vnodes live for the lifetime of the mount — inactive is a no-op.
-unsafe fn devfs_inactive(_ctx: &VopContext) {}
-
-// =========================================================================
-// Static dispatch table
-// =========================================================================
-
-use crate::vfs_core::vop::{VopMetaOps, VopDataOps, VopVector, META_OPS_DEFAULT, DATA_OPS_DEFAULT};
-
-pub(super) static DEVFS_VOPS: VopVector = VopVector {
-    meta: VopMetaOps {
-        lookup: devfs_lookup,
-        getattr: devfs_getattr,
-        access: devfs_access,
-        open: devfs_open,
-        close: devfs_close,
-        inactive: devfs_inactive,
-        ..META_OPS_DEFAULT
-    },
-    data: VopDataOps {
-        read: devfs_read,
-        write: devfs_write,
-        readdir: devfs_readdir,
-        ioctl: devfs_ioctl,
-        statfs: devfs_statfs,
-        ..DATA_OPS_DEFAULT
-    },
-};

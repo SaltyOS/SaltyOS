@@ -5,13 +5,13 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::arch::paging::{PageFlags, PageTable};
 #[cfg(target_arch = "aarch64")]
 use crate::arch::paging::flush_tlb_all;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::paging::write_cr3;
-use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
-use crate::FramebufferInfo;
+use crate::arch::paging::{PageFlags, PageTable};
+use crate::init::bootinfo::FramebufferInfo;
+use crate::mm::{PAGE_SIZE, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, pmm_alloc};
 
 /// Kernel VA for framebuffer mapping (PML4[257])
 const FB_KERNEL_VA: u64 = 0xFFFF_8080_0000_0000;
@@ -44,7 +44,9 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
     let pml4_idx = ((FB_KERNEL_VA >> 39) & 0x1FF) as usize;
 
     // Allocate and install PDPT at PML4[257]
-    let pdpt_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
+    let pdpt_phys = pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::PageTable,
+    })?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(pdpt_phys) as *mut u8, 0, PAGE_SIZE);
     }
@@ -54,7 +56,9 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
     let pdpt = unsafe { &mut *(phys_to_virt(pdpt_phys) as *mut PageTable) };
 
     // PDPT index 0 (we only need the first GB entry)
-    let pd_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
+    let pd_phys = pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::PageTable,
+    })?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(pd_phys) as *mut u8, 0, PAGE_SIZE);
     }
@@ -72,11 +76,15 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
     // 6-10x faster than UC on real hardware.
     let pt_flags = PageFlags::Present as u64
         | PageFlags::Writable as u64
-        | PageFlags::WriteThrough as u64; // PAT1 = WC after init_pat()
+        | PageFlags::WriteThrough as u64 // PAT1 = WC after init_pat()
+        | PageFlags::Accessed as u64 // -> HW_AF on aarch64 (omit = access-flag fault on first VRAM write); A-bit on x86_64 is hw-managed
+        | PageFlags::NoExecute as u64; // NX on x86_64; UXN on aarch64 — framebuffer is data, never executable
 
     let mut pages_mapped = 0;
     for pt_idx in 0..num_pts {
-        let pt_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
+        let pt_phys = pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::PageTable,
+        })?;
         unsafe {
             core::ptr::write_bytes(phys_to_virt(pt_phys) as *mut u8, 0, PAGE_SIZE);
         }

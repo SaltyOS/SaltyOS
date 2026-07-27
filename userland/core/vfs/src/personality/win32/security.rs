@@ -7,8 +7,8 @@
 //!
 //! The raw descriptor bytes are persisted in the `"security.NTACL"` xattr.
 //! This module parses the self-relative binary format, evaluates the DACL
-//! against a client SID, and provides `check_nt_acl` for the dispatch layer
-//! to call before `VopVector.access` for Win32 clients.
+//! against a client SID, and provides async-capable entry points for both
+//! open-time ACL checks and `NtQuerySecurityObject` / `NtSetSecurityObject`.
 //!
 //! ## Limitations
 //!
@@ -19,9 +19,19 @@
 //! - Maximum descriptor size is limited by the xattr backend's inline
 //!   limit (typically 4096 bytes for ramfs/saltyfs).
 
-use crate::server::types::ClientState;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::vop_context::{data_ctx_from_meta, VopContext};
+use trona_kernel::core_types::TronaMsg;
+use trona_server::ReplyLease;
+
+use crate::core::error::{VfsError, VfsResult};
+use crate::core::outcome::{Parked, Ready};
+use crate::core::vop_context::OwnerVopCtx;
+use crate::ops::AckReplyIntent;
+use crate::owner::VfsState;
+use crate::owner::clients::ClientState;
+use crate::owner::pending::PendingOpHandle;
+use crate::owner::resume::{FsResume, Resume};
+use crate::personality::Personality;
+use crate::server::types::ClientHandle;
 
 /// Xattr name used to persist the raw NT security descriptor.
 const NTACL_XATTR: &[u8] = b"security.NTACL";
@@ -29,7 +39,16 @@ const NTACL_XATTR: &[u8] = b"security.NTACL";
 /// Maximum security descriptor size we accept. NT descriptors in
 /// practice are rarely larger than 4 KB; this prevents a rogue
 /// client from stuffing unbounded data into the xattr.
-const MAX_SECURITY_DESCRIPTOR_SIZE: usize = 4096;
+pub(crate) const MAX_SECURITY_DESCRIPTOR_SIZE: usize = 4096;
+
+/// Result of an NT ACL check whose xattr fetch may have parked on
+/// a backend round-trip.
+#[derive(Clone, Copy)]
+pub(crate) enum NtAclCheck {
+    Allowed,
+    Denied(VfsError),
+    Parked(PendingOpHandle),
+}
 
 // =========================================================================
 // Security information flags (SECURITY_INFORMATION bitmask)
@@ -77,6 +96,327 @@ const SID_LOCAL_SYSTEM: [u8; 12] = [
     0, 0, 0, 0, 0, 5, // identifier_authority = 5 (NT Authority)
     18, 0, 0, 0, // sub_authorities[0] = 18 (LE)
 ];
+
+// =========================================================================
+// NtQuerySecurityObject / NtSetSecurityObject VFS entries
+// =========================================================================
+
+/// `NtQuerySecurityObject` wire:
+/// `regs[0] = fd`, `regs[1] = SECURITY_INFORMATION`,
+/// `regs[2] = requested_len`.
+pub(crate) unsafe fn handle_nt_query_security_object(
+    state: &mut VfsState,
+    client: ClientHandle,
+    msg: &TronaMsg,
+    reply_lease: ReplyLease,
+) {
+    unsafe {
+        let fd = msg.regs[0] as i32;
+        let security_info = msg.regs[1] as u32;
+        let requested_len = msg.regs[2] as usize;
+        if !valid_security_information(security_info) {
+            emit_security_query_error(reply_lease, VfsError::Inval);
+            return;
+        }
+        let vnode_h =
+            match security_vnode_for_fd(state, client, fd, security_info, SecurityOp::Query) {
+                Ok(h) => h,
+                Err(e) => {
+                    emit_security_query_error(reply_lease, e);
+                    return;
+                }
+            };
+        let Some(ctx) = OwnerVopCtx::from_state(state, vnode_h) else {
+            emit_security_query_error(reply_lease, VfsError::Io);
+            return;
+        };
+        let ops = (*ctx.vnode).ops;
+        if ops.is_null() {
+            emit_security_query_error(reply_lease, VfsError::Io);
+            return;
+        }
+        let vkey = (*ctx.vnode).key;
+        let fs_id = ctx.fs_instance_id();
+        let data_ctx = ctx.data_ctx();
+        let mut scratch = [0u8; MAX_SECURITY_DESCRIPTOR_SIZE];
+        let copy_cap = requested_len.min(MAX_SECURITY_DESCRIPTOR_SIZE);
+        match ((*ops).data.getxattr)(
+            &data_ctx,
+            NTACL_XATTR.as_ptr(),
+            NTACL_XATTR.len() as u8,
+            scratch.as_mut_ptr(),
+            copy_cap,
+        ) {
+            Ok(Ready(total_len)) => {
+                let copy_len = total_len.min(copy_cap);
+                crate::personality::reply::emit_xattr_get(
+                    reply_lease,
+                    Personality::Win32,
+                    Ok((total_len, &scratch[..copy_len])),
+                );
+            }
+            Ok(Parked(handle)) => {
+                stamp_security_query_resume(state, client, handle, vkey, fs_id, reply_lease);
+            }
+            Err(VfsError::NoEnt) => {
+                crate::personality::reply::emit_xattr_get(
+                    reply_lease,
+                    Personality::Win32,
+                    Ok((0, &[])),
+                );
+            }
+            Err(e) => emit_security_query_error(reply_lease, e),
+        }
+    }
+}
+
+/// `NtSetSecurityObject` wire:
+/// `regs[0] = fd`, `regs[1] = SECURITY_INFORMATION`,
+/// `regs[2] = descriptor_len`, `regs[3..] = descriptor bytes`.
+pub(crate) unsafe fn handle_nt_set_security_object(
+    state: &mut VfsState,
+    client: ClientHandle,
+    msg: &TronaMsg,
+    reply_lease: ReplyLease,
+) {
+    unsafe {
+        let fd = msg.regs[0] as i32;
+        let security_info = msg.regs[1] as u32;
+        let descriptor_len = msg.regs[2] as usize;
+        if !valid_security_information(security_info)
+            || descriptor_len == 0
+            || descriptor_len > MAX_SECURITY_DESCRIPTOR_SIZE
+        {
+            emit_security_ack(reply_lease, Err(VfsError::Inval));
+            return;
+        }
+        let mut descriptor = [0u8; MAX_SECURITY_DESCRIPTOR_SIZE];
+        if !copy_security_descriptor_from_regs(msg, 3, descriptor_len, &mut descriptor) {
+            emit_security_ack(reply_lease, Err(VfsError::Range));
+            return;
+        }
+        if parse_sd(&descriptor[..descriptor_len]).is_none() {
+            emit_security_ack(reply_lease, Err(VfsError::Inval));
+            return;
+        }
+        let vnode_h = match security_vnode_for_fd(state, client, fd, security_info, SecurityOp::Set)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                emit_security_ack(reply_lease, Err(e));
+                return;
+            }
+        };
+        let Some(ctx) = OwnerVopCtx::from_state(state, vnode_h) else {
+            emit_security_ack(reply_lease, Err(VfsError::Io));
+            return;
+        };
+        let ops = (*ctx.vnode).ops;
+        if ops.is_null() {
+            emit_security_ack(reply_lease, Err(VfsError::Io));
+            return;
+        }
+        let vkey = (*ctx.vnode).key;
+        let data_ctx = ctx.data_ctx();
+        match ((*ops).data.setxattr)(
+            &data_ctx,
+            NTACL_XATTR.as_ptr(),
+            NTACL_XATTR.len() as u8,
+            descriptor.as_ptr(),
+            descriptor_len,
+            0,
+        ) {
+            Ok(Ready(())) => emit_security_ack(reply_lease, Ok(())),
+            Ok(Parked(handle)) => {
+                stamp_security_ack_resume(state, client, handle, vkey, reply_lease);
+            }
+            Err(e) => emit_security_ack(reply_lease, Err(e)),
+        }
+    }
+}
+
+#[inline]
+fn valid_security_information(mask: u32) -> bool {
+    const VALID: u32 = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | SACL_SECURITY_INFORMATION;
+    mask != 0 && (mask & !VALID) == 0
+}
+
+#[derive(Clone, Copy)]
+enum SecurityOp {
+    Query,
+    Set,
+}
+
+fn security_vnode_for_fd(
+    state: &mut VfsState,
+    client: ClientHandle,
+    fd: i32,
+    security_info: u32,
+    op: SecurityOp,
+) -> Result<crate::core::vnode::VnodeHandle, VfsError> {
+    if fd < 0 {
+        return Err(VfsError::BadF);
+    }
+    let Some(open_h) = state.open_object_at(client, fd as usize) else {
+        return Err(VfsError::BadF);
+    };
+    let obj = state.open_objects.get(open_h).ok_or(VfsError::BadF)?;
+    let handle_state =
+        super::open_state::get_by_slot(state, obj.personality_aux).ok_or(VfsError::Acces)?;
+    let desired = handle_state.granted_access;
+    let allowed = match op {
+        SecurityOp::Query => can_query_security(desired),
+        SecurityOp::Set => can_set_security(desired, security_info),
+    };
+    if allowed {
+        Ok(obj.vnode)
+    } else {
+        Err(VfsError::Acces)
+    }
+}
+
+#[inline]
+fn can_query_security(desired: u32) -> bool {
+    has_read_control(desired)
+}
+
+fn can_set_security(desired: u32, security_info: u32) -> bool {
+    if (security_info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) != 0
+        && !has_write_owner(desired)
+    {
+        return false;
+    }
+    if (security_info & DACL_SECURITY_INFORMATION) != 0 && !has_write_dac(desired) {
+        return false;
+    }
+    if (security_info & SACL_SECURITY_INFORMATION) != 0 && !has_system_security(desired) {
+        return false;
+    }
+    true
+}
+
+#[inline]
+fn has_read_control(desired: u32) -> bool {
+    (desired
+        & (super::consts::READ_CONTROL
+            | super::consts::GENERIC_READ
+            | super::consts::GENERIC_WRITE
+            | super::consts::GENERIC_EXECUTE
+            | super::consts::GENERIC_ALL))
+        != 0
+}
+
+#[inline]
+fn has_write_dac(desired: u32) -> bool {
+    (desired & (super::consts::WRITE_DAC | super::consts::GENERIC_ALL)) != 0
+}
+
+#[inline]
+fn has_write_owner(desired: u32) -> bool {
+    (desired & (super::consts::WRITE_OWNER | super::consts::GENERIC_ALL)) != 0
+}
+
+#[inline]
+fn has_system_security(desired: u32) -> bool {
+    // SaltyOS does not model ACCESS_SYSTEM_SECURITY privilege yet;
+    // GENERIC_ALL is the only currently representable handle right
+    // that can update SACL bytes.
+    (desired & super::consts::GENERIC_ALL) != 0
+}
+
+unsafe fn stamp_security_query_resume(
+    state: &mut VfsState,
+    client: ClientHandle,
+    handle: PendingOpHandle,
+    vkey: crate::core::identity::VnodeKey,
+    fs_id: crate::core::identity::FsInstanceId,
+    reply_lease: ReplyLease,
+) {
+    let badge = state
+        .clients
+        .get(client)
+        .map(|c| c.client_badge)
+        .unwrap_or(0);
+    if let Err(Some(reply_lease)) = state.stamp_resume_ctx(
+        handle,
+        badge,
+        Some(reply_lease),
+        Resume::Fs(FsResume::FillNtSecurityQueryReply {
+            client,
+            vkey,
+            fs_id,
+        }),
+    ) {
+        emit_security_query_error(reply_lease, VfsError::Busy);
+    }
+}
+
+unsafe fn stamp_security_ack_resume(
+    state: &mut VfsState,
+    client: ClientHandle,
+    handle: PendingOpHandle,
+    vkey: crate::core::identity::VnodeKey,
+    reply_lease: ReplyLease,
+) {
+    let badge = state
+        .clients
+        .get(client)
+        .map(|c| c.client_badge)
+        .unwrap_or(0);
+    if let Err(Some(reply_lease)) = state.stamp_resume_ctx(
+        handle,
+        badge,
+        Some(reply_lease),
+        Resume::Fs(FsResume::AckMutation {
+            client,
+            vkey,
+            reply: AckReplyIntent::NtIoStatusBlock,
+        }),
+    ) {
+        emit_security_ack(reply_lease, Err(VfsError::Busy));
+    }
+}
+
+fn emit_security_query_error(reply_lease: ReplyLease, err: VfsError) {
+    unsafe {
+        crate::personality::reply::emit_xattr_get(reply_lease, Personality::Win32, Err(err));
+    }
+}
+
+fn emit_security_ack(reply_lease: ReplyLease, result: Result<(), VfsError>) {
+    unsafe {
+        crate::personality::reply::emit_ack(
+            reply_lease,
+            AckReplyIntent::NtIoStatusBlock,
+            0,
+            result,
+        );
+    }
+}
+
+fn copy_security_descriptor_from_regs(
+    msg: &TronaMsg,
+    reg_start: usize,
+    len: usize,
+    out: &mut [u8],
+) -> bool {
+    if len > out.len() {
+        return false;
+    }
+    let words = (len + 7) / 8;
+    if reg_start.saturating_add(words) > msg.regs.len() {
+        return false;
+    }
+    for i in 0..len {
+        let word = msg.regs[reg_start + i / 8];
+        let lane = i % 8;
+        out[i] = ((word >> (lane * 8)) & 0xff) as u8;
+    }
+    true
+}
 
 /// S-1-5-32-544 (BUILTIN\Administrators) — maps to gid 0.
 #[allow(dead_code)]
@@ -449,41 +789,76 @@ unsafe fn read_u32_le_raw(base: *const u8, off: usize) -> u32 {
 }
 
 // =========================================================================
-// NT ACL access check (dispatch-layer entry point)
+// NT ACL access check (open-time entry point)
 // =========================================================================
 
-/// Check whether `client` is permitted `requested_access` on `vp` according
-/// to the vnode's stored NT security descriptor.
-///
-/// Reads the `"security.NTACL"` xattr, parses the self-relative SD, maps
-/// the client's cred_uid to a SID, and evaluates the DACL.
-///
-/// Returns `Ok(())` if access is granted, `Err(VfsError::Perm)` if denied.
-/// If no SD is stored on the vnode, returns `Ok(())` — the absence of an
-/// NT ACL means no NT-level restriction applies (the POSIX mode check in
-/// `VopVector.access` still runs separately).
+/// Check whether `client` is permitted `requested_access` on the
+/// vnode's stored NT security descriptor, preserving a parked xattr
+/// fetch as a resume handle so the caller can stamp a continuation
+/// instead of failing the open.
 ///
 /// # Safety
 ///
-/// `ctx` must reference a valid active vnode and mount. `client` must be a
-/// valid pointer to an active `ClientState`.
-pub(crate) unsafe fn check_nt_acl(
-    ctx: &VopContext,
+/// `ctx` must reference a valid active vnode and mount. `client`
+/// must be a valid pointer to an active `ClientState`.
+pub(crate) unsafe fn check_nt_acl_or_park(
+    ctx: &OwnerVopCtx<'_>,
+    requested_access: u32,
+    client: *const ClientState,
+) -> NtAclCheck {
+    let mut sd_buf = [0u8; MAX_SECURITY_DESCRIPTOR_SIZE];
+    unsafe {
+        let ops = (*ctx.vnode).ops;
+        if ops.is_null() {
+            return NtAclCheck::Denied(VfsError::Io);
+        }
+
+        let data_ctx = ctx.data_ctx();
+        match ((*ops).data.getxattr)(
+            &data_ctx,
+            NTACL_XATTR.as_ptr(),
+            NTACL_XATTR.len() as u8,
+            sd_buf.as_mut_ptr(),
+            sd_buf.len(),
+        ) {
+            Ok(Ready(n)) => {
+                if n > sd_buf.len() {
+                    return NtAclCheck::Denied(VfsError::Range);
+                }
+                match check_nt_acl_descriptor_bytes(&sd_buf[..n], requested_access, client) {
+                    Ok(()) => NtAclCheck::Allowed,
+                    Err(e) => NtAclCheck::Denied(e),
+                }
+            }
+            Ok(Parked(handle)) => NtAclCheck::Parked(handle),
+            Err(e) if e.is_optional_metadata_absent() => NtAclCheck::Allowed,
+            Err(e) => NtAclCheck::Denied(e),
+        }
+    }
+}
+
+/// Evaluate already-fetched security descriptor bytes.
+///
+/// Completion routers use this after copying a parked xattr
+/// payload out of backend SHM. An empty slice means no stored NT
+/// ACL and therefore no NT-level restriction.
+///
+/// # Safety
+///
+/// `client` must be a valid pointer to an active `ClientState`.
+pub(crate) unsafe fn check_nt_acl_descriptor_bytes(
+    sd_bytes: &[u8],
     requested_access: u32,
     client: *const ClientState,
 ) -> VfsResult<()> {
-    let mut sd_buf = [0u8; MAX_SECURITY_DESCRIPTOR_SIZE];
-
-    // SAFETY: caller guarantees `vp` and `client` validity.
-    let sd_len = unsafe {
-        get_security_descriptor(ctx, sd_buf.as_mut_ptr(), sd_buf.len())?
-    };
-
-    if sd_len == 0 {
+    if client.is_null() {
+        return Err(VfsError::Io);
+    }
+    if sd_bytes.is_empty() {
         return Ok(());
     }
 
-    let sd = match parse_sd(&sd_buf[..sd_len]) {
+    let sd = match parse_sd(sd_bytes) {
         Some(sd) => sd,
         None => return Ok(()),
     };
@@ -495,8 +870,9 @@ pub(crate) unsafe fn check_nt_acl(
         None => return Ok(()),
     };
 
-    // Build the client SID from cred_uid.
-    let euid = unsafe { (*client).cred_uid };
+    // Build the client SID from the credential snapshot vfs keeps
+    // for this frontend connection.
+    let euid = unsafe { (*client).cred.euid };
     let mut client_sid_buf = [0u8; 28];
     let client_sid_len = uid_to_sid(euid, &mut client_sid_buf);
     let client_sid = SidRef {
@@ -519,85 +895,6 @@ pub(crate) unsafe fn check_nt_acl(
     if evaluate_dacl(dacl, requested_access, client_sid) {
         Ok(())
     } else {
-        Err(VfsError::Perm)
-    }
-}
-
-// =========================================================================
-// Get / Set (raw xattr pass-through)
-// =========================================================================
-
-/// Read the raw NT security descriptor from the vnode's xattr store.
-///
-/// On success, returns the number of bytes written to `buf[..buf_len]`.
-/// If the xattr does not exist, returns `Ok(0)` — the caller should
-/// synthesize a default empty descriptor.
-///
-/// # Safety
-///
-/// `ctx` must reference a valid active vnode and mount. `buf` must point to
-/// at least `buf_len` writable bytes.
-pub(crate) unsafe fn get_security_descriptor(
-    ctx: &VopContext,
-    buf: *mut u8,
-    buf_len: usize,
-) -> VfsResult<usize> {
-    unsafe {
-        let ops = (*ctx.vnode).ops;
-        if ops.is_null() {
-            return Err(VfsError::Io);
-        }
-
-        let data_ctx = data_ctx_from_meta(ctx);
-        let result = ((*ops).data.getxattr)(
-            &data_ctx,
-            NTACL_XATTR.as_ptr(),
-            NTACL_XATTR.len() as u8,
-            buf,
-            buf_len,
-        );
-
-        match result {
-            Ok(n) => Ok(n),
-            // Xattr not found — no descriptor stored yet.
-            Err(VfsError::NotFound) => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// Write a raw NT security descriptor to the vnode's xattr store.
-///
-/// The descriptor bytes are stored verbatim — no validation or
-/// interpretation is performed.
-///
-/// # Safety
-///
-/// `ctx` must reference a valid active vnode and mount. `buf` must point to
-/// at least `len` readable bytes.
-pub(crate) unsafe fn set_security_descriptor(
-    ctx: &VopContext,
-    buf: *const u8,
-    len: usize,
-) -> VfsResult<()> {
-    if len > MAX_SECURITY_DESCRIPTOR_SIZE {
-        return Err(VfsError::TooLarge);
-    }
-
-    unsafe {
-        let ops = (*ctx.vnode).ops;
-        if ops.is_null() {
-            return Err(VfsError::Io);
-        }
-
-        let data_ctx = data_ctx_from_meta(ctx);
-        ((*ops).data.setxattr)(
-            &data_ctx,
-            NTACL_XATTR.as_ptr(),
-            NTACL_XATTR.len() as u8,
-            buf,
-            len,
-            0, // no XATTR_CREATE / XATTR_REPLACE constraint
-        )
+        Err(VfsError::Acces)
     }
 }

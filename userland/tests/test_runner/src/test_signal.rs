@@ -2,13 +2,10 @@
 //! Ported from userland/test_signal/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
-use trona::types::core::*;
-use trona_posix::proc as posix;
+use trona_posix::consts::*;
 use trona_posix::signals;
 use trona_posix::*;
+use trona_runtime::debug::serial;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -34,9 +31,9 @@ unsafe extern "C" fn sigchld_handler(_sig: i32) {
 pub fn run() -> bool {
     puts(b"[TEST_SIGNAL] Starting signal tests\n");
 
-    let mut restore_sigusr1 = SIG_DFL;
-    let mut restore_sigusr2 = SIG_DFL;
-    let mut restore_sigchld = SIG_DFL;
+    let restore_sigusr1: usize;
+    let restore_sigusr2: usize;
+    let restore_sigchld: usize;
 
     let my_pid = unsafe { trona_posix::posix_getpid() };
     if my_pid <= 0 {
@@ -59,7 +56,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
 
     // The handler may have already been called by the kernel's signal
     // frame injection (EINTR path) during the kill IPC itself. Poll for
@@ -85,7 +82,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
     unsafe { signals::posix_sigcheck() };
     puts(b"[TEST_SIGNAL] Test 2: PASS\n");
 
@@ -99,12 +96,12 @@ pub fn run() -> bool {
 
     if child_pid == 0 {
         loop {
-            trona::trona_yield();
+            trona_kernel::syscall::yield_now();
         }
     }
 
-    trona::trona_yield();
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
+    trona_kernel::syscall::yield_now();
 
     if unsafe { trona_posix::posix_kill(child_pid, SIGTERM) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill child SIGTERM\n");
@@ -175,12 +172,12 @@ pub fn run() -> bool {
 
     if child6_pid == 0 {
         loop {
-            trona::trona_yield();
+            trona_kernel::syscall::yield_now();
         }
     }
 
-    trona::trona_yield();
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
+    trona_kernel::syscall::yield_now();
 
     if unsafe { trona_posix::posix_kill(child6_pid, SIGTERM) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill child6 SIGTERM\n");
@@ -221,12 +218,12 @@ pub fn run() -> bool {
 
     if child8_pid == 0 {
         loop {
-            trona::trona_yield();
+            trona_kernel::syscall::yield_now();
         }
     }
 
-    trona::trona_yield();
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
+    trona_kernel::syscall::yield_now();
 
     // Stop the child
     if unsafe { trona_posix::posix_kill(child8_pid, SIGSTOP) } != 0 {
@@ -253,7 +250,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    trona::trona_yield();
+    trona_kernel::syscall::yield_now();
 
     // Kill the resumed child
     if unsafe { trona_posix::posix_kill(child8_pid, SIGKILL) } != 0 {

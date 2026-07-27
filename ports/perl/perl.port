@@ -17,12 +17,44 @@ type = custom
 cp ${PORTDIR}/hints/saltyos.sh ${SRCDIR}/hints/saltyos.sh
 cd ${SRCDIR}
 
-# Phase 1: Build host miniperl + generate_uudmap in a separate object dir.
+# Phase 1: Build a FULL host perl in a completely isolated copy of the
+# perl source tree (${SRCDIR}/host/), then expose the needed host binaries
+# into ${SRCDIR}/host-tools/ via symlink.
+#
+# Why isolated: our previous `-Dmksymlinks` approach shared lib/,
+# generate_uudmap, and assorted generated files between host-tools/ and
+# ${SRCDIR}. Host `make` then rewrote those shared files, and the later
+# target Configure/make raced against them ("Config.pm may be out of date
+# with config.sh", duplicate `ln -s generate_uudmap` races, infinitely
+# regenerated Makefiles). By building host perl in its own separate tree,
+# host and target share nothing; the only bridge is the two symlinks the
+# target Makefile needs to find pre-built host binaries.
+HOST_BUILD=${SRCDIR}/host
+if [ ! -f "$HOST_BUILD/.built" ]; then
+    rm -rf "$HOST_BUILD"
+    mkdir -p "$HOST_BUILD"
+    # We're at the very start of [prepare] so ${SRCDIR} is still pristine
+    # (phase 2/3 below touches it later). Snapshot it into $HOST_BUILD,
+    # excluding host/ itself (to avoid recursive copy) and host-tools/ (stale
+    # prior-run symlink farm). Double exclude pattern is for portability
+    # across GNU tar (directory-exclude recurses automatically) and bsdtar
+    # (older versions need the explicit `/*` glob for subtree exclusion).
+    tar --exclude='./host' --exclude='./host/*' \
+        --exclude='./host-tools' --exclude='./host-tools/*' \
+        -cf - . | tar -C "$HOST_BUILD" -xf -
+    (
+        cd "$HOST_BUILD"
+        CC=cc LD=cc sh Configure -des -Dusedevel -Dprefix=/usr -Uusethreads -Dcc=cc -Dld=cc
+        CC=cc make -j${NPROC}
+    )
+    touch "$HOST_BUILD/.built"
+fi
+
+# Bridge: target Makefile's code-generation steps invoke ./host-tools/miniperl
+# and ./host-tools/generate_uudmap. Point them at the isolated host build.
 mkdir -p host-tools
-cd host-tools
-CC=cc LD=cc sh ../Configure -des -Dusedevel -Dmksymlinks -Dprefix=/usr -Uusethreads -Dcc=cc -Dld=cc
-CC=cc make miniperl generate_uudmap
-cd ..
+ln -sfn "$HOST_BUILD/miniperl" host-tools/miniperl
+ln -sfn "$HOST_BUILD/generate_uudmap" host-tools/generate_uudmap
 
 # Phase 2: Install SaltyOS config.sh and substitute placeholders
 cp ${PORTDIR}/config.sh.saltyos config.sh
@@ -40,5 +72,43 @@ rm -f config.sh.bak
 sh Configure -S
 rm -f *.o
 
-[install]
-bin/perl = perl
+# Seed Config.pm from the just-written config.sh before the parallel build.
+# Several extension Makefiles abort with "Please rerun the make command" if
+# they notice lib/Config.pm older than config.sh and try to rebuild in the
+# middle of `make -j`.
+make lib/Config.pm
+touch lib/Config.pm lib/Config_heavy.pl
+
+# Cross-install with host miniperl: keep installperl's @INC / PERL5LIB from
+# the caller so we can put target lib first (for Config.pm) and host lib
+# second (for pure-Perl modules needed by miniperl). This matches upstream's
+# Cross/installperl.patch approach.
+awk '
+    /^    @INC = '\''lib'\'';$/ { print "#" $0; next }
+    /^    \$ENV\{PERL5LIB\} = '\''lib'\'';$/ { print "#" $0; next }
+    { print }
+' installperl > installperl.saltyos
+mv installperl.saltyos installperl
+chmod 0755 installperl
+
+[stage]
+mode = script
+# Run installperl under the host-built miniperl from ${SRCDIR}/host/
+# (phase 1 of [prepare]). This follows Perl's cross-compilation flow: miniperl
+# avoids host XS dependencies, while the patched installperl keeps the caller's
+# @INC ordering intact.
+#
+# @INC ordering is deliberate:
+#   1. lib (target's)  — `use Config` must find the CROSS Config.pm so
+#      installperl picks up target install paths (prefix=/usr, archname,
+#      archlib under /usr/lib/perl5/<version>/<archname>, …). This file
+#      was freshly written by phase 3's `Configure -S` in ${SRCDIR}.
+#   2. host/lib (host's) — everything else loaded by installperl
+#      (File::Path, Cwd, File::Copy, File::Find, …) resolves here.
+commands =
+    PERL5LIB=lib:host/lib ./host/miniperl -Ilib -Ihost/lib installperl --destdir=${STAGE}
+
+[stage.exclude]
+usr/lib/perl5/**/pod
+usr/lib/perl5/**/*.pod
+usr/lib/perl5/**/t

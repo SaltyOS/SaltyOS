@@ -9,15 +9,15 @@
 #ifndef BOOT_STAGE2_BIOS_MEMORY_H
 #define BOOT_STAGE2_BIOS_MEMORY_H
 
-#include "../../../../common/types.h"
 #include "../../../../common/stage2_info.h"
+#include "../../../../common/types.h"
 
 /* E820 memory types */
-#define E820_USABLE     1
-#define E820_RESERVED   2
-#define E820_ACPI_RECL  3
-#define E820_ACPI_NVS   4
-#define E820_BAD        5
+#define E820_USABLE 1
+#define E820_RESERVED 2
+#define E820_ACPI_RECL 3
+#define E820_ACPI_NVS 4
+#define E820_BAD 5
 
 /*
  * Get memory map entry count

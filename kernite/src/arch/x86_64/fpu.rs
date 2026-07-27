@@ -1,31 +1,53 @@
-//! FPU/SSE Lazy State Management
+//! FPU/SSE eager state management
 //!
-//! Implements lazy FPU switching using CR0.TS + #NM (Device Not Available).
-//! The kernel itself is soft-float and never uses XMM registers, so FPU state
-//! only needs to be saved/restored when switching between userspace threads.
+//! The kernel itself is soft-float and never uses XMM registers, so FPU
+//! state only needs to be saved/restored when switching between userspace
+//! threads. This module performs that save+restore unconditionally on
+//! every context switch — CR0.TS is held at 0 throughout and the
+//! `#NM` (Device Not Available) trap is treated as a fatal regression.
 //!
 //! Strategy:
-//! - CR0.TS is set on every context switch
-//! - First FPU instruction in usermode triggers #NM exception
-//! - #NM handler saves old owner's state (XSAVE) and restores new owner's (XRSTOR)
-//! - CR0.TS is cleared after restore, allowing subsequent FPU instructions
+//! - `bsp_init` / `ap_init` configure CR0/CR4/XCR0 once per CPU and clear
+//!   CR0.TS for the lifetime of the kernel.
+//! - `init_thread` zero-initializes a TCB's save area; XRSTOR with an
+//!   all-zero header (XSTATE_BV=0) reproduces the architectural init
+//!   state per Intel SDM Vol.1 §13.8, so no fninit/ldmxcsr is required.
+//! - `switch` xsaves the outgoing thread and xrstors the incoming thread
+//!   in one IRQ-disabled step. The new thread runs immediately with no
+//!   trap round-trip.
+//! - `flush_current` / `reload_current` keep the live registers in sync
+//!   when callers mutate the current thread's save area in place
+//!   (TCB_COPY_FPU into self, fault-handler `tcb.fpu_state` rewrites).
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::sched::thread::{Tcb, XSaveArea};
-use crate::{kdebug, kerror};
-use super::cpu;
+
+unsafe extern "C" {
+    fn x86_fpu_read_cr0() -> u64;
+    fn x86_fpu_write_cr0(value: u64);
+    fn x86_fpu_read_cr4() -> u64;
+    fn x86_fpu_write_cr4(value: u64);
+    fn x86_fpu_xsetbv0(value: u64);
+    fn x86_fpu_fninit();
+    fn x86_fpu_xsave(area: *mut u8);
+    fn x86_fpu_xrstor(area: *const u8);
+    fn x86_fpu_fxsave(area: *mut u8);
+    fn x86_fpu_fxrstor(area: *const u8);
+}
 
 /// Initialize FPU hardware on the BSP (Boot Strap Processor).
 ///
-/// Configures CR0, CR4, and XCR0 for SSE/XSAVE support.
-/// Called during early kernel init after CPUID detection.
+/// Configures CR0, CR4, and XCR0 for SSE/XSAVE support. Called during
+/// early kernel init after CPUID detection.
 pub fn init_bsp() {
     // SAFETY: Single-threaded boot context, modifying control registers
     unsafe {
         configure_fpu_hardware();
     }
-    crate::kdebug!(arch, |_g| { _g.puts("[FPU] BSP FPU hardware configured\n"); });
+    crate::kernel::printk::kdebug!(arch, |_g| {
+        _g.puts("[FPU] BSP FPU hardware configured\n");
+    });
 }
 
 /// Initialize FPU hardware on an AP (Application Processor).
@@ -44,23 +66,22 @@ pub fn init_ap() {
 /// Must be called during CPU init with interrupts disabled.
 unsafe fn configure_fpu_hardware() {
     unsafe {
-        // CR0 configuration:
+        // CR0 configuration (eager FPU):
         //   Clear EM (bit 2) — don't emulate FPU
-        //   Set MP (bit 1) — monitor coprocessor (WAIT/FWAIT trigger #NM when TS=1)
+        //   Set MP (bit 1) — monitor coprocessor (Intel-recommended for 80486+)
         //   Set NE (bit 5) — native FPU error reporting (use #MF, not IRQ 13)
-        //   TS (bit 3) is NOT set here — it's set on context switch (scheduler.rs)
-        let mut cr0: u64;
-        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack));
-        cr0 &= !(1 << 2); // clear EM
-        cr0 |= (1 << 1) | (1 << 5); // set MP, NE (TS is set on context switch, not here)
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        //   Clear TS (bit 3) and never set it — eager FPU saves/restores on
+        //     every context switch, so #NM-driven lazy switching is not used.
+        let mut cr0 = x86_fpu_read_cr0();
+        cr0 &= !((1 << 2) | (1 << 3)); // clear EM, TS
+        cr0 |= (1 << 1) | (1 << 5); // set MP, NE
+        x86_fpu_write_cr0(cr0);
 
         // CR4 configuration:
         //   Set OSFXSR (bit 9) — enable FXSAVE/FXRSTOR
         //   Set OSXMMEXCPT (bit 10) — enable #XM exceptions for SIMD errors
         //   Set OSXSAVE (bit 18) — enable XSAVE/XRSTOR (if CPU supports it)
-        let mut cr4: u64;
-        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack));
+        let mut cr4 = x86_fpu_read_cr4();
         cr4 |= (1 << 9) | (1 << 10);
         if super::cpuid::has_xsave() {
             cr4 |= 1 << 18;
@@ -74,23 +95,17 @@ unsafe fn configure_fpu_hardware() {
             cr4 |= 1 << 21;
             super::uaccess::enable_smap_runtime();
         }
-        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+        x86_fpu_write_cr4(cr4);
 
         // XCR0 configuration (if XSAVE available):
         //   Enable x87 (bit 0) + SSE (bit 1) state components
         if super::cpuid::has_xsave() {
             let xcr0: u64 = 0x3; // x87 + SSE
-            core::arch::asm!(
-                "xsetbv",
-                in("ecx") 0u32,
-                in("eax") xcr0 as u32,
-                in("edx") 0u32,
-                options(nostack),
-            );
+            x86_fpu_xsetbv0(xcr0);
         }
 
         // Initialize x87 FPU to known state
-        core::arch::asm!("fninit", options(nostack));
+        x86_fpu_fninit();
 
         // Verify our static XSAVE buffer is large enough for the configured XCR0.
         // Currently XCR0=0x3 (x87+SSE) needs ≤576B and our buffer is 832B, but if
@@ -98,69 +113,15 @@ unsafe fn configure_fpu_hardware() {
         // before it silently corrupts adjacent TCB fields.
         let needed = super::cpuid::xsave_area_size();
         if needed > 832 {
-            crate::kerror!(|_g| {
+            crate::kernel::printk::kerror!(|_g| {
                 _g.puts("*** FATAL: XSAVE area size (");
                 _g.dec(needed as u64);
                 _g.puts(") exceeds TCB buffer (832) ***\n");
             });
-            loop { super::halt(); }
-        }
-    }
-}
-
-/// Handle #NM (Device Not Available) exception — lazy FPU switching.
-///
-/// Called from the IDT exception handler when a usermode thread executes
-/// an FPU/SSE instruction with CR0.TS set.
-///
-/// # Safety
-/// Must be called from exception context with the faulting thread as current.
-pub unsafe fn handle_nm() {
-    unsafe {
-        let scheduler = crate::sched::scheduler::scheduler();
-        let current = scheduler.current();
-        if current.is_null() {
-            return;
-        }
-
-        // Clear TS BEFORE any FPU/SSE operations to prevent recursive #NM.
-        // Instructions like xsave/fxsave/xrstor/fxrstor/ldmxcsr all trigger
-        // #NM when CR0.TS=1, which would cause a kernel-mode #NM panic.
-        clear_ts();
-
-        let old_owner = cpu::get_fpu_owner() as *mut Tcb;
-
-        // 1. Save old owner's FPU state (if different thread)
-        if !old_owner.is_null() && old_owner != current {
-            if super::cpuid::has_xsave() {
-                xsave(&mut (*old_owner).fpu_state);
-            } else {
-                fxsave(&mut (*old_owner).fpu_state);
+            loop {
+                super::halt();
             }
         }
-
-        // 2. Restore current thread's FPU state (or initialize defaults)
-        if (*current).fpu_initialized {
-            if super::cpuid::has_xsave() {
-                xrstor(&(*current).fpu_state);
-            } else {
-                fxrstor(&(*current).fpu_state);
-            }
-        } else {
-            // First FPU use by this thread — initialize to clean defaults
-            core::arch::asm!("fninit", options(nostack));
-            // Set MXCSR to default: all SIMD exceptions masked
-            let mxcsr: u32 = 0x1F80;
-            core::arch::asm!(
-                "ldmxcsr [{}]",
-                in(reg) &mxcsr,
-                options(nostack),
-            );
-            (*current).fpu_initialized = true;
-        }
-
-        // 3. Update ownership (TS already cleared at entry)
-        cpu::set_fpu_owner(current as *mut u8);
     }
 }
 
@@ -170,16 +131,9 @@ pub unsafe fn handle_nm() {
 /// Area must be 64-byte aligned. Only call when XSAVE is supported.
 unsafe fn xsave(area: &mut XSaveArea) {
     // SAFETY: XSAVE saves x87+SSE state (components 0x3) to 64-byte aligned area.
-    // The asm! block uses explicit register arguments; this instruction works
-    // regardless of soft-float target since it's inline asm.
+    // The assembly helper works regardless of soft-float target.
     unsafe {
-        core::arch::asm!(
-            "xsave [{}]",
-            in(reg) area.data.as_mut_ptr(),
-            in("eax") 0x3u32,
-            in("edx") 0u32,
-            options(nostack),
-        );
+        x86_fpu_xsave(area.data.as_mut_ptr());
     }
 }
 
@@ -190,13 +144,7 @@ unsafe fn xsave(area: &mut XSaveArea) {
 unsafe fn xrstor(area: &XSaveArea) {
     // SAFETY: XRSTOR restores x87+SSE state (components 0x3) from 64-byte aligned area.
     unsafe {
-        core::arch::asm!(
-            "xrstor [{}]",
-            in(reg) area.data.as_ptr(),
-            in("eax") 0x3u32,
-            in("edx") 0u32,
-            options(nostack),
-        );
+        x86_fpu_xrstor(area.data.as_ptr());
     }
 }
 
@@ -206,11 +154,7 @@ unsafe fn xrstor(area: &XSaveArea) {
 /// Area must be 16-byte aligned (we use 64-byte aligned, which satisfies this).
 unsafe fn fxsave(area: &mut XSaveArea) {
     unsafe {
-        core::arch::asm!(
-            "fxsave [{}]",
-            in(reg) area.data.as_mut_ptr(),
-            options(nostack),
-        );
+        x86_fpu_fxsave(area.data.as_mut_ptr());
     }
 }
 
@@ -220,116 +164,91 @@ unsafe fn fxsave(area: &mut XSaveArea) {
 /// Area must contain valid FXSAVE state.
 unsafe fn fxrstor(area: &XSaveArea) {
     unsafe {
-        core::arch::asm!(
-            "fxrstor [{}]",
-            in(reg) area.data.as_ptr(),
-            options(nostack),
-        );
+        x86_fpu_fxrstor(area.data.as_ptr());
     }
 }
 
-/// Save current FPU state of the hardware into the given area.
+/// Initialize a freshly created or recycled TCB's FPU save area.
 ///
-/// Public wrapper for use by TCB_COPY_FPU syscall when the source
-/// thread is the current FPU owner and its state needs flushing.
+/// A zero-initialized XSAVE area encodes the processor-supplied init
+/// state for every state component (Intel SDM Vol.1 §13.8: when XRSTOR
+/// observes XSTATE_BV bit `i` cleared, component `i` is reset to its
+/// init state — x87 control word 0x37F, MXCSR 0x1F80, tag word 0xFFFF,
+/// all data registers zero). No fninit / ldmxcsr is needed before the
+/// first switch-in.
+pub fn init_thread(tcb: &mut Tcb) {
+    tcb.fpu_state = XSaveArea::zeroed();
+}
+
+/// Save outgoing thread's FPU state and restore incoming thread's, in
+/// the single context-switch step the scheduler invokes.
 ///
 /// # Safety
-/// Caller must ensure area is valid and 64-byte aligned.
-pub unsafe fn xsave_current(area: &mut XSaveArea) {
+/// `old_tcb` and `new_tcb` must be valid Tcb pointers. Must be called
+/// with local IRQs disabled — the scheduler's `switch_common` holds
+/// this invariant.
+pub unsafe fn switch(old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+    crate::kernel::bug::kassert!(!old_tcb.is_null());
+    crate::kernel::bug::kassert!(!new_tcb.is_null());
+    // SAFETY: caller asserts both pointers are valid Tcbs and IRQs are off,
+    // so no other code on this CPU observes the half-saved state.
     unsafe {
         if super::cpuid::has_xsave() {
-            xsave(area);
+            xsave(&mut (*old_tcb).fpu_state);
+            xrstor(&(*new_tcb).fpu_state);
         } else {
-            fxsave(area);
+            fxsave(&mut (*old_tcb).fpu_state);
+            fxrstor(&(*new_tcb).fpu_state);
         }
     }
 }
 
-/// Set CR0.TS (Task Switched) bit.
+/// Flush the live FPU registers into `tcb`'s save area when `tcb` is the
+/// currently running thread on this CPU; otherwise no-op.
 ///
-/// Next FPU/SSE instruction will trigger #NM for lazy switching.
-/// Called on context switch.
-#[inline]
-pub fn set_ts() {
-    // SAFETY: Setting TS is safe — it only causes #NM on next FPU use
-    unsafe {
-        core::arch::asm!(
-            "mov rax, cr0",
-            "or rax, 8",
-            "mov cr0, rax",
-            out("rax") _,
-            options(nostack),
-        );
-    }
-}
-
-/// Clear CR0.TS bit.
-///
-/// Allows FPU/SSE instructions without triggering #NM.
-/// Called after restoring FPU state for the current thread.
-#[inline]
-fn clear_ts() {
-    // SAFETY: clts is a privileged instruction that clears TS — safe in kernel
-    unsafe {
-        core::arch::asm!("clts", options(nostack));
-    }
-}
-
-/// If the given TCB is the current CPU's FPU owner, flush its FPU state
-/// from hardware registers into the TCB's XSaveArea.
-///
-/// Used by TCB_COPY_FPU to ensure the source TCB's state is up-to-date
-/// before copying to the destination.
+/// In eager mode the FPU is always implicitly owned by the currently
+/// running thread, so this collapses to a self-check against the
+/// scheduler. Used by TCB_COPY_FPU to capture the live state of the
+/// parent / interrupted thread before reading it.
 ///
 /// # Safety
-/// `tcb_ptr` must be a valid pointer to a Tcb.
-pub unsafe fn flush_if_owner(tcb_ptr: *mut u8) {
-    if cpu::get_fpu_owner() == tcb_ptr {
-        // SAFETY: Caller guarantees tcb_ptr is valid Tcb.
-        // Clear TS before XSAVE — if the caller reached here via a path that
-        // set CR0.TS (e.g. fork on the same CPU after context switch), XSAVE
-        // would trigger a kernel #NM.
+/// `tcb` must be a valid Tcb pointer.
+pub unsafe fn flush_current(tcb: *mut Tcb) {
+    let current = crate::sched::scheduler::scheduler().current();
+    if current == tcb {
+        // SAFETY: tcb is current on this CPU, so its save area is exclusively
+        // owned by us until we yield.
         unsafe {
-            clear_ts();
-            let tcb = &mut *(tcb_ptr as *mut Tcb);
-            xsave_current(&mut tcb.fpu_state);
+            if super::cpuid::has_xsave() {
+                xsave(&mut (*tcb).fpu_state);
+            } else {
+                fxsave(&mut (*tcb).fpu_state);
+            }
         }
     }
 }
 
-/// Save outgoing thread's FPU state to its TCB buffer during context switch.
+/// Restore the FPU registers from `tcb`'s save area when `tcb` is the
+/// currently running thread on this CPU; otherwise no-op.
 ///
-/// If the given TCB is the current CPU's FPU owner, saves the live hardware
-/// state into the TCB's XSaveArea and releases ownership. This ensures the
-/// buffer is up-to-date before the thread migrates to another CPU.
+/// Used after callers mutate `tcb.fpu_state` directly (e.g. TCB_COPY_FPU
+/// into self, fault-handler register rewrites) to keep the live
+/// registers in sync — without this, the next switch-out would xsave
+/// the stale register contents back over the freshly written buffer.
 ///
 /// # Safety
-/// `tcb_ptr` must be a valid pointer to a Tcb.
-pub unsafe fn save_on_switch(tcb_ptr: *mut u8) {
-    if cpu::get_fpu_owner() == tcb_ptr {
-        // SAFETY: Caller guarantees tcb_ptr is valid Tcb.
-        // Clear TS before XSAVE to prevent kernel #NM.
+/// `tcb` must be a valid Tcb pointer.
+pub unsafe fn reload_current(tcb: *mut Tcb) {
+    let current = crate::sched::scheduler::scheduler().current();
+    if current == tcb {
+        // SAFETY: tcb is current on this CPU; its save area is stable for the
+        // duration of this syscall.
         unsafe {
-            clear_ts();
-            let tcb = &mut *(tcb_ptr as *mut Tcb);
-            xsave_current(&mut tcb.fpu_state);
-            cpu::set_fpu_owner(core::ptr::null_mut());
+            if super::cpuid::has_xsave() {
+                xrstor(&(*tcb).fpu_state);
+            } else {
+                fxrstor(&(*tcb).fpu_state);
+            }
         }
-    }
-}
-
-/// Clear FPU ownership if the given TCB is the current CPU's FPU owner.
-///
-/// Called during TCB cleanup to prevent stale pointer dereference.
-/// If the dying thread's FPU state is in hardware, we discard it
-/// (no need to save — the thread is being destroyed).
-pub fn disown_if_current(tcb_ptr: *mut u8) {
-    if cpu::get_fpu_owner() == tcb_ptr {
-        // SAFETY: We're clearing the owner and setting TS so next FPU use
-        // triggers #NM for whoever runs next.
-        unsafe {
-            cpu::set_fpu_owner(core::ptr::null_mut());
-        }
-        set_ts();
     }
 }

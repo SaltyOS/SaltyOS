@@ -1,28 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::*;
 
 use crate::base::mmsrv_ipc;
 use crate::base::proc_table;
 
-const VSPACE_FLAG_WRITABLE: u64 = trona::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = trona::VSPACE_FLAG_USER;
-const VSPACE_FLAG_EXECUTABLE: u64 = trona::VSPACE_FLAG_EXECUTABLE;
-const PF_W: u32 = trona::PF_W;
-const PF_X: u32 = trona::PF_X;
-const PT_LOAD: u32 = trona::PT_LOAD;
+const VSPACE_FLAG_WRITABLE: u64 = uapi::KERNITE_PAGE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = uapi::KERNITE_PAGE_FLAG_USER;
+const VSPACE_FLAG_EXECUTABLE: u64 = uapi::KERNITE_PAGE_FLAG_EXECUTABLE;
+const PF_W: u32 = uapi::KERNITE_PF_W;
+const PF_X: u32 = uapi::KERNITE_PF_X;
+const PT_LOAD: u32 = uapi::KERNITE_PT_LOAD;
 const CHUNK_PAGES: usize = 512;
 const MAX_IMAGE_RO_SEGS: usize = 8;
 const MAX_IMAGE_RW_RANGES: usize = 8;
 const MAX_IMAGE_RW_RUNS: usize = 8;
 const REGION_TYPE_SPAWN: u64 = 2;
 const REGION_TYPE_IMAGE_RO: u64 = 6;
+const REGION_TYPE_IMAGE_TEXT: u64 = 8;
+const REGION_TYPE_IMAGE_DATA: u64 = 9;
+#[allow(dead_code)]
+const REGION_TYPE_IMAGE_BSS: u64 = 10;
 
 pub(crate) struct ElfRuntimePlan {
     pub is_dynamic: bool,
     pub lib_window_pages: usize,
-    pub needed: trona_loader::elf_dynamic::NeededLibs,
-    pub layout: trona::layout::VmLayoutPlan,
+    pub needed: super::NeededLibs,
+    pub layout: trona_runtime::spawn::layout::VmLayoutPlan,
 }
 
 pub(crate) struct ElfRuntimeLoadResult {
@@ -30,6 +34,227 @@ pub(crate) struct ElfRuntimeLoadResult {
     pub rtld_result: ElfLoadResult,
     pub shared_lib_base: u64,
     pub shared_lib_map: proc_table::ProcLibMap,
+    pub mapped_image_count: usize,
+    pub mapped_images: [trona_protocol::win32::SaltyOSMappedImageV1;
+        trona_protocol::win32::SALTYOS_STARTUP_MAX_MAPPED_IMAGES],
+}
+
+unsafe fn inspect_shared_lib_for_layout(
+    initrd: *const u8,
+    initrd_size: usize,
+    soname: &[u8],
+) -> Option<(u64, super::NeededLibs)> {
+    unsafe {
+        const LIB_PREFIX: &[u8] = b"/lib/";
+        let mut cpio_name = [0u8; 64];
+        if soname.len() + LIB_PREFIX.len() <= cpio_name.len() {
+            let mut i = 0usize;
+            while i < LIB_PREFIX.len() {
+                cpio_name[i] = LIB_PREFIX[i];
+                i += 1;
+            }
+            i = 0;
+            while i < soname.len() {
+                cpio_name[LIB_PREFIX.len() + i] = soname[i];
+                i += 1;
+            }
+
+            if let Some(entry) = trona_loader::common::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                &cpio_name[..soname.len() + LIB_PREFIX.len()],
+            ) {
+                return Some((
+                    super::elf_compute_load_span(entry.data, entry.data_len),
+                    super::elf_get_needed(entry.data, entry.data_len),
+                ));
+            }
+        }
+
+        let mut vfs_path = [0u8; 160];
+        if soname.len() + LIB_PREFIX.len() <= vfs_path.len() {
+            let mut i = 0usize;
+            while i < LIB_PREFIX.len() {
+                vfs_path[i] = LIB_PREFIX[i];
+                i += 1;
+            }
+            let mut j = 0usize;
+            while j < soname.len() {
+                vfs_path[LIB_PREFIX.len() + j] = soname[j];
+                j += 1;
+            }
+            if let Some(info) = crate::loader::vfs_load::inspect_shared_object_from_vfs(
+                &vfs_path,
+                LIB_PREFIX.len() + soname.len(),
+            ) {
+                return Some(info);
+            }
+        }
+
+        const USR_LIB_PREFIX: &[u8] = b"/usr/lib/";
+        if soname.len() + USR_LIB_PREFIX.len() <= vfs_path.len() {
+            let mut i = 0usize;
+            while i < USR_LIB_PREFIX.len() {
+                vfs_path[i] = USR_LIB_PREFIX[i];
+                i += 1;
+            }
+            let mut j = 0usize;
+            while j < soname.len() {
+                vfs_path[USR_LIB_PREFIX.len() + j] = soname[j];
+                j += 1;
+            }
+            return crate::loader::vfs_load::inspect_shared_object_from_vfs(
+                &vfs_path,
+                USR_LIB_PREFIX.len() + soname.len(),
+            );
+        }
+
+        None
+    }
+}
+
+fn page_align_up_u64(v: u64) -> u64 {
+    (v + 0xFFF) & !0xFFFu64
+}
+
+fn push_needed_unique(libs: &mut super::NeededLibs, name: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < libs.count {
+        if libs.name_lens[i] == name.len() {
+            let mut j = 0usize;
+            let mut same = true;
+            while j < name.len() {
+                if libs.names[i][j] != name[j] {
+                    same = false;
+                    break;
+                }
+                j += 1;
+            }
+            if same {
+                return true;
+            }
+        }
+        i += 1;
+    }
+
+    if libs.count >= super::MAX_NEEDED_LIBS {
+        return false;
+    }
+    let copy_len = core::cmp::min(name.len(), super::MAX_NEEDED_NAME);
+    let mut j = 0usize;
+    while j < copy_len {
+        libs.names[libs.count][j] = name[j];
+        j += 1;
+    }
+    libs.name_lens[libs.count] = copy_len;
+    libs.count += 1;
+    true
+}
+
+unsafe fn collect_bootstrap_closure(
+    seeds: &super::NeededLibs,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> Option<super::NeededLibs> {
+    unsafe {
+        let mut closure = super::NeededLibs::new();
+        let mut i = 0usize;
+        while i < seeds.count {
+            let name = &seeds.names[i][..seeds.name_lens[i]];
+            if !push_needed_unique(&mut closure, name) {
+                return None;
+            }
+            i += 1;
+        }
+
+        let mut cursor = 0usize;
+        while cursor < closure.count {
+            let name = &closure.names[cursor][..closure.name_lens[cursor]];
+            let (_, needed) = inspect_shared_lib_for_layout(initrd, initrd_size, name)?;
+            let mut dep_idx = 0usize;
+            while dep_idx < needed.count {
+                let dep = &needed.names[dep_idx][..needed.name_lens[dep_idx]];
+                if !push_needed_unique(&mut closure, dep) {
+                    return None;
+                }
+                dep_idx += 1;
+            }
+            cursor += 1;
+        }
+
+        Some(closure)
+    }
+}
+
+fn prefixed_path(prefix: &[u8], name: &[u8], out: &mut [u8]) -> Option<usize> {
+    if prefix.len().saturating_add(name.len()) > out.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() {
+        out[i] = prefix[i];
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < name.len() {
+        out[prefix.len() + j] = name[j];
+        j += 1;
+    }
+    Some(prefix.len() + name.len())
+}
+
+unsafe fn load_bootstrap_shared_object(
+    soname: &[u8],
+    initrd: *const u8,
+    initrd_size: usize,
+    load_base: u64,
+    pid: u32,
+    child_vspace: Cap,
+) -> Option<ElfLoadResult> {
+    unsafe {
+        const LIB_PREFIX: &[u8] = b"/lib/";
+        const USR_LIB_PREFIX: &[u8] = b"/usr/lib/";
+
+        let mut path = [0u8; 160];
+        if let Some(path_len) = prefixed_path(LIB_PREFIX, soname, &mut path) {
+            if let Some(entry) =
+                trona_loader::common::cpio::cpio_find_file(initrd, initrd_size, &path[..path_len])
+            {
+                let mut result = ElfLoadResult {
+                    entry: 0,
+                    base: 0,
+                    brk: 0,
+                };
+                let err = exec_load_elf_mmsrv(
+                    entry.data,
+                    entry.data_len,
+                    load_base,
+                    pid,
+                    child_vspace,
+                    &raw mut result,
+                );
+                if err == 0 {
+                    return Some(result);
+                }
+                return None;
+            }
+            if let Some(result) =
+                exec_load_elf_from_vfs(&path[..path_len], load_base, pid, child_vspace)
+            {
+                return Some(result);
+            }
+        }
+
+        if let Some(path_len) = prefixed_path(USR_LIB_PREFIX, soname, &mut path) {
+            if let Some(result) =
+                exec_load_elf_from_vfs(&path[..path_len], load_base, pid, child_vspace)
+            {
+                return Some(result);
+            }
+        }
+
+        None
+    }
 }
 
 fn elf_segment_vspace_flags(p_flags: u32) -> u64 {
@@ -91,12 +316,7 @@ impl ImageLoadPlan {
     }
 }
 
-fn insert_sorted_range(
-    ranges: &mut [ImageRange],
-    count: &mut usize,
-    base: u64,
-    end: u64,
-) -> bool {
+fn insert_sorted_range(ranges: &mut [ImageRange], count: &mut usize, base: u64, end: u64) -> bool {
     if *count >= ranges.len() {
         return false;
     }
@@ -234,8 +454,7 @@ unsafe fn build_segmented_load_plan(
 
                         let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
                         let seg_base = seg_vaddr & !0xFFFu64;
-                        let seg_end =
-                            (seg_vaddr.wrapping_add(phdr.p_memsz) + 0xFFF) & !0xFFFu64;
+                        let seg_end = (seg_vaddr.wrapping_add(phdr.p_memsz) + 0xFFF) & !0xFFFu64;
                         if page >= seg_base && page < seg_end {
                             flags |= elf_segment_vspace_flags(phdr.p_flags);
                         }
@@ -458,7 +677,7 @@ unsafe fn load_segmented_image<FRead>(
 where
     FRead: FnMut(*mut u8, usize, usize) -> bool,
 {
-    use trona::consts::{ELF_MAP_FAILED, ELF_OUT_OF_MEMORY};
+    use uapi::{ELF_MAP_FAILED, ELF_OUT_OF_MEMORY};
 
     unsafe {
         let delta = if is_pie {
@@ -520,11 +739,21 @@ where
                                 stage as u64,
                                 chunk_count as u64,
                                 seg.flags,
-                                REGION_TYPE_IMAGE_RO,
+                                // Executable RO runs are the main
+                                // program's `.text` (→ VmExe). Non-exec
+                                // RO runs are `.rodata` — classified
+                                // under `IMAGE_RO` so procfs lumps
+                                // them with shared-lib read-only pages
+                                // (VmLib).
+                                if seg.flags & VSPACE_FLAG_EXECUTABLE != 0 {
+                                    REGION_TYPE_IMAGE_TEXT
+                                } else {
+                                    REGION_TYPE_IMAGE_RO
+                                },
                             ) {
                                 Ok(v) => v,
                                 Err((err, label, value)) => {
-                                    trona::uerror!(|_lb| {
+                                    trona_runtime::uerror!(|_lb| {
                                         _lb.str(
                                             b"[PROCMGR] exec ELF RO MM_ALLOC_TYPED_COPY failed err=",
                                         );
@@ -552,7 +781,7 @@ where
                         ) {
                             Ok(v) => v,
                             Err((err, label, value)) => {
-                                trona::uerror!(|_lb| {
+                                trona_runtime::uerror!(|_lb| {
                                     _lb.str(
                                         b"[PROCMGR] exec ELF RO MM_COPY_FROM_CLIENT_REGION failed err=",
                                     );
@@ -610,11 +839,13 @@ where
                                 stage as u64,
                                 chunk_count as u64,
                                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-                                REGION_TYPE_SPAWN,
+                                // Writable runs are `.data` / `.bss`
+                                // of the main program (→ VmData).
+                                REGION_TYPE_IMAGE_DATA,
                             ) {
                                 Ok(v) => v,
                                 Err((err, label, value)) => {
-                                    trona::uerror!(|_lb| {
+                                    trona_runtime::uerror!(|_lb| {
                                         _lb.str(
                                             b"[PROCMGR] exec ELF RW MM_ALLOC_TYPED_COPY failed err=",
                                         );
@@ -642,7 +873,7 @@ where
                         ) {
                             Ok(v) => v,
                             Err((err, label, value)) => {
-                                trona::uerror!(|_lb| {
+                                trona_runtime::uerror!(|_lb| {
                                     _lb.str(
                                         b"[PROCMGR] exec ELF RW MM_COPY_FROM_CLIENT_REGION failed err=",
                                     );
@@ -703,40 +934,43 @@ unsafe fn count_rtld_span(
 ) -> u64 {
     unsafe {
         let mut rtld_cpio_path = [0u8; 64];
-        let interp = trona_loader::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
-        let interp_slice = if !interp.is_null() && *interp != 0 {
-            let len = crate::loader::stack_build::strlen(interp);
-            core::slice::from_raw_parts(interp, len)
-        } else {
-            &[]
+        let rtld_cpio_len = {
+            use trona_loader::common::elf::header::{get_interp, phdr_slice, validate_ehdr};
+            let interp_opt = validate_ehdr(elf_data, elf_data_len)
+                .ok()
+                .and_then(|ehdr| phdr_slice(elf_data, elf_data_len, ehdr).ok())
+                .and_then(|phdrs| get_interp(elf_data, phdrs));
+            match interp_opt {
+                Some(interp) => {
+                    if interp.is_empty() || interp.len() > rtld_cpio_path.len() {
+                        0
+                    } else {
+                        let mut i = 0;
+                        while i < interp.len() {
+                            rtld_cpio_path[i] = interp[i];
+                            i += 1;
+                        }
+                        interp.len()
+                    }
+                }
+                None => 0,
+            }
         };
-        let rtld_cpio_len = trona_loader::elf_dynamic::resolve_interp_to_cpio_path(
-            interp_slice,
-            &mut rtld_cpio_path,
-        );
         if rtld_cpio_len == 0 {
             return 5 * 4096;
         }
 
-        let mut rtld_entry = CpioEntry::zeroed();
-        if trona_loader::cpio::cpio_find_file(
+        let rtld_entry = match trona_loader::common::cpio::cpio_find_file(
             initrd,
             initrd_size,
-            rtld_cpio_path.as_ptr(),
-            rtld_cpio_len,
-            &raw mut rtld_entry,
-        ) == 0
-        {
-            return 5 * 4096; // fallback estimate
-        }
+            &rtld_cpio_path[..rtld_cpio_len],
+        ) {
+            Some(e) => e,
+            None => return 5 * 4096,
+        };
 
-        let span =
-            trona_loader::elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
-        if span == 0 {
-            5 * 4096
-        } else {
-            span
-        }
+        let span = super::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
+        if span == 0 { 5 * 4096 } else { span }
     }
 }
 
@@ -747,25 +981,17 @@ pub(crate) unsafe fn count_rtld_span_by_name(
     initrd_size: usize,
 ) -> u64 {
     unsafe {
-        let mut rtld_entry = CpioEntry::zeroed();
-        if trona_loader::cpio::cpio_find_file(
+        let rtld_entry = match trona_loader::common::cpio::cpio_find_file(
             initrd,
             initrd_size,
-            rtld_name,
-            rtld_name_len,
-            &raw mut rtld_entry,
-        ) == 0
-        {
-            return 5 * 4096;
-        }
+            core::slice::from_raw_parts(rtld_name, rtld_name_len),
+        ) {
+            Some(e) => e,
+            None => return 5 * 4096,
+        };
 
-        let span =
-            trona_loader::elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
-        if span == 0 {
-            5 * 4096
-        } else {
-            span
-        }
+        let span = super::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
+        if span == 0 { 5 * 4096 } else { span }
     }
 }
 
@@ -781,19 +1007,17 @@ pub(crate) unsafe fn plan_elf_runtime(
         let is_dynamic = if let Some(vfs) = vfs_stream {
             vfs.is_dynamic
         } else {
-            trona_loader::elf_dynamic::elf_has_interp(elf_data, elf_data_len)
-        };
-
-        let lib_window_pages = if is_dynamic {
-            crate::loader::shared_lib_cache::compute_lib_window_pages(initrd, initrd_size)
-        } else {
-            0
+            use trona_loader::common::elf::header::{has_interp, phdr_slice, validate_ehdr};
+            validate_ehdr(elf_data, elf_data_len)
+                .and_then(|ehdr| phdr_slice(elf_data, elf_data_len, ehdr))
+                .map(|phdrs| has_interp(phdrs))
+                .unwrap_or(false)
         };
 
         let elf_span = if let Some(vfs) = vfs_stream {
             vfs.elf_span
         } else {
-            trona_loader::elf_loader::elf_compute_load_span(elf_data, elf_data_len)
+            super::elf_compute_load_span(elf_data, elf_data_len)
         };
         let rtld_span = if is_dynamic {
             if let Some(vfs) = vfs_stream {
@@ -810,22 +1034,38 @@ pub(crate) unsafe fn plan_elf_runtime(
             0
         };
 
-        let needed = if is_dynamic && vfs_stream.is_none() {
-            trona_loader::elf_dynamic::elf_get_needed(elf_data, elf_data_len)
+        let direct_needed = if is_dynamic && vfs_stream.is_none() {
+            super::elf_get_needed(elf_data, elf_data_len)
         } else if let Some(vfs) = vfs_stream {
             vfs.needed
         } else {
-            trona_loader::elf_dynamic::NeededLibs::new()
+            super::NeededLibs::new()
         };
 
-        let shared_lib_cache_pages = crate::loader::shared_lib_cache::shared_lib_va_pages_for_needed(&needed);
-        let layout = trona::layout::compute_vm_layout_randomized(
+        let needed = if is_dynamic {
+            collect_bootstrap_closure(&direct_needed, initrd, initrd_size)?
+        } else {
+            super::NeededLibs::new()
+        };
+
+        let lib_window_pages = super::compute_needed_window_pages(&needed, |soname| {
+            unsafe { inspect_shared_lib_for_layout(initrd, initrd_size, soname) }
+                .map(|(span, _)| span)
+                .unwrap_or(0)
+        });
+
+        // The spawner preloads the bootstrap DSO closure into the reserved
+        // shared-library window before first entry, and RTLD reuses that
+        // window metadata to seed its object graph.
+        let initrd_window_size = if map_initrd { initrd_size } else { 0 };
+        let layout = trona_runtime::spawn::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
-            shared_lib_cache_pages,
+            lib_window_pages,
             map_initrd,
-            lib_window_pages * 4096,
-            || trona::syscall::sys_getrandom(),
+            initrd_window_size,
+            trona_runtime::spawn::stack_plan::StackLayoutSpec::default_service(),
+            || trona_kernel::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
             return None;
@@ -883,6 +1123,9 @@ pub(crate) unsafe fn load_elf_runtime(
             base: 0,
             brk: 0,
         };
+        let mut mapped_image_count = 0usize;
+        let mut mapped_images = [trona_protocol::win32::SaltyOSMappedImageV1::zeroed();
+            trona_protocol::win32::SALTYOS_STARTUP_MAX_MAPPED_IMAGES];
         if runtime.is_dynamic {
             rtld_result = if let Some(vfs) = vfs_stream {
                 exec_load_rtld_mmsrv_by_name(
@@ -905,24 +1148,52 @@ pub(crate) unsafe fn load_elf_runtime(
                     child_vspace,
                 )?
             };
+
+            let mut next_base = runtime.layout.shared_libs.base;
+            let mut i = 0usize;
+            while i < runtime.needed.count {
+                let name = &runtime.needed.names[i][..runtime.needed.name_lens[i]];
+                let load = load_bootstrap_shared_object(
+                    name,
+                    initrd,
+                    initrd_size,
+                    next_base,
+                    pid,
+                    child_vspace,
+                )?;
+                if mapped_image_count >= mapped_images.len() {
+                    return None;
+                }
+                let mut mapped = trona_protocol::win32::SaltyOSMappedImageV1::zeroed();
+                mapped.image = trona_protocol::win32::SaltyOSImageInfoV1::new(
+                    trona_protocol::win32::SALTYOS_IMAGE_KIND_ELF,
+                    0,
+                    load.base,
+                    load.brk.saturating_sub(load.base),
+                    0,
+                );
+                mapped.set_name(name);
+                mapped_images[mapped_image_count] = mapped;
+                mapped_image_count += 1;
+                next_base = page_align_up_u64(load.brk);
+                i += 1;
+            }
         }
 
-        let (shared_lib_base, shared_lib_map) = if runtime.is_dynamic {
-            crate::loader::shared_lib_cache::map_shared_lib_to_vspace(
-                child_vspace,
-                runtime.layout.shared_libs.base,
-                &runtime.needed,
-                pid,
-            )
+        let shared_lib_base: u64 = if mapped_image_count != 0 {
+            runtime.layout.shared_libs.base
         } else {
-            (0, proc_table::ProcLibMap::zeroed())
+            0
         };
+        let shared_lib_map = proc_table::ProcLibMap::zeroed();
 
         Some(ElfRuntimeLoadResult {
             elf_result,
             rtld_result,
             shared_lib_base,
             shared_lib_map,
+            mapped_image_count,
+            mapped_images,
         })
     }
 }
@@ -946,10 +1217,10 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
     result: *mut ElfLoadResult,
 ) -> i32 {
     unsafe {
-        use trona::consts::{
-            ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_NOT_64BIT, ELF_NOT_ELF,
-            ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, EM_AARCH64, EM_X86_64,
-            ET_DYN, ET_EXEC, PT_LOAD,
+        use uapi::{
+            ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_NO_LOAD, ELF_NOT_64BIT, ELF_NOT_ELF, ELF_NOT_LE,
+            ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_DYN, ET_EXEC,
+            PT_LOAD,
         };
 
         if data_len < core::mem::size_of::<Elf64Ehdr>() {
@@ -979,7 +1250,7 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
             return ELF_BAD_ARCH;
         }
         #[cfg(target_arch = "aarch64")]
-        if ehdr.e_machine != EM_AARCH64 {
+        if ehdr.e_machine != trona_runtime::core::server_consts::EM_AARCH64 {
             return ELF_BAD_ARCH;
         }
 
@@ -1063,10 +1334,10 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
     result: *mut ElfLoadResult,
 ) -> i32 {
     unsafe {
-        use trona::consts::{
-            ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_NOT_64BIT, ELF_NOT_ELF,
-            ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, EM_AARCH64, EM_X86_64,
-            ET_DYN, ET_EXEC, PT_LOAD,
+        use uapi::{
+            ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_NO_LOAD, ELF_NOT_64BIT, ELF_NOT_ELF, ELF_NOT_LE,
+            ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_DYN, ET_EXEC,
+            PT_LOAD,
         };
 
         let fd = vfs.fd;
@@ -1107,7 +1378,7 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
             return ELF_BAD_ARCH;
         }
         #[cfg(target_arch = "aarch64")]
-        if ehdr.e_machine != EM_AARCH64 {
+        if ehdr.e_machine != trona_runtime::core::server_consts::EM_AARCH64 {
             return ELF_BAD_ARCH;
         }
 
@@ -1182,9 +1453,7 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
             load_base,
             pid,
             result,
-            |dst, len, file_off| {
-                crate::loader::vfs_load::vfs_read_exact_at(fd, dst, len, file_off)
-            },
+            |dst, len, file_off| crate::loader::vfs_load::vfs_read_exact_at(fd, dst, len, file_off),
         )
     }
 }
@@ -1206,17 +1475,17 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv(
 ) -> Option<ElfLoadResult> {
     unsafe {
         let mut rtld_cpio_path = [0u8; 64];
-        let interp = trona_loader::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
-        let interp_slice = if !interp.is_null() && *interp != 0 {
-            let len = crate::loader::stack_build::strlen(interp);
-            core::slice::from_raw_parts(interp, len)
-        } else {
-            &[]
+        let rtld_cpio_len = {
+            use trona_loader::common::elf::header::{get_interp, phdr_slice, validate_ehdr};
+            let interp_opt = validate_ehdr(elf_data, elf_data_len)
+                .ok()
+                .and_then(|ehdr| phdr_slice(elf_data, elf_data_len, ehdr).ok())
+                .and_then(|phdrs| get_interp(elf_data, phdrs));
+            match interp_opt {
+                Some(interp) => super::resolve_interp_to_cpio_path(interp, &mut rtld_cpio_path),
+                None => 0,
+            }
         };
-        let rtld_cpio_len = trona_loader::elf_dynamic::resolve_interp_to_cpio_path(
-            interp_slice,
-            &mut rtld_cpio_path,
-        );
         if rtld_cpio_len == 0 {
             return None;
         }
@@ -1243,20 +1512,19 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
     child_vspace: Cap,
 ) -> Option<ElfLoadResult> {
     unsafe {
-        let mut rtld_entry = CpioEntry::zeroed();
-        if trona_loader::cpio::cpio_find_file(
+        let rtld_entry = match trona_loader::common::cpio::cpio_find_file(
             initrd,
             initrd_size,
-            rtld_name,
-            rtld_name_len,
-            &raw mut rtld_entry,
-        ) == 0
-        {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] exec: rtld not found in initrd\n");
-            });
-            return None;
-        }
+            core::slice::from_raw_parts(rtld_name, rtld_name_len),
+        ) {
+            Some(e) => e,
+            None => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] exec: rtld not found in initrd\n");
+                });
+                return None;
+            }
+        };
 
         let mut rtld_result = ElfLoadResult {
             entry: 0,
@@ -1272,7 +1540,7 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
             &raw mut rtld_result,
         );
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] exec: rtld load failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" pid=");
@@ -1314,7 +1582,7 @@ pub(crate) unsafe fn exec_load_elf_from_vfs(
         );
         crate::loader::vfs_load::cleanup_vfs_load(vfs_buf.data, vfs_buf.alloc_size);
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] exec: VFS ELF load failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");

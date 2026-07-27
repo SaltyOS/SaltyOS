@@ -13,8 +13,8 @@
 [submodule "lib/basalt"]
 	path = lib/basalt
 	url = https://github.com/SaltyOS/basalt
-	branch = vNext
+	branch = vCanary
 [submodule "lib/trona"]
 	path = lib/trona
 	url = https://github.com/SaltyOS/trona
-	branch = vNext
+	branch = vCanary

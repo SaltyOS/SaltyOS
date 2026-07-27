@@ -9,61 +9,74 @@
 //! only does hardware I/O and frame forwarding.
 //!
 //! Communication with netsrv:
-//!   - SHM ring buffers (128KB, 32 pages) for RX and TX frame exchange
-//!   - Notification signaling: netdrv signals netsrv when RX frames are
-//!     available; netsrv signals netdrv (via badged notification) when TX
-//!     frames are queued.
+//!   - SHM ring buffers (header page + RX/TX slots) for frame exchange
+//!   - MessagePipe kicks: netdrv sends `NETSRV_RX_KICK` after publishing
+//!     RX frames; netsrv sends `NETDRV_TX_KICK` after publishing TX frames.
 //!
-//! Startup caps are role-based. System caps come from `trona::caps::*()`,
-//! the pcidrv dependency comes from generated `svc_caps::*()`, and a few
-//! IRQ/notification slots are runtime-local.
+//! Startup caps are role-based. System caps come from `trona_runtime::client::caps::*()`;
+//! the service-local `pcidrv_ep` dependency is resolved through the
+//! `trona_runtime::local_cap!` macro declared below, and a few IRQ/private
+//! slots are runtime-local.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
 extern crate trona_posix;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 mod virtio;
 mod virtio_modern;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::common::{TRONA_INVALID_OPERATION, TRONA_OK};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::netsrv::{NETDRV_REGISTER, NETDRV_TX_KICK, NETSRV_RX_KICK};
+use trona_runtime::core::slot_alloc::{OwnedCap, OwnedSlot, TransferCap};
+
+// Service-local cap: `Require=pcidrv-ep.socket` in `netdrv.service`
+// (Provider=pcidrv, Alias=pcidrv_ep). Init hashes `"netdrv:pcidrv_ep"`
+// into a LOCAL_ROLE id when building the startup cap_table.
+trona_runtime::local_cap!(pub(crate) pcidrv_ep = "netdrv:pcidrv_ep");
 
 // ---------------------------------------------------------------------------
 // Capability slot constants
 // ---------------------------------------------------------------------------
 
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
-// System roles via substrate `trona::caps::*` getters.
-const CAP_IRQ_HANDLER: u64 = 81;
-const CAP_IRQ_NOTIFICATION: u64 = 82;
-const CAP_NETSRV_RX_NTFN: u64 = 84;
-const CAP_REPLY_TEMP: u64 = 85;
+// System roles still come from substrate `trona_runtime::client::caps::*`, while the driver's
+// receive scratch slots are allocated from `trona_runtime::core::slot_alloc` so they do not
+// collide with RTLD/runtime frame reservations.
+static mut CAP_IRQ_HANDLER_SLOT: u64 = 0;
+/// Stable receive scratch for the service-EP IPC dispatch loop.
+/// Payload caps from inbound `MP_CALL` records are installed here.
+/// Process-lifetime slot; allocated once and never freed.
+static mut CAP_RECV_SCRATCH: Option<OwnedSlot> = None;
 
 // ---------------------------------------------------------------------------
 // SHM ring buffer constants
 // ---------------------------------------------------------------------------
 
-const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
-const NET_SHM_ID: u64 = 0x4E455400;
-const TX_BADGE: u64 = 0x2;
-const POLL_TIMEOUT_NS: u64 = 10_000_000;
+const SHM_MAP_HINT: u64 = 0;
+const SHM_HEADER_BYTES: u64 = 0x1000;
+const SHM_SLOT_BYTES: u64 = 2048;
+const SHM_RX_SLOT_COUNT: u64 = 32;
+const SHM_TX_SLOT_COUNT: u64 = 32;
+const NET_SHM_BYTES: u64 =
+    SHM_HEADER_BYTES + ((SHM_RX_SLOT_COUNT + SHM_TX_SLOT_COUNT) * SHM_SLOT_BYTES);
+const NET_SHM_MAP_BYTES: u64 = (NET_SHM_BYTES + 4095) & !4095;
 
 // ---------------------------------------------------------------------------
 // Driver state
 // ---------------------------------------------------------------------------
 
 static mut IRQ_ENABLED: bool = false;
-static mut IRQ_BADGE_BITS: u64 = 0;
 pub(crate) static mut USING_MODERN_TRANSPORT: bool = false;
 static mut SHM_BASE: u64 = 0;
-static mut NETSRV_RX_NTFN: u64 = 0;
 static mut LOGGED_RX_FRAME: bool = false;
 static mut LOGGED_TX_FRAME: bool = false;
 
@@ -75,18 +88,50 @@ pub(crate) fn ipc_ctx() -> *mut IpcContext {
     trona_posix::tls::current_ipc_ctx()
 }
 
-fn irq_badge_bits() -> u64 {
-    // SAFETY: Written during IRQ setup before event loop starts.
-    unsafe { *(&raw const IRQ_BADGE_BITS) }
+fn init_private_slots() {
+    // Reserve one stable receive slot for NETDRV_REGISTER's SHM
+    // memory-object cap.
+    let slot = trona_runtime::core::slot_alloc::alloc_slot_or_idle(b"netdrv recv-scratch");
+    // SAFETY: Single-threaded init; no other thread accesses CAP_RECV_SCRATCH yet.
+    unsafe {
+        *(&raw mut CAP_RECV_SCRATCH) = Some(slot);
+    }
 }
 
-fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
+#[inline]
+pub(crate) fn set_irq_handler_cap(slot: u64) {
+    unsafe {
+        *(&raw mut CAP_IRQ_HANDLER_SLOT) = slot;
+    }
+}
+
+#[inline]
+fn cap_irq_handler() -> u64 {
+    unsafe { *(&raw const CAP_IRQ_HANDLER_SLOT) }
+}
+
+/// Returns the raw slot number for use as a receive slot target.
+#[inline]
+fn cap_recv_scratch_slot() -> u64 {
+    // SAFETY: Written once during init; read-only afterwards.
+    unsafe {
+        match &*(&raw const CAP_RECV_SCRATCH) {
+            Some(s) => s.borrow().addr(),
+            None => 0,
+        }
+    }
+}
+
+fn idle() -> ! {
+    loop {
+        trona_kernel::syscall::yield_now();
+    }
 }
 
 fn log_frame_bytes(prefix: &[u8], frame: &[u8]) {
     let dump_len = core::cmp::min(frame.len(), 32);
-    trona::udebug!(|_lb| {
+    let _ = (prefix, dump_len);
+    trona_runtime::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" len=");
         _lb.dec(frame.len() as u64);
@@ -115,7 +160,8 @@ fn log_ethertype(prefix: &[u8], frame: &[u8]) {
         return;
     }
     let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
-    trona::udebug!(|_lb| {
+    let _ = (prefix, ethertype);
+    trona_runtime::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" len=");
         _lb.dec(frame.len() as u64);
@@ -133,23 +179,41 @@ fn mac_addr() -> [u8; 6] {
 
 /// Register with name service as "netdrv".
 fn register_namesrv() {
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
+
     let name = b"netdrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = NS_REGISTER;
+    msg.label = NAMESRV_REGISTER;
     msg.regs[0] = name.len() as u64;
-    msg.length = 1 + (name.len() as u64 + 7) / 8;
+    let Some(publish_tc) = trona_runtime::client::caps::service_client_ep_for_transfer() else {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] No service client ep to publish\n");
+        });
+        return;
+    };
     // SAFETY: Writing name bytes into message register space; IPC context is valid.
     unsafe {
         let dst = &raw mut msg.regs[1] as *mut u8;
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.slot());
+    }
+    msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    msg.length = (REGISTER_FLAGS_REG + 1) as u64;
+    unsafe {
         let mut reply = TronaMsg::zeroed();
-        let err =
-            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
+        let err = ipc::mp_call_ctx(
+            ipc_ctx(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        drop(publish_tc);
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[netdrv] namesrv registration failed\n");
             });
         }
@@ -162,91 +226,35 @@ fn register_namesrv() {
 
 /// Set up IRQ handling for the device.
 ///
-/// Uses the IRQ handler cap received from pcidrv (slot 81) rather than
-/// creating one via irq_control_get, following least-privilege principles.
-///
-/// 1. Retype a Notification from untyped memory
-/// 2. Bind IRQ handler (from pcidrv) to notification
-/// 3. Bind notification to our TCB for Recv wakeup
+/// pcidrv may hand us an IRQ cap. RX IRQ events and TX kicks are both handled
+/// by netdrv's EventQueue reactor; TX kicks are coalescable notifications from
+/// netsrv, not synchronous RPCs.
 fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
-    if !has_irq_handler {
-        trona::uwarn!(|_lb| {
-            _lb.str(b"[netdrv] No IRQ handler cap from pcidrv, skipping IRQ setup\n");
-        });
-        return false;
-    }
-
-    // Step 1: Allocate a Notification object via rsrcsrv (owner=self)
-    // SAFETY: IPC context is valid; set up receive slot for cap transfer.
-    unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_IRQ_NOTIFICATION, 0);
-    }
-    let mut msg = TronaMsg::zeroed();
-    msg.label = RES_ALLOC_OBJECT;
-    msg.regs[0] = 0;
-    msg.regs[1] = OBJ_NOTIFICATION;
-    msg.regs[2] = 0;
-    msg.regs[3] = 0;
-    msg.length = 4;
-    let mut alloc_reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to rsrcsrv.
-    let err = unsafe {
-        ipc::call_ctx(
-            ipc_ctx(),
-            trona::caps::rsrcsrv_ep(),
-            &raw const msg,
-            &raw mut alloc_reply,
-        )
-    };
-    if err != 0 || alloc_reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] Failed to allocate Notification via rsrcsrv: ");
-            _lb.dec(if err != 0 {
-                err as u64
-            } else {
-                alloc_reply.label
+    if has_irq_handler && irq_line > 0 {
+        let irq_handler = cap_irq_handler();
+        if irq_handler == 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] pcidrv did not provide an IRQ handler slot\n");
             });
-            _lb.putc(b'\n');
+            return false;
+        }
+        // SAFETY: single-threaded init before the reactor starts.
+        unsafe {
+            *(&raw mut IRQ_ENABLED) = true;
+        }
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] IRQ-driven wake path (virtqueue interrupts -> EventQueue)\n");
         });
-        return false;
-    }
-
-    // Step 2: Bind IRQ handler to notification
-    let err = invoke::irq_handler_set_notification(CAP_IRQ_HANDLER, CAP_IRQ_NOTIFICATION);
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] Failed to bind IRQ to notification: ");
-            _lb.dec(err as u64);
-            _lb.putc(b'\n');
+    } else {
+        // SAFETY: single-threaded init before the reactor starts.
+        unsafe {
+            *(&raw mut IRQ_ENABLED) = false;
+        }
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[netdrv] device reports no IRQ handler; RX cannot be serviced\n");
         });
-        return false;
     }
 
-    // Step 3: Bind notification to our TCB for Recv wakeup
-    let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_IRQ_NOTIFICATION);
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] Failed to bind notification to TCB: ");
-            _lb.dec(err as u64);
-            _lb.putc(b'\n');
-        });
-        return false;
-    }
-
-    // Initial ACK to unmask the IRQ
-    let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-
-    // SAFETY: Single-threaded init path; written once before event loop.
-    unsafe {
-        *(&raw mut IRQ_ENABLED) = true;
-        *(&raw mut IRQ_BADGE_BITS) = 1u64 << ((irq_line as u64) & 63);
-    }
-
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netdrv] IRQ ");
-        _lb.dec(irq_line as u64);
-        _lb.str(b" handler configured\n");
-    });
     true
 }
 
@@ -259,7 +267,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
 /// Applies sender-side backpressure when the shared ring is full so frames are
 /// not silently dropped under SMP burst load.
 fn shm_rx_enqueue(frame: &[u8]) -> bool {
-    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER before any enqueue
+    // SAFETY: SHM_BASE is set once during NETDRV_REGISTER before any enqueue
     // calls. Single-threaded driver. All pointer arithmetic is within the
     // mapped SHM region (header at offset 0, RX ring at offset 0x1000).
     unsafe {
@@ -279,7 +287,7 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
             let next = (rx_head + 1) % slot_count;
             if next == rx_tail {
                 signal_netsrv_rx();
-                let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = trona_kernel::syscall::yield_now();
                 continue;
             }
 
@@ -301,7 +309,7 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
 /// Returns the frame length if a frame was dequeued, None if the ring is
 /// empty or SHM is not yet mapped.
 fn shm_tx_peek(buf: &mut [u8; 2048]) -> Option<usize> {
-    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
+    // SAFETY: SHM_BASE is set once during NETDRV_REGISTER. Single-threaded
     // driver. All pointer arithmetic is within the mapped SHM region (header
     // at offset 0, TX ring at offset 0x11000).
     unsafe {
@@ -329,7 +337,7 @@ fn shm_tx_peek(buf: &mut [u8; 2048]) -> Option<usize> {
 
 /// Consume one TX frame from the SHM TX ring after a successful transmit.
 fn shm_tx_consume() {
-    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
+    // SAFETY: SHM_BASE is set once during NETDRV_REGISTER. Single-threaded
     // driver. All pointer arithmetic is within the mapped SHM region.
     unsafe {
         let base = *(&raw const SHM_BASE);
@@ -351,11 +359,26 @@ fn shm_tx_consume() {
 
 /// Signal netsrv that RX frames are available in the SHM ring.
 fn signal_netsrv_rx() {
-    // SAFETY: NETSRV_RX_NTFN is set during DRIVER_REGISTER before any
-    // signal calls. Single-threaded driver.
-    let cap = unsafe { *(&raw const NETSRV_RX_NTFN) };
-    if cap != 0 {
-        let _ = trona::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
+    let netsrv_ref = trona_runtime::client::caps::netsrv_ep();
+    if netsrv_ref.is_null() {
+        return;
+    }
+    let netsrv = netsrv_ref.addr();
+
+    // Fire-and-forget notification, NOT an RPC. A blocking send deadlocks:
+    // netsrv answers the kick with a progress sweep (no reply), and that sweep
+    // can re-enter netdrv with a blocking TX kick while we are still parked in
+    // the send. `mp_write_ctx` blocks when the peer pipe is full, so force a
+    // zero timeout — the kernel then drops the kick instead of blocking when
+    // netsrv is momentarily behind. netsrv drains all pending RX from the SHM
+    // ring on its next sweep regardless, so a dropped/coalesced kick is
+    // harmless. The buffer timeout is saved and restored so other netdrv IPC
+    // (which relies on the default blocking policy) is unaffected.
+    let mut msg = TronaMsg::zeroed();
+    msg.label = NETSRV_RX_KICK;
+    let ctx = ipc_ctx();
+    unsafe {
+        let _ = ipc::mp_write_ctx(ctx, netsrv, &raw const msg);
     }
 }
 
@@ -378,7 +401,7 @@ fn drain_rx() -> bool {
             unsafe {
                 if !*(&raw const LOGGED_RX_FRAME) {
                     *(&raw mut LOGGED_RX_FRAME) = true;
-                    trona::udebug!(|_lb| {
+                    trona_runtime::udebug!(|_lb| {
                         _lb.str(b"[netdrv] RX header-skip=");
                         _lb.dec(hdr_sz as u64);
                         _lb.putc(b'\n');
@@ -420,86 +443,81 @@ fn drain_tx_ring() {
     }
 }
 
-/// Service the device data path from either an interrupt wakeup or a timed poll.
-///
-/// `ack_notification` should be true when we woke due to a notification badge.
-/// This keeps shared IRQ handlers re-armed even when the notification was
-/// triggered by another device on the same line.
-fn poll_device_once(irq_enabled: bool, badge: u64) {
-    let ack_notification = badge != 0;
-    let rx_progress = drain_rx();
-    let isr = virtio::read_isr();
-    let needs_ack = irq_enabled && (((badge & irq_badge_bits()) != 0) || isr != 0);
-
-    drain_tx_ring();
-
-    if needs_ack {
-        let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+/// Service a device IRQ event: drain RX + TX until the device reports no
+/// further interrupt, then ack — which unmasks the level line at the
+/// controller. Always acks: `dispatch_irq` masks the level line on dispatch,
+/// so even a spurious shared-INTx wake (isr == 0) must ack to re-arm delivery.
+fn service_irq_event() {
+    loop {
+        let _ = drain_rx();
+        drain_tx_ring();
+        // `read_isr` is destructive; loop so any interrupt asserted during the
+        // drain is serviced before we ack (closes the lost-wakeup window).
+        if virtio::read_isr() == 0 {
+            break;
+        }
+    }
+    let handler = cap_irq_handler();
+    if handler != 0 {
+        // SAFETY: `handler` is netdrv's bound IRQ-handler cap slot.
+        let _ = invoke::irq_handler_ack(trona_runtime::core::slot_alloc::resolved_cap_ref(handler));
     }
 }
 
 // ---------------------------------------------------------------------------
-// DRIVER_REGISTER IPC handler
+// NETDRV_REGISTER IPC handler
 // ---------------------------------------------------------------------------
 
-/// Handle the DRIVER_REGISTER IPC from netsrv.
+/// Handle the NETDRV_REGISTER IPC from netsrv.
 ///
-/// netsrv sends DRIVER_REGISTER with:
-///   regs[0] = SHM ID (must match NET_SHM_ID)
-///   extra_caps[0] = netsrv's badged RX notification cap
+/// netsrv sends NETDRV_REGISTER with:
+///   regs[0] = mmsrv SHM object index (`0` is valid)
+///   caps[0] = SHM memory-object cap
 ///
 /// On success, replies with:
 ///   label = TRONA_OK
 ///   regs[0] = MAC address low 4 bytes (network order)
 ///   regs[1] = MAC address high 2 bytes (network order)
 ///   regs[2] = link status (1 = up)
-///   extra_caps[0] = badged copy of our IRQ notification (badge=TX_BADGE)
 fn handle_driver_register(msg: &TronaMsg, reply: &mut TronaMsg) {
-    let shm_id = msg.regs[0];
-    if shm_id != NET_SHM_ID {
-        reply.label = TRONA_INVALID_ARGUMENT;
+    let shm_idx = msg.regs[0];
+
+    // Map the SHM into our address space via mmsrv. The cap transferred by
+    // netsrv lands at receive scratch; adopt it as OwnedCap then convert to
+    // TransferCap so shm_map can move it into mmsrv's tracking table.
+    let recv_scratch = cap_recv_scratch_slot();
+    if recv_scratch == 0 {
+        reply.label = TRONA_INVALID_OPERATION;
         return;
     }
-
-    // Store netsrv's RX notification cap (received as extra_cap from the Call).
-    // The cap was placed in CAP_NETSRV_RX_NTFN by the receive slot setup.
-    // SAFETY: Single-threaded driver; written once during registration.
-    unsafe {
-        *(&raw mut NETSRV_RX_NTFN) = CAP_NETSRV_RX_NTFN;
-    }
-
-    // Map the SHM into our address space via mmsrv
-    let ctx = ipc_ctx();
-    let mut map_msg = TronaMsg::zeroed();
-    map_msg.label = MM_SHM_MAP;
-    map_msg.regs[0] = NET_SHM_ID;
-    map_msg.regs[1] = 0; // client_badge: 0 = map into caller (netdrv)
-    map_msg.regs[2] = SHM_VADDR;
-    map_msg.regs[3] = 0x3; // RW permissions
-    map_msg.length = 4;
-    let mut map_reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe {
-        ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const map_msg, &raw mut map_reply)
+    // SAFETY: The kernel just installed a cap at `recv_scratch` via the IPC
+    // receive path; we take sole ownership here.
+    let shm_tc: TransferCap = unsafe { OwnedCap::adopt_received(recv_scratch).into_transfer() };
+    let map_res =
+        trona_runtime::client::mm::shm_map(shm_idx, shm_tc, SHM_MAP_HINT, NET_SHM_MAP_BYTES, 0x3);
+    // shm_map consumed (or dropped) shm_tc; no manual delete needed.
+    let mapped_base = match map_res {
+        Ok(base) => base,
+        Err(label) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to map SHM label=");
+                _lb.dec(label);
+                _lb.putc(b'\n');
+            });
+            reply.label = TRONA_INVALID_OPERATION;
+            return;
+        }
     };
-    if err != 0 || map_reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] Failed to map SHM\n");
+    if mapped_base == 0 {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to map SHM: base=0\n");
         });
         reply.label = TRONA_INVALID_OPERATION;
         return;
     }
     // SAFETY: Single-threaded driver; written once during registration.
     unsafe {
-        *(&raw mut SHM_BASE) = SHM_VADDR;
-    }
-
-    // Send our IRQ notification cap (unbadged, retains GRANT right) as extra
-    // cap in reply.  netsrv will pass TX_BADGE via the `bits` argument of
-    // SYS_SIGNAL instead of relying on cap.badge.
-    // SAFETY: IPC context is valid; setting extra cap for reply.
-    unsafe {
-        ipc::set_send_cap_ctx(ctx, 0, CAP_IRQ_NOTIFICATION);
+        *(&raw mut SHM_BASE) = mapped_base;
     }
 
     // Reply with MAC address
@@ -515,11 +533,9 @@ fn handle_driver_register(msg: &TronaMsg, reply: &mut TronaMsg) {
     reply.regs[2] = 1; // link status: up
     reply.length = 3;
 
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netdrv] DRIVER_REGISTER complete, SHM mapped rx_ntfn_cap=");
-        _lb.dec(CAP_NETSRV_RX_NTFN);
-        _lb.str(b" tx_ntfn_cap=");
-        _lb.dec(CAP_IRQ_NOTIFICATION);
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] NETDRV_REGISTER complete, SHM mapped at ");
+        _lb.hex(mapped_base);
         _lb.putc(b'\n');
     });
 }
@@ -528,132 +544,169 @@ fn handle_driver_register(msg: &TronaMsg, reply: &mut TronaMsg) {
 // Event loop
 // ---------------------------------------------------------------------------
 
-/// Main event loop: wait for IRQ notifications or IPC requests.
-///
-/// Uses a recv / reply_recv pattern:
-/// - On notification (badge != 0): check for hardware IRQ and/or TX badge
-///   from netsrv, process accordingly, then recv again.
-/// - On IPC request (badge == 0): dispatch DRIVER_REGISTER, fill reply,
-///   then reply_recv (atomically reply and wait for next event).
-fn event_loop(device_ok: bool) -> ! {
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netdrv] Entering event loop\n");
-    });
+/// Cookie for the service pipe's `STATE_READABLE` Watch (kind 0).
+const NETDRV_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+/// Cookie stamped on `EVENT_TYPE_IRQ` records from the bound NIC IRQ (kind 1).
+const NETDRV_IRQ_COOKIE: u64 = trona_server::event_loop::encode_cookie(1, 0, 1);
 
-    // SAFETY: IRQ_ENABLED is set during init before event loop starts.
-    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
-    let use_timed_poll = device_ok;
+/// Reactor dispatcher. The service pipe (`STATE_READABLE`) carries netsrv IPC
+/// (`NETDRV_REGISTER` / `NETDRV_TX_KICK`); the NIC IRQ is bound onto the same
+/// `EventQueue` and drains the device in `handle_other`.
+struct NetdrvDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    recv_scratch: Cap,
+}
 
-    if device_ok && !irq_enabled {
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[netdrv] No IRQ, using timed-recv polling\n");
-        });
-    } else if !device_ok {
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[netdrv] No device, serving IPC only\n");
-        });
+impl trona_server::event_loop::EqDispatcher for NetdrvDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
     }
 
-    let ctx = ipc_ctx();
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-    let mut have_event = false;
-
-    // Set receive slot for netsrv's notification cap during DRIVER_REGISTER
-    // SAFETY: IPC context is valid.
-    unsafe {
-        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_NETSRV_RX_NTFN, 0);
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        let mut reply = TronaMsg::zeroed();
+        match msg.label {
+            NETDRV_REGISTER => handle_driver_register(msg, &mut reply),
+            NETDRV_TX_KICK => {
+                drain_tx_ring();
+                reply.label = TRONA_OK;
+            }
+            _ => reply.label = TRONA_INVALID_OPERATION,
+        }
+        // SAFETY: `ipc_ctx()` is this thread's IPC context; reply on the service pipe.
+        let _ = unsafe { ipc::mp_write_reply_ctx(ipc_ctx(), self.recv_ep, &raw const reply) };
+        0
     }
 
-    loop {
-        if !have_event {
-            msg = TronaMsg::zeroed();
-            badge = 0;
-
-            if use_timed_poll {
-                let err = unsafe {
-                    ipc::recv_timed_ctx(
-                        ctx,
-                        trona::caps::service_ep(),
-                        POLL_TIMEOUT_NS,
-                        &raw mut msg,
-                        &raw mut badge,
-                    )
-                };
-                if err != 0 {
-                    poll_device_once(irq_enabled, 0);
-                    continue;
-                }
-            } else {
-                // SAFETY: IPC context is valid; server EP was set up by procmgr.
-                unsafe {
-                    ipc::recv_ctx(
-                        ctx,
-                        trona::caps::service_ep(),
-                        &raw mut msg,
-                        &raw mut badge,
-                    );
-                }
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        if self.recv_scratch != 0 {
+            // SAFETY: re-arm the cap-receive scratch before each MP_READ.
+            unsafe {
+                trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                    ipc_ctx(),
+                    CAP_SELF_CSPACE,
+                    self.recv_scratch,
+                    0,
+                );
             }
         }
-        have_event = false;
+        true
+    }
 
-        if badge != 0 {
-            if device_ok {
-                poll_device_once(irq_enabled, badge);
-            }
-        } else {
-            // IPC request on server endpoint
-            let mut reply = TronaMsg::zeroed();
-            match msg.label {
-                DRIVER_REGISTER => handle_driver_register(&msg, &mut reply),
-                _ => {
-                    reply.label = TRONA_INVALID_OPERATION;
-                }
-            }
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+            NETDRV_SERVICE_COOKIE,
+        )
+    }
 
-            let reply_has_caps = unsafe { !ctx.is_null() && (*ctx).send_cap_count > 0 };
+    fn handle_other(&mut self, kind: u32, _cookie: u64) -> i32 {
+        if kind == trona_kernel::uapi::KERNITE_EVENT_TYPE_IRQ {
+            service_irq_event();
+        }
+        0
+    }
 
-            if use_timed_poll && !reply_has_caps {
-                let save_err = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
-                if save_err == 0 {
-                    let _ = unsafe { ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply) };
-                } else {
-                    // Fall back to reply_recv if we cannot split reply + timed recv.
-                    msg = TronaMsg::zeroed();
-                    badge = 0;
-                    // SAFETY: IPC context is valid.
-                    unsafe {
-                        ipc::reply_recv_ctx(
-                            ctx,
-                            trona::caps::service_ep(),
-                            &raw const reply,
-                            &raw mut msg,
-                            &raw mut badge,
-                        );
-                    }
-                    have_event = true;
-                }
-            } else {
-                if use_timed_poll && reply_has_caps {
-                    trona::udebug!(|_lb| {
-                        _lb.str(b"[netdrv] reply carries caps, using reply_recv path\n");
-                    });
-                }
-                msg = TronaMsg::zeroed();
-                badge = 0;
-                // SAFETY: IPC context is valid.
-                unsafe {
-                    ipc::reply_recv_ctx(
-                        ctx,
-                        trona::caps::service_ep(),
-                        &raw const reply,
-                        &raw mut msg,
-                        &raw mut badge,
-                    );
-                }
-                have_event = true;
-            }
+    fn handle_overflow(&mut self, _dropped: u64) {}
+
+    fn handle_timer(&mut self, _cookie: u64) {}
+}
+
+/// Reactor entry: binds the service pipe (IPC) and the NIC IRQ onto one
+/// `EventQueue`, then blocks in `EQ_WAIT`. RX/TX are serviced from the IRQ
+/// (`handle_other`); netsrv kicks TX via `NETDRV_TX_KICK`.
+fn event_loop(device_ok: bool) -> ! {
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Entering reactor\n");
+    });
+
+    let ctx = ipc_ctx();
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+    let recv_scratch = cap_recv_scratch_slot();
+    if recv_scratch == 0 {
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[netdrv] No private receive scratch slot reserved\n");
+        });
+    }
+
+    // Self-provision the reactor's EventQueue + Watch from rsrcsrv.
+    let eq = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_EVENT_QUEUE as u64,
+        4,
+    );
+    let watch = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_WATCH as u64,
+        0,
+    );
+    let (eq, watch) = match (eq, watch) {
+        (Some(eq), Some(watch)) => (eq, watch),
+        _ => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] reactor EventQueue/Watch alloc failed\n");
+            });
+            idle();
+        }
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+
+    // Arm the service pipe's READABLE edge onto the reactor EQ.
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+        NETDRV_SERVICE_COOKIE,
+    );
+
+    // Bind the NIC IRQ to the same EQ FIRST, then re-enable virtqueue
+    // interrupts — binding before enabling closes the pre-bind lost-wakeup
+    // window. A prime drain services anything that arrived during init.
+    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
+    if device_ok && irq_enabled {
+        let _ = trona_kernel::invoke::irq_bind_eq(
+            trona_runtime::core::slot_alloc::resolved_cap_ref(cap_irq_handler()),
+            trona_kernel::core_types::CapRef::flat(eq_cap),
+            NETDRV_IRQ_COOKIE,
+        );
+        virtio::enable_queue_interrupts();
+        service_irq_event();
+    } else if device_ok {
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[netdrv] device has no IRQ handler; RX cannot be serviced (IPC-only)\n");
+        });
+    } else {
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] no device; serving IPC only\n");
+        });
+    }
+
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+
+    let dispatcher = NetdrvDispatcher {
+        recv_ep,
+        watch_cap,
+        eq_cap,
+        recv_scratch,
+    };
+    let mut reactor = trona_server::event_loop::EventLoop::new(eq_cap, dispatcher);
+
+    loop {
+        // SAFETY: `ctx` is this thread's IPC context; block on the EQ and
+        // dispatch one ready event (IPC via `dispatch_state`, NIC IRQ via
+        // `handle_other`). The recv-slot scratch is re-armed in `prepare_mp_read`.
+        unsafe {
+            let _ = reactor.run_iteration(ctx);
         }
     }
 }
@@ -664,9 +717,10 @@ fn event_loop(device_ok: bool) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netdrv] virtio-net Hardware Driver starting\n");
     });
+    init_private_slots();
 
     // Discover and initialize virtio-net device
     let mut irq_line: u8 = 0;
@@ -675,7 +729,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Try modern virtio (device ID 0x1041) first
     if let Some((bus, dev, func)) = virtio_modern::find_virtio_net_modern() {
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[netdrv] Found modern virtio-net device\n");
         });
         if virtio_modern::init_virtio_modern(bus, dev, func) {
@@ -686,6 +740,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 Some((_bar_phys, _bar_bits, _bar_size, irq, _bar_is_io, has_irq)) => {
                     irq_line = irq;
                     has_irq_handler = has_irq;
+                    trona_runtime::uinfo!(|_lb| {
+                        _lb.str(b"[netdrv] IRQ=");
+                        _lb.dec(irq as u64);
+                        _lb.str(b" available=");
+                        _lb.dec(has_irq as u64);
+                        _lb.str(b" mode=poll\n");
+                    });
                 }
                 None => {}
             }
@@ -696,7 +757,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     if !device_ok {
         match virtio::find_virtio_net() {
             Some((bus, dev, func, bar0, _bar0_full)) => {
-                trona::uinfo!(|_lb| {
+                trona_runtime::uinfo!(|_lb| {
                     _lb.str(b"[netdrv] Found virtio-net at ");
                     _lb.dec(bus as u64);
                     _lb.putc(b':');
@@ -710,10 +771,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
                         irq_line = irq;
                         has_irq_handler = has_irq;
-                        trona::uinfo!(|_lb| {
+                        trona_runtime::uinfo!(|_lb| {
                             _lb.str(b"[netdrv] IRQ=");
                             _lb.dec(irq as u64);
-                            _lb.putc(b'\n');
+                            _lb.str(b" available=");
+                            _lb.dec(has_irq as u64);
+                            _lb.str(b" mode=poll\n");
                         });
 
                         // Transitional device (0x1000): try modern transport
@@ -725,48 +788,50 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         } else if virtio::init_virtio(bar0, bar_size) {
                             device_ok = true;
                         } else {
-                            trona::uerror!(|_lb| {
+                            trona_runtime::uerror!(|_lb| {
                                 _lb.str(b"[netdrv] Failed to init virtio transport\n");
                             });
                         }
                     }
                     None => {
-                        trona::uerror!(|_lb| {
+                        trona_runtime::uerror!(|_lb| {
                             _lb.str(b"[netdrv] Failed to get PCI caps from pcidrv\n");
                         });
                     }
                 }
             }
             None => {
-                trona::uwarn!(|_lb| {
+                trona_runtime::uwarn!(|_lb| {
                     _lb.str(b"[netdrv] No virtio-net device found\n");
                 });
             }
         }
     }
 
-    // Set up IRQ handling
-    if device_ok && irq_line > 0 {
+    // Set up the device wake path. TX is explicit MP kick; RX is timed poll
+    // plus NETSRV_RX_KICK after frames are published.
+    if device_ok {
         if setup_irq(irq_line, has_irq_handler) {
-            trona::uinfo!(|_lb| {
-                _lb.str(b"[netdrv] IRQ handling enabled\n");
-            });
+            if unsafe { *(&raw const IRQ_ENABLED) } {
+                trona_runtime::uinfo!(|_lb| {
+                    _lb.str(b"[netdrv] IRQ handling enabled\n");
+                });
+            }
         } else {
-            trona::uwarn!(|_lb| {
+            trona_runtime::uwarn!(|_lb| {
                 _lb.str(b"[netdrv] IRQ setup failed, using polling mode\n");
             });
         }
     }
 
     if device_ok {
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[netdrv] virtio-net device ready\n");
         });
     }
 
-    // Register with namesrv and signal readiness
+    // Register with namesrv; unit_mgr observes the publish event as readiness.
     register_namesrv();
-    signal_ready();
 
     event_loop(device_ok)
 }

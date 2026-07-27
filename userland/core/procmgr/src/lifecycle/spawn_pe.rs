@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::*;
 
 use crate::base::alloc::Allocator;
-use crate::base::mmsrv_ipc;
 use crate::base::proc_table;
+use crate::lifecycle::spawn::compute_ready_timeout_ns;
+use crate::lifecycle::spawn::{
+    SpawnPlan, SpawnSessionPolicy, compute_slot_budget, configure_spawn_scheduler,
+    finalize_spawn_launch, prepare_spawn_child_base,
+};
 use crate::loader::mem_util::free_staging_buffer;
 use crate::loader::pe_load::{load_pe_runtime_support, plan_pe_runtime_support};
 use crate::loader::stack_build::{
@@ -12,13 +16,8 @@ use crate::loader::stack_build::{
     write_pe_stack,
 };
 use crate::personality::PersonalityKind;
-use crate::lifecycle::spawn::compute_ready_timeout_ns;
-use crate::lifecycle::spawn::{
-    compute_slot_budget, configure_spawn_scheduler, finalize_spawn_launch,
-    prepare_spawn_child_base, SpawnPlan,
-};
 
-use trona::layout::{self, CspaceLayoutProfile};
+use trona_runtime::spawn::layout;
 
 pub(crate) unsafe fn handle_pe_spawn_inner(
     msg: &TronaMsg,
@@ -45,7 +44,7 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
     is_display: bool,
 ) -> bool {
     unsafe {
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] PE spawn: '");
             _lb.bytes(&name[..name_len]);
             _lb.str(b"'\n");
@@ -53,24 +52,23 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
 
         let base_start = crate::basename_of(name, name_len);
 
-        let mut pe_info = trona_loader::pe_loader::PeInfo::zeroed();
-        let err = trona_loader::pe_loader::pe_validate(data, data_len, &raw mut pe_info);
-        if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] PE validation failed err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
-            });
-            reply.label = trona::TRONA_INVALID_ARGUMENT;
-            return false;
-        }
+        let pe_headers = match trona_loader::common::pe::header::validate(data, data_len) {
+            Ok(h) => h,
+            Err(_) => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] PE validation failed\n");
+                });
+                reply.label = trona_protocol::posix::TRONA_INVALID_ARGUMENT;
+                return false;
+            }
+        };
 
-        let pe_span = trona_loader::pe_loader::pe_compute_load_span(data, data_len);
+        let pe_span = pe_headers.opt.size_of_image as u64;
         if pe_span == 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] PE span is zero\n");
             });
-            reply.label = trona::TRONA_INVALID_ARGUMENT;
+            reply.label = trona_protocol::posix::TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -78,10 +76,10 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
         let initrd_size = crate::read_boot_info_initrd_size();
 
         let Some(pe_support) = plan_pe_runtime_support(initrd, initrd_size) else {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] PE runtime support not found\n");
             });
-            reply.label = trona::TRONA_NOT_FOUND;
+            reply.label = trona_protocol::posix::TRONA_NOT_FOUND;
             return false;
         };
 
@@ -91,22 +89,24 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             pe_support.kernel32_pages,
             false,
             0,
-            || trona::syscall::sys_getrandom(),
+            trona_runtime::spawn::stack_plan::StackLayoutSpec::default_service(),
+            || trona_kernel::syscall::sys_getrandom(),
         );
 
         if layout.stack_top == 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] PE too large for VA layout\n");
             });
-            reply.label = trona::TRONA_INVALID_ARGUMENT;
+            reply.label = trona_protocol::posix::TRONA_INVALID_ARGUMENT;
             return false;
         }
 
-        let effective_timeout_ns = if readiness_mode == trona::SPAWN_READY_NOTIFY {
-            compute_ready_timeout_ns(requested_timeout_ns, true, data_len, 0)
-        } else {
-            0
-        };
+        let effective_timeout_ns =
+            if readiness_mode == trona_runtime::core::server_consts::SPAWN_READY_NOTIFY {
+                compute_ready_timeout_ns(requested_timeout_ns, true, data_len, 0)
+            } else {
+                0
+            };
 
         let plan = SpawnPlan {
             is_dynamic: true,
@@ -118,14 +118,21 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             layout,
         };
 
+        let basename = &name[base_start..name_len];
         if use_pre_ep {
-            let basename = &name[base_start..name_len];
             let _ = crate::service::registry::adopt_provider_from_scratch(basename);
         }
 
-        let Some(base) =
-            prepare_spawn_child_base(alloc, reply, badge, &plan, policy_cnode_bits, use_pre_ep)
-        else {
+        let Some(base) = prepare_spawn_child_base(
+            alloc,
+            reply,
+            badge,
+            kind,
+            &plan,
+            policy_cnode_bits,
+            use_pre_ep,
+            basename,
+        ) else {
             return false;
         };
 
@@ -138,14 +145,15 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
         let child_sig_ntfn = base.child_sig_ntfn;
         let ready_badge_bit = base.ready_badge_bit;
         let cn_size_bits = base.cn_size_bits;
+        let rtld_untyped_count = base.rtld_untyped_count;
         let cap_layout = base.cap_layout;
 
         if !kind.prepare_runtime(pid, child_cn, Some(cap_layout.win32srv_ep), pid as u64) {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] PE personality prepare failed\n");
             });
-            alloc.rollback(trona::caps::rsrcsrv_ep());
-            reply.label = trona::TRONA_OUT_OF_MEMORY;
+            crate::lifecycle::exit::abort_spawning_process(slot_idx);
+            reply.label = trona_protocol::posix::TRONA_OUT_OF_MEMORY;
             return false;
         }
 
@@ -159,16 +167,15 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             pid,
             child_vs,
         ) else {
-            mmsrv_ipc::deregister_from_mmsrv(pid);
-            alloc.rollback(trona::caps::rsrcsrv_ep());
-            reply.label = trona::TRONA_NOT_FOUND;
+            crate::lifecycle::exit::abort_spawning_process(slot_idx);
+            reply.label = trona_protocol::posix::TRONA_NOT_FOUND;
             return false;
         };
         let pe_result = pe_loads.pe_result;
         let rtld_result = pe_loads.rtld_result;
         let kernel32_result = pe_loads.kernel32_result;
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] PE layout pid=");
             _lb.hex(pid as u64);
             _lb.str(b" pe=[");
@@ -190,21 +197,24 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             _lb.str(b"\n");
         });
 
-        if !configure_spawn_scheduler(alloc, reply, pid, child_tcb, child_sc) {
+        if !configure_spawn_scheduler(reply, slot_idx, child_tcb, child_sc) {
             return false;
         }
 
         let stack_pages = plan.layout.stack.page_count();
-        let stack_stage = match alloc_zeroed_staged_stack_page(alloc, reply, pid) {
+        let stack_stage = match alloc_zeroed_staged_stack_page(reply, slot_idx) {
             Some(stage) => stage,
             None => return false,
         };
 
-        let cspace_layout = layout::compute_cspace_layout(
+        let cspace_layout = crate::lifecycle::spawn::service_cspace_layout(
             cn_size_bits as u64,
             cap_layout.frame_slot_start,
-            CspaceLayoutProfile::DefaultService,
-            true,
+            rtld_untyped_count,
+            crate::lifecycle::spawn::compute_rtld_untyped_size_bits(
+                true,
+                plan.layout.shared_libs.size,
+            ),
         );
 
         let mut str_buf = [0u8; 256];
@@ -222,6 +232,15 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
 
         let envc: u32 = 0;
         let win32srv_ep = cap_layout.win32srv_ep;
+
+        // PE spawn follows the same stdio_mode dispatch as the ELF
+        // path. The Win32 CRT is not yet taught to read the
+        // preinstalled bitmap, so PE children currently always do a
+        // lazy `/dev/console` bind on first stdio use. If PE-side
+        // StandardInput=tty is ever exposed, the dispatch in spawn.rs
+        // can be lifted into a shared helper; until then, PE spawn
+        // always ships a zero bitmap.
+        let preinstalled_stdio_bits = 0u64;
 
         let child_entry_rip;
         let child_rsp;
@@ -243,6 +262,7 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             &name[base_start..name_len],
             pid,
             child_cn,
+            preinstalled_stdio_bits,
         ) {
             Ok(rsp) => {
                 child_rsp = rsp;
@@ -250,28 +270,26 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             }
             Err(_) => {
                 free_staging_buffer(stack_stage, 1);
-                mmsrv_ipc::deregister_from_mmsrv(pid);
-                alloc.rollback(trona::caps::rsrcsrv_ep());
-                reply.label = trona::TRONA_OUT_OF_MEMORY;
+                crate::lifecycle::exit::abort_spawning_process(slot_idx);
+                reply.label = trona_protocol::posix::TRONA_OUT_OF_MEMORY;
                 return false;
             }
         }
 
         if !commit_staged_top_stack_page(
-            alloc,
             reply,
-            pid,
-            plan.layout.stack.base,
+            slot_idx,
             plan.layout.stack_top,
-            stack_pages,
+            plan.layout.stack_spec,
             stack_stage,
+            child_tcb,
         ) {
             return false;
         }
+        let _ = stack_pages;
         free_staging_buffer(stack_stage, 1);
 
         return finalize_spawn_launch(
-            alloc,
             reply,
             badge,
             kind,
@@ -281,9 +299,6 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             slot_idx,
             pid,
             child_tcb,
-            child_vs,
-            child_cn,
-            child_sc,
             ready_badge_bit,
             child_sig_ntfn,
             kernel32_result.base,
@@ -296,7 +311,11 @@ pub(crate) unsafe fn handle_pe_spawn_inner(
             child_entry_rip,
             child_rsp,
             b"[PROCMGR] PE ",
+            SpawnSessionPolicy::InheritCaller,
             cap_layout,
+            msg,
+            args_reg_idx,
+            spawn_args_len,
         );
     }
 }

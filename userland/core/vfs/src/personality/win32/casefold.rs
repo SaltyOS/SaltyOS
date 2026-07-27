@@ -2,7 +2,7 @@
 //! Win32 VFS-side ASCII case-folding for path comparison.
 //!
 //! Win32 path resolution is case-insensitive. The actual Unicode Simple
-//! Case-Folding lives in `trona::casefold` and is used by
+//! Case-Folding lives in `trona_protocol::vfs::casefold` and is used by
 //! `VopVector::lookup_ci` (the filesystem-side readdir scan fallback).
 //!
 //! This module provides a fast ASCII-only comparison used by the VFS layer
@@ -36,11 +36,7 @@ pub(crate) fn ascii_fold_eq(a: &[u8], b: &[u8]) -> bool {
 /// Map a single byte to ASCII lowercase. Non-ASCII bytes pass through.
 #[inline]
 fn ascii_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' {
-        b + 32
-    } else {
-        b
-    }
+    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
 }
 
 /// Check if a byte is an ASCII letter (A-Z or a-z).
@@ -53,11 +49,11 @@ pub(crate) fn is_ascii_alpha(b: u8) -> bool {
 /// Returns `None` if the byte is not an ASCII letter.
 #[inline]
 pub(crate) fn drive_letter_index(letter: u8) -> Option<usize> {
-    if letter >= b'A' && letter <= b'Z' {
-        Some((letter - b'A') as usize)
-    } else if letter >= b'a' && letter <= b'z' {
-        Some((letter - b'a') as usize)
-    } else {
+    if !is_ascii_alpha(letter) {
         None
+    } else if letter <= b'Z' {
+        Some((letter - b'A') as usize)
+    } else {
+        Some((letter - b'a') as usize)
     }
 }

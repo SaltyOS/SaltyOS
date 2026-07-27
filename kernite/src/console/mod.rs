@@ -17,8 +17,8 @@
 mod fb;
 mod font;
 
-use crate::mm::{pmm_alloc_contiguous, pmm_free_count, phys_to_virt, PAGE_SIZE};
-use crate::FramebufferInfo;
+use crate::init::bootinfo::FramebufferInfo;
+use crate::mm::{PAGE_SIZE, phys_to_virt, pmm_free_count};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static CONSOLE_READY: AtomicBool = AtomicBool::new(false);
@@ -45,14 +45,17 @@ struct Cell {
 /// Static cell grid for text-mode (no dynamic allocation).
 /// ~90 KB in BSS (zero-initialized to avoid inflating .data).
 /// Properly initialized at runtime by clear_screen() during console::init().
-static mut CELL_GRID: [[Cell; MAX_TEXT_COLS]; MAX_TEXT_ROWS] =
-    [[Cell { ch: 0, fg_idx: 0, bg_idx: 0 }; MAX_TEXT_COLS]; MAX_TEXT_ROWS];
+static mut CELL_GRID: [[Cell; MAX_TEXT_COLS]; MAX_TEXT_ROWS] = [[Cell {
+    ch: 0,
+    fg_idx: 0,
+    bg_idx: 0,
+}; MAX_TEXT_COLS]; MAX_TEXT_ROWS];
 
 /// ANSI escape sequence parser state.
 #[derive(Clone, Copy, PartialEq)]
 enum AnsiState {
     Normal,
-    Escape, // seen ESC (0x1B)
+    Escape,  // seen ESC (0x1B)
     Bracket, // seen ESC[
 }
 
@@ -60,11 +63,11 @@ enum AnsiState {
 const MAX_ANSI_PARAMS: usize = 8;
 
 struct ConsoleState {
-    fb_base: *mut u8,       // VRAM (WC mapped)
-    shadow: *mut u8,        // Ring shadow buffer in WB system RAM
-    shadow_total: usize,    // Total shadow buffer size in bytes (2 * visible_size)
-    visible_size: usize,    // Visible area size in bytes (height * pitch)
-    top_scanline: usize,    // Byte offset into shadow for current top of screen
+    fb_base: *mut u8,    // VRAM (WC mapped)
+    shadow: *mut u8,     // Ring shadow buffer in WB system RAM
+    shadow_total: usize, // Total shadow buffer size in bytes (2 * visible_size)
+    visible_size: usize, // Visible area size in bytes (height * pitch)
+    top_scanline: usize, // Byte offset into shadow for current top of screen
     dirty_lines: [bool; MAX_DIRTY_ROWS],
     width: u32,
     height: u32,
@@ -120,8 +123,11 @@ fn pack_color(r: u8, g: u8, b: u8, red_pos: u8, green_pos: u8, blue_pos: u8) -> 
 /// Tries 2x visible size first (ring buffer, O(1) scroll). Falls back to 1x
 /// (requires memmove on scroll, but still avoids rendering to VRAM directly).
 fn alloc_shadow(visible_size: usize) -> (*mut u8, usize, bool) {
+    let shadow_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+        subkind: crate::mm::frame::KernelMetaKind::General,
+    };
     let pages_2x = (visible_size * 2 + PAGE_SIZE - 1) / PAGE_SIZE;
-    if let Some(phys) = pmm_alloc_contiguous(pages_2x) {
+    if let Some(phys) = crate::mm::pmm_alloc_contiguous_owned(pages_2x, &shadow_owner) {
         let ptr = phys_to_virt(phys) as *mut u8;
         // SAFETY: Contiguous physical frames mapped via direct physical map.
         unsafe { core::ptr::write_bytes(ptr, 0, pages_2x * PAGE_SIZE) };
@@ -130,7 +136,7 @@ fn alloc_shadow(visible_size: usize) -> (*mut u8, usize, bool) {
 
     // Fallback: 1x visible size (no ring, memmove on scroll)
     let pages_1x = (visible_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if let Some(phys) = pmm_alloc_contiguous(pages_1x) {
+    if let Some(phys) = crate::mm::pmm_alloc_contiguous_owned(pages_1x, &shadow_owner) {
         let ptr = phys_to_virt(phys) as *mut u8;
         // SAFETY: Contiguous physical frames mapped via direct physical map.
         unsafe { core::ptr::write_bytes(ptr, 0, pages_1x * PAGE_SIZE) };
@@ -150,7 +156,7 @@ fn alloc_shadow(visible_size: usize) -> (*mut u8, usize, bool) {
 /// - Before init_smp() (so APs inherit the PML4[257] mapping)
 pub fn init(fb_info: &FramebufferInfo) {
     if fb_info.addr == 0 || fb_info.bpp != 32 || fb_info.width == 0 || fb_info.height == 0 {
-        crate::serial_puts("[CONSOLE] No usable framebuffer, skipping\n");
+        crate::kernel::printk::serial_puts("[CONSOLE] No usable framebuffer, skipping\n");
         return;
     }
 
@@ -158,7 +164,7 @@ pub fn init(fb_info: &FramebufferInfo) {
     let fb_base = match unsafe { fb::map_framebuffer(fb_info) } {
         Some(ptr) => ptr,
         None => {
-            crate::serial_puts("[CONSOLE] Failed to map framebuffer\n");
+            crate::kernel::printk::serial_puts("[CONSOLE] Failed to map framebuffer\n");
             return;
         }
     };
@@ -167,13 +173,29 @@ pub fn init(fb_info: &FramebufferInfo) {
     let max_rows = fb_info.height / font::GLYPH_HEIGHT;
 
     if max_rows as usize > MAX_DIRTY_ROWS {
-        crate::serial_puts("[CONSOLE] Too many rows for dirty tracking, skipping\n");
+        crate::kernel::printk::serial_puts(
+            "[CONSOLE] Too many rows for dirty tracking, skipping\n",
+        );
         return;
     }
 
     // Light gray text on black background
-    let fg = pack_color(0xC0, 0xC0, 0xC0, fb_info.red_pos, fb_info.green_pos, fb_info.blue_pos);
-    let bg = pack_color(0x00, 0x00, 0x00, fb_info.red_pos, fb_info.green_pos, fb_info.blue_pos);
+    let fg = pack_color(
+        0xC0,
+        0xC0,
+        0xC0,
+        fb_info.red_pos,
+        fb_info.green_pos,
+        fb_info.blue_pos,
+    );
+    let bg = pack_color(
+        0x00,
+        0x00,
+        0x00,
+        fb_info.red_pos,
+        fb_info.green_pos,
+        fb_info.blue_pos,
+    );
     rebuild_glyph_row_lut(fg, bg);
 
     let visible_size = fb_info.height as usize * fb_info.pitch as usize;
@@ -185,12 +207,14 @@ pub fn init(fb_info: &FramebufferInfo) {
     let skip_shadow = visible_pages * 3 > free;
 
     let (shadow, shadow_total, has_ring, text_mode) = if skip_shadow {
-        crate::serial_puts("[CONSOLE] Low memory -- using text-mode (no shadow)\n");
+        crate::kernel::printk::serial_puts("[CONSOLE] Low memory -- using text-mode (no shadow)\n");
         (core::ptr::null_mut(), 0, false, true)
     } else {
         let (s, st, hr) = alloc_shadow(visible_size);
         if s.is_null() {
-            crate::serial_puts("[CONSOLE] Shadow alloc failed -- text-mode fallback\n");
+            crate::kernel::printk::serial_puts(
+                "[CONSOLE] Shadow alloc failed -- text-mode fallback\n",
+            );
             (s, st, hr, true)
         } else {
             (s, st, hr, false)
@@ -267,7 +291,7 @@ pub fn init(fb_info: &FramebufferInfo) {
 
     CONSOLE_READY.store(true, Ordering::Release);
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[CONSOLE] Framebuffer console initialized: ");
         _g.dec(fb_info.width as u64);
         _g.puts("x");
@@ -343,7 +367,8 @@ pub(crate) fn flush_pending() {
 /// Output a byte slice to the framebuffer console.
 #[inline]
 pub(crate) fn write(bytes: &[u8]) {
-    if bytes.is_empty() || !CONSOLE_READY.load(Ordering::Acquire)
+    if bytes.is_empty()
+        || !CONSOLE_READY.load(Ordering::Acquire)
         || CONSOLE_DISABLED.load(Ordering::Acquire)
     {
         return;
@@ -391,7 +416,9 @@ fn write_char(state: &mut ConsoleState, c: u8) {
         AnsiState::Bracket => {
             if c >= b'0' && c <= b'9' {
                 // Accumulate digit
-                state.ansi_cur_param = state.ansi_cur_param.wrapping_mul(10)
+                state.ansi_cur_param = state
+                    .ansi_cur_param
+                    .wrapping_mul(10)
                     .wrapping_add((c - b'0') as u16);
                 return;
             }
@@ -435,7 +462,14 @@ fn emit_char(state: &mut ConsoleState, c: u8) {
             }
         }
         _ => {
-            draw_glyph_color(state, c, state.col, state.row, state.current_fg, state.current_bg);
+            draw_glyph_color(
+                state,
+                c,
+                state.col,
+                state.row,
+                state.current_fg,
+                state.current_bg,
+            );
             state.col += 1;
         }
     }
@@ -583,16 +617,30 @@ fn update_bold_fg(state: &mut ConsoleState) {
 }
 
 /// Clear a range of cells in the cell grid (text-mode only).
-fn clear_cells(state: &mut ConsoleState, start_col: u32, start_row: u32, end_col: u32, end_row: u32) {
+fn clear_cells(
+    state: &mut ConsoleState,
+    start_col: u32,
+    start_row: u32,
+    end_col: u32,
+    end_row: u32,
+) {
     let bg_idx = palette_index(state, state.current_bg);
-    let blank = Cell { ch: b' ', fg_idx: 0xFF, bg_idx };
+    let blank = Cell {
+        ch: b' ',
+        fg_idx: 0xFF,
+        bg_idx,
+    };
     // SAFETY: Bounds clamped below, single-writer under SERIAL_LOCK.
     unsafe {
         let grid = &raw mut CELL_GRID;
         for r in start_row as usize..end_row as usize {
-            if r >= MAX_TEXT_ROWS { break; }
+            if r >= MAX_TEXT_ROWS {
+                break;
+            }
             for c in start_col as usize..end_col as usize {
-                if c >= MAX_TEXT_COLS { break; }
+                if c >= MAX_TEXT_COLS {
+                    break;
+                }
                 (*grid)[r][c] = blank;
             }
             mark_dirty(state, r);
@@ -741,7 +789,11 @@ fn render_glyph_to_vram(state: &ConsoleState, c: u8, col: u32, row: u32, fg: u32
             }
         } else {
             for bit in 0..GLYPH_WIDTH_USIZE {
-                let pixel = if row_bits & (0x80 >> bit) != 0 { fg } else { bg };
+                let pixel = if row_bits & (0x80 >> bit) != 0 {
+                    fg
+                } else {
+                    bg
+                };
                 // SAFETY: within VRAM mapping bounds
                 unsafe {
                     line_base.add(px_x + bit).write(pixel);
@@ -770,7 +822,11 @@ fn draw_glyph_color(state: &mut ConsoleState, c: u8, col: u32, row: u32, fg: u32
             let bi = palette_index(state, bg);
             // SAFETY: Bounds checked above, single-writer under SERIAL_LOCK.
             unsafe {
-                (*(&raw mut CELL_GRID))[row_idx][col_idx] = Cell { ch: c, fg_idx: fi, bg_idx: bi };
+                (*(&raw mut CELL_GRID))[row_idx][col_idx] = Cell {
+                    ch: c,
+                    fg_idx: fi,
+                    bg_idx: bi,
+                };
             }
         }
         mark_dirty(state, row as usize);
@@ -799,7 +855,11 @@ fn draw_glyph_color(state: &mut ConsoleState, c: u8, col: u32, row: u32, fg: u32
         } else {
             // Per-pixel rendering for custom colors
             for bit in 0..GLYPH_WIDTH_USIZE {
-                let pixel = if row_bits & (0x80 >> bit) != 0 { fg } else { bg };
+                let pixel = if row_bits & (0x80 >> bit) != 0 {
+                    fg
+                } else {
+                    bg
+                };
                 // SAFETY: within shadow buffer bounds
                 unsafe {
                     line_base.add(px_x + bit).write(pixel);
@@ -830,7 +890,11 @@ fn scroll_up(state: &mut ConsoleState) {
             }
             let last = max_r - 1;
             for c in 0..max_c {
-                (*grid)[last][c] = Cell { ch: b' ', fg_idx: 0xFF, bg_idx: bg_idx };
+                (*grid)[last][c] = Cell {
+                    ch: b' ',
+                    fg_idx: 0xFF,
+                    bg_idx: bg_idx,
+                };
             }
         }
         state.row = state.max_rows - 1;
@@ -876,7 +940,13 @@ fn scroll_up(state: &mut ConsoleState) {
 
     // Clear the last text row in shadow buffer with current background color
     let last_row_offset = state.top_scanline + (state.max_rows as usize - 1) * row_bytes;
-    fill_rect_shadow(state, last_row_offset, state.width, font::GLYPH_HEIGHT, state.current_bg);
+    fill_rect_shadow(
+        state,
+        last_row_offset,
+        state.width,
+        font::GLYPH_HEIGHT,
+        state.current_bg,
+    );
 
     // All lines are dirty after scroll
     mark_all_dirty(state);
@@ -990,7 +1060,11 @@ fn clear_screen() {
 
     if state.text_mode {
         let bg_idx = palette_index(state, state.bg);
-        let blank = Cell { ch: b' ', fg_idx: 0xFF, bg_idx };
+        let blank = Cell {
+            ch: b' ',
+            fg_idx: 0xFF,
+            bg_idx,
+        };
         // SAFETY: Single-threaded init, bounds within MAX_TEXT_ROWS/MAX_TEXT_COLS
         unsafe {
             let grid = &raw mut CELL_GRID;

@@ -6,10 +6,10 @@ pub(crate) mod session;
 pub(crate) mod signal;
 pub(crate) mod timer;
 
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_protocol::posix::*;
 
-use crate::base::proc_table::{find_by_badge, find_by_pid, proctab, MAX_EXE_PATH_LEN};
+use crate::base::proc_table::{MAX_EXE_PATH_LEN, find_by_badge, find_by_pid, proctab};
 
 // ---- POSIX signal numbers ----
 pub(crate) const PM_SIGKILL: usize = 9;
@@ -24,6 +24,7 @@ pub(crate) const PM_SIGTTOU: usize = 22;
 // ---- POSIX wait options ----
 pub(crate) const WNOHANG: u32 = 1;
 pub(crate) const WUNTRACED: u32 = 2;
+pub(crate) const WCONTINUED: u32 = 8;
 
 /// Check whether the caller identified by `badge` is a POSIX subsystem process.
 pub(crate) fn is_posix_caller(badge: u64) -> bool {
@@ -54,7 +55,7 @@ pub(crate) unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pid = msg.regs[0] as u32;
         let Some(idx) = find_by_pid(pid) else {
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
                 _lb.hex(pid as u64);
                 _lb.str(b" -> not found\n");
@@ -69,7 +70,7 @@ pub(crate) unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
             exe_len += 1;
         }
         if exe_len == 0 {
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
                 _lb.hex(pid as u64);
                 _lb.str(b" -> empty\n");
@@ -78,7 +79,7 @@ pub(crate) unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
             return;
         }
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
             _lb.hex(pid as u64);
             _lb.str(b" -> '");
@@ -106,159 +107,163 @@ pub(crate) unsafe fn dispatch_posix(
 ) -> Option<bool> {
     unsafe {
         match label {
-            PM_FORK => {
+            INIT_FORK => {
                 crate::lifecycle::fork::handle_fork(msg, reply, badge);
                 Some(false)
             }
-            PM_EXEC => {
+            INIT_FORK_RESULT => {
+                crate::lifecycle::fork::handle_fork_result(msg, reply, badge);
+                Some(false)
+            }
+            INIT_EXEC => {
                 crate::lifecycle::exec::handle_exec(msg, reply, badge);
                 Some(reply.label == 0)
             }
-            PM_WAIT => {
+            INIT_WAIT => {
                 let skip = crate::lifecycle::wait::handle_wait(msg, reply, badge);
                 Some(skip)
             }
-            PM_KILL => {
+            INIT_KILL => {
                 signal::handle_kill(msg, reply, badge);
                 Some(false)
             }
-            PM_KILL_PGID => {
+            INIT_KILL_PGID => {
                 signal::handle_kill_pgid(msg, reply);
                 Some(false)
             }
-            PM_SIGACTION => {
+            INIT_SIGACTION => {
                 signal::handle_sigaction(msg, reply, badge);
                 Some(false)
             }
-            PM_SETITIMER => {
+            INIT_SETITIMER => {
                 timer::handle_setitimer(msg, reply, badge);
                 Some(false)
             }
-            PM_GETITIMER => {
+            INIT_GETITIMER => {
                 timer::handle_getitimer(msg, reply, badge);
                 Some(false)
             }
-            PM_GETUID => {
+            INIT_GETUID => {
                 session::handle_getuid(reply, badge);
                 Some(false)
             }
-            PM_GETGID => {
+            INIT_GETGID => {
                 session::handle_getgid(reply, badge);
                 Some(false)
             }
-            PM_SETPGID => {
+            INIT_SETPGID => {
                 session::handle_setpgid(msg, reply, badge);
                 Some(false)
             }
-            PM_GETPGID => {
+            INIT_GETPGID => {
                 session::handle_getpgid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETSID => {
+            INIT_SETSID => {
                 session::handle_setsid(reply, badge);
                 Some(false)
             }
-            PM_GETSID => {
+            INIT_GETSID => {
                 session::handle_getsid(msg, reply, badge);
                 Some(false)
             }
-            PM_GETEUID => {
+            INIT_GETEUID => {
                 session::handle_geteuid(reply, badge);
                 Some(false)
             }
-            PM_GETEGID => {
+            INIT_GETEGID => {
                 session::handle_getegid(reply, badge);
                 Some(false)
             }
-            PM_GETGROUPS => {
+            INIT_GETGROUPS => {
                 session::handle_getgroups(msg, reply, badge);
                 Some(false)
             }
-            PM_GETPGID_BADGE => {
+            INIT_GETPGID_BADGE => {
                 session::handle_getpgid_badge(msg, reply);
                 Some(false)
             }
-            PM_GETSID_BADGE => {
+            INIT_GETSID_BADGE => {
                 session::handle_getsid_badge(msg, reply);
                 Some(false)
             }
-            PM_GET_SESSION_TTY_BADGE => {
-                session::handle_get_session_tty_badge(msg, reply);
+            INIT_GET_SESSION_TTY_BADGE => {
+                session::handle_get_session_tty_badge(msg, reply, badge);
                 Some(false)
             }
-            PM_UMASK => {
+            INIT_UMASK => {
                 handle_umask(msg, reply, badge);
                 Some(false)
             }
-            PM_GET_EXE_PATH => {
+            INIT_GET_EXE_PATH => {
                 handle_get_exe_path(msg, reply);
                 Some(false)
             }
-            PM_SETUID => {
+            INIT_SETUID => {
                 session::handle_setuid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETGID => {
+            INIT_SETGID => {
                 session::handle_setgid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETEUID => {
+            INIT_SETEUID => {
                 session::handle_seteuid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETEGID => {
+            INIT_SETEGID => {
                 session::handle_setegid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETREUID => {
+            INIT_SETREUID => {
                 session::handle_setreuid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETREGID => {
+            INIT_SETREGID => {
                 session::handle_setregid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETGROUPS => {
+            INIT_SETGROUPS => {
                 session::handle_setgroups(msg, reply, badge);
                 Some(false)
             }
-            PM_GET_CREDS_BY_BADGE => {
+            INIT_GET_CREDS_BY_BADGE => {
                 session::handle_get_creds_by_badge(msg, reply);
                 Some(false)
             }
-            PM_GETRESUID => {
+            INIT_GETRESUID => {
                 session::handle_getresuid(reply, badge);
                 Some(false)
             }
-            PM_GETRESGID => {
+            INIT_GETRESGID => {
                 session::handle_getresgid(reply, badge);
                 Some(false)
             }
-            PM_SETRESUID => {
+            INIT_SETRESUID => {
                 session::handle_setresuid(msg, reply, badge);
                 Some(false)
             }
-            PM_SETRESGID => {
+            INIT_SETRESGID => {
                 session::handle_setresgid(msg, reply, badge);
                 Some(false)
             }
-            PM_GETRLIMIT => {
+            INIT_GETRLIMIT => {
                 session::handle_getrlimit(msg, reply, badge);
                 Some(false)
             }
-            PM_SETRLIMIT => {
+            INIT_SETRLIMIT => {
                 session::handle_setrlimit(msg, reply, badge);
                 Some(false)
             }
-            PM_SET_SESSION_TTY => {
+            INIT_SET_SESSION_TTY => {
                 session::handle_set_session_tty(msg, reply);
                 Some(false)
             }
-            PM_CLEAR_SESSION_TTY => {
+            INIT_CLEAR_SESSION_TTY => {
                 session::handle_clear_session_tty(msg, reply);
                 Some(false)
             }
-            PM_SET_SESSION_TTY_PGRP => {
+            INIT_SET_SESSION_TTY_PGRP => {
                 session::handle_set_session_tty_pgrp(msg, reply);
                 Some(false)
             }

@@ -8,10 +8,12 @@
 //! Stateless header parsing and construction live in `crate::net::proto::udp`;
 //! this module handles the stateful socket layer.
 
-use trona::consts::kernel::{TRONA_INVALID_ARGUMENT, TRONA_OK};
-use trona::consts::posix::SOCK_DGRAM;
-use trona::consts::server::{INET_OP_RECV, INET_OP_RECVFROM, TRONA_NOT_CONNECTED, TRONA_NO_BUFS};
-use trona_posix::consts::*;
+use trona_protocol::common::{TRONA_INVALID_ARGUMENT, TRONA_OK};
+use trona_protocol::posix::{
+    INET_OP_RECV, INET_OP_RECVFROM, INET_RECV_FLAG_WANT_TIMESTAMP, TRONA_NO_BUFS,
+    TRONA_NOT_CONNECTED,
+};
+use trona_protocol::posix_abi::socket::SOCK_DGRAM;
 
 use crate::net::proto::ipv4;
 use crate::net::proto::udp as udp_proto;
@@ -123,7 +125,7 @@ static mut COMPLETIONS: [Option<Completion>; MAX_COMPLETIONS] = [const { None };
 static mut COMP_HEAD: usize = 0;
 static mut COMP_TAIL: usize = 0;
 
-fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona_runtime::debug::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -149,6 +151,53 @@ fn push_completion(c: Completion) {
         slot.write(Some(c));
         *(&raw mut COMP_HEAD) = next_head;
     }
+}
+
+/// Enqueue an `INET_OP_RECV` completion for a UDP socket whose receive
+/// queue already held a datagram when `NET_RECV_WAIT` arrived. See
+/// `tcp::push_immediate_recv_completion` for the ordering contract.
+pub(crate) fn push_immediate_recv_completion(conn_id: u32, data: &[u8]) {
+    let n = core::cmp::min(data.len(), 152);
+    let mut comp = Completion {
+        conn_id,
+        result: TRONA_OK,
+        op_type: INET_OP_RECV,
+        data: [0u8; 152],
+        data_len: n,
+        extra_conn_id: 0,
+        extra_ip: 0,
+        extra_port: 0,
+        timestamp_ns: 0,
+    };
+    comp.data[..n].copy_from_slice(&data[..n]);
+    push_completion(comp);
+}
+
+/// Enqueue an `INET_OP_RECVFROM` completion for a UDP datagram already
+/// buffered when `NET_RECVFROM_WAIT` arrived. Preserves source address
+/// and optional timestamp so the `handle_netsrv_callback` path can
+/// reconstruct a POSIX `recvfrom()` reply for the parked client.
+pub(crate) fn push_immediate_recvfrom_completion(
+    conn_id: u32,
+    data: &[u8],
+    src_ip: u32,
+    src_port: u16,
+    timestamp_ns: u64,
+) {
+    let n = core::cmp::min(data.len(), 152);
+    let mut comp = Completion {
+        conn_id,
+        result: TRONA_OK,
+        op_type: INET_OP_RECVFROM,
+        data: [0u8; 152],
+        data_len: n,
+        extra_conn_id: 0,
+        extra_ip: src_ip,
+        extra_port: src_port,
+        timestamp_ns,
+    };
+    comp.data[..n].copy_from_slice(&data[..n]);
+    push_completion(comp);
 }
 
 pub(crate) fn pop_completion() -> Option<Completion> {
@@ -312,7 +361,11 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
         (*sockets)[idx].keep_zero_source_ip
     };
     let src_ip = if local_ip == 0 {
-        if keep_zero_source_ip { 0 } else { ipv4::our_ip() }
+        if keep_zero_source_ip {
+            0
+        } else {
+            ipv4::our_ip()
+        }
     } else {
         local_ip
     };
@@ -377,7 +430,11 @@ pub(crate) fn udp_send(conn_id: u32, data: &[u8]) -> i32 {
 
 /// Receive a datagram, returning (bytes_copied, src_ip, src_port).
 /// Returns (-1, 0, 0) if no data available.
-pub(crate) fn udp_recvfrom(conn_id: u32, buf: &mut [u8], want_timestamp: bool) -> (i32, u32, u16, u64) {
+pub(crate) fn udp_recvfrom(
+    conn_id: u32,
+    buf: &mut [u8],
+    want_timestamp: bool,
+) -> (i32, u32, u16, u64) {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
         None => return (-1, 0, 0, options::TIMESTAMP_NONE_NS),
@@ -556,7 +613,7 @@ pub(crate) fn udp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(
         options::get_option(
             &mut (*sockets)[idx].opts,
             SOCK_DGRAM,
-            trona::consts::posix::IPPROTO_UDP,
+            trona_protocol::posix_abi::socket::IPPROTO_UDP,
             level,
             optname,
         )
@@ -599,7 +656,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
             unsafe {
                 if *(&raw const LOGGED_UDP_DROPS) < 8 {
                     *(&raw mut LOGGED_UDP_DROPS) += 1;
-                    trona::udebug!(|_lb| {
+                    trona_runtime::udebug!(|_lb| {
                         _lb.str(b"[netsrv] UDP parse failed len=");
                         _lb.dec(data.len() as u64);
                         _lb.putc(b'\n');
@@ -615,7 +672,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
     unsafe {
         if *(&raw const LOGGED_UDP_FRAMES) < 8 {
             *(&raw mut LOGGED_UDP_FRAMES) += 1;
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[netsrv] UDP datagram src=");
                 log_ipv4(&mut _lb, src_ip);
                 _lb.putc(b':');
@@ -638,7 +695,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
             unsafe {
                 if *(&raw const LOGGED_UDP_DROPS) < 8 {
                     *(&raw mut LOGGED_UDP_DROPS) += 1;
-                    trona::udebug!(|_lb| {
+                    trona_runtime::udebug!(|_lb| {
                         _lb.str(b"[netsrv] UDP drop no socket dst_port=");
                         _lb.dec(dst_port as u64);
                         _lb.str(b" src=");
@@ -661,11 +718,18 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
         // If a recv is pending, deliver directly via completion
         if sock.pending_recv {
             let op_type = sock.pending_recv_op_type;
-            let want_timestamp = (sock.pending_recv_flags & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP) != 0;
+            let want_timestamp = (sock.pending_recv_flags & INET_RECV_FLAG_WANT_TIMESTAMP) != 0;
             sock.pending_recv = false;
             let max_len = sock.pending_recv_max_len as usize;
             let copy_len = core::cmp::min(payload.len(), max_len);
-            let copy_len = core::cmp::min(copy_len, if op_type == INET_OP_RECVFROM { 104 } else { 152 });
+            let copy_len = core::cmp::min(
+                copy_len,
+                if op_type == INET_OP_RECVFROM {
+                    104
+                } else {
+                    152
+                },
+            );
 
             let mut comp = Completion {
                 conn_id: sock.conn_id,
@@ -836,7 +900,7 @@ pub(crate) fn set_pending_recvfrom(conn_id: u32, max_len: u16, flags: u32) {
                     extra_conn_id: 0,
                     extra_ip: entry.src_ip,
                     extra_port: entry.src_port,
-                    timestamp_ns: if (flags & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP) != 0 {
+                    timestamp_ns: if (flags & INET_RECV_FLAG_WANT_TIMESTAMP) != 0 {
                         entry.timestamp_ns
                     } else {
                         options::TIMESTAMP_NONE_NS

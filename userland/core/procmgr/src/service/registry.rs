@@ -1,103 +1,68 @@
 //! Boot-time service-def registry for procmgr.
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Init parses every `.service` file in the initrd at boot. Pre-procmgr
-//! services it spawns directly. Post-procmgr services it ships to procmgr in
-//! one shot via `PM_REGISTER_SERVICE_DEFS`: a single frame cap whose contents
-//! are a `TronaProcmgrServiceDefsV1` header followed by `count` entries of
-//! `TronaProcmgrServiceDefV1`.
+//! Init parses every unit file in the initrd at boot. Pre-procmgr services it
+//! spawns directly. Post-procmgr services it ships to procmgr as a chunked
+//! `PM_REGISTER_SERVICE_DEFS` stream: each IPC call transfers one frame cap
+//! containing a `TronaServiceDefs` header followed by
+//! `service_count` `TronaServiceDef` entries and then
+//! `attachment_count` `TronaServiceAttachment` entries.
 //!
-//! Procmgr maps the frame at its scratch VA, validates the magic + version,
-//! copies entries into the static `SERVICE_REGISTRY` below, unmaps, and acks
-//! `TRONA_OK`. The registry is consulted later by `spawn_tx` when building
-//! the cap_table for a post-procmgr child: each `Require=` entry resolves to
-//! a `(role_id, slot)` pair via the provider name and procmgr's provider
-//! registry.
+//! Procmgr validates the chunk header and keeps each received chunk mapped in
+//! a dedicated registry VA range. The registry is consulted later by
+//! `spawn_tx` when building the cap_table for a post-procmgr child: the wire
+//! record names both the provider namespace and the attachment family, so
+//! procmgr can handle endpoint attachments and capability attachments as
+//! distinct cases instead of inferring everything from a pre-resolved
+//! `role_id`.
 
 use core::ptr;
-use trona::cap_table::{CapTableBuilder, CapTableErr};
-use trona::consts::kernel::CAP_TBL_FLAG_BADGED;
-use trona::types::core::{
-    Cap, TronaMsg, TronaProcmgrServiceDefV1, TronaProcmgrServiceDefsV1, MAX_PROCMGR_SERVICE_DEFS,
-    MAX_REQUIRE_PROVIDER, REQUIRE_KIND_LOCAL, REQUIRE_KIND_SYSTEM, TRONA_PROCMGR_DEFS_MAGIC,
-    TRONA_PROCMGR_DEFS_VERSION,
+use trona_kernel::core_types::{
+    ATTACHMENT_TYPE_CAP, ATTACHMENT_TYPE_ENDPOINT, Cap, MAX_REQUIRE_PROVIDER, REQUIRE_KIND_LOCAL,
+    REQUIRE_KIND_SYSTEM, TRONA_SERVICE_DEFS_FLAG_FIRST, TRONA_SERVICE_DEFS_MAGIC, TronaMsg,
+    TronaServiceAttachment, TronaServiceDef, TronaServiceDefs,
 };
+use trona_runtime::spawn::cap_table::{CapTableBuilder, CapTableErr};
+use uapi::CAP_TBL_FLAG_BADGED;
 
 const FRAME_SIZE: usize = 4096;
+const SERVICE_REGISTRY_BASE_VADDR: u64 = crate::PROCMGR_SCRATCH_VADDR + 0x0010_0000;
+const SERVICE_REGISTRY_CHUNK_STRIDE: u64 = FRAME_SIZE as u64;
 
-/// Maximum number of providers procmgr tracks. Bootstrap pre-procmgr
-/// providers (namesrv/vfs/mmsrv/rsrcsrv = 4) plus post-procmgr providers
-/// procmgr will register as it spawns them. The post-procmgr count is
-/// bounded by `MAX_PROCMGR_SERVICE_DEFS`, so 4 + MAX_PROCMGR_SERVICE_DEFS
-/// is the worst case.
-pub const MAX_PROVIDERS: usize = 4 + MAX_PROCMGR_SERVICE_DEFS;
+static mut REGISTERED_PROVIDER_COUNT: u32 = 0;
+static mut SERVICE_REGISTRY_ATTACHMENT_COUNT: u32 = 0;
 
-/// One entry in `PROVIDER_REGISTRY`. `slot` is the cap slot in procmgr's
-/// own CSpace; for bootstrap providers it's the startup cap_table slot
-/// surfaced via `trona::caps::*()`, for post-procmgr providers it's a
-/// procmgr-side scratch slot copied from the EP that init or `spawn_tx`
-/// set up.
-#[derive(Clone, Copy)]
-struct ProviderEntry {
-    name: [u8; MAX_REQUIRE_PROVIDER],
-    name_len: u8,
-    slot: u64,
+fn bootstrap_provider_count() -> u32 {
+    let mut count = 0u32;
+    if trona_runtime::client::caps::namesrv_ep() != 0 {
+        count += 1;
+    }
+    if crate::base::cap_helpers::vfs_provider_ep() != 0 {
+        count += 1;
+    }
+    if crate::base::cap_helpers::mmsrv_authority_raw() != 0 {
+        count += 1;
+    }
+    if crate::base::cap_helpers::rsrcsrv_authority_raw() != 0 {
+        count += 1;
+    }
+    count
 }
 
-impl ProviderEntry {
-    const fn zeroed() -> Self {
-        ProviderEntry {
-            name: [0; MAX_REQUIRE_PROVIDER],
-            name_len: 0,
-            slot: 0,
-        }
+unsafe fn publish_well_known_provider(name: &[u8], slot: u64) {
+    if slot == 0 {
+        return;
+    }
+    if name == b"vfs" {
+        let _ = unsafe { crate::base::cap_helpers::refresh_vfs_caps(slot as Cap) };
     }
 }
 
-static mut PROVIDER_REGISTRY: [ProviderEntry; MAX_PROVIDERS] =
-    [ProviderEntry::zeroed(); MAX_PROVIDERS];
-static mut PROVIDER_REGISTRY_COUNT: u32 = 0;
-
-/// Procmgr-side CSpace slots used to hold provider EP copies.
-///
-/// The bootstrap providers (`namesrv`/`vfs`/`mmsrv`/`rsrcsrv`) live at fixed
-/// system slots already (64..71) — they do **not** consume this range.
-/// Slots in this range are allocated on demand for:
-///
-/// - Pre-procmgr providers registered via `PM_REGISTER_PROVIDER`
-///   (e.g. `console`, `com1` — caps that arrive from init).
-/// - Post-procmgr providers registered by `spawn_tx` after a successful
-///   spawn (the child's listener EP, copied so procmgr can later mint
-///   per-consumer badged copies).
-///
-/// `MAX_PROVIDERS - 4` = 14 dynamic slots — exactly enough to mirror every
-/// post-procmgr service def the registry can hold, with bootstrap entries
-/// staying in their fixed slots.
-const PROVIDER_SLOT_BASE: u64 = 1024;
-const PROVIDER_SLOT_LIMIT: u64 = PROVIDER_SLOT_BASE + (MAX_PROVIDERS as u64) - 4;
-static mut NEXT_PROVIDER_SLOT: u64 = PROVIDER_SLOT_BASE;
-
-/// Bump-allocate a CSpace slot inside `[PROVIDER_SLOT_BASE,
-/// PROVIDER_SLOT_LIMIT)` for a new provider EP copy. Returns `None` when
-/// the range is exhausted — at that point procmgr is being asked to track
-/// more providers than the registry was sized for, which is a build-time
-/// configuration bug.
-pub fn alloc_provider_slot() -> Option<u64> {
-    unsafe {
-        let cur = ptr::read_volatile(&raw const NEXT_PROVIDER_SLOT);
-        if cur >= PROVIDER_SLOT_LIMIT {
-            return None;
-        }
-        ptr::write_volatile(&raw mut NEXT_PROVIDER_SLOT, cur + 1);
-        Some(cur)
-    }
-}
-
-/// Outcome of `resolve_local_requires`. Carries enough information for the
+/// Outcome of `resolve_registry_attachments`. Carries enough information for the
 /// caller to log a meaningful message but is otherwise opaque.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolveErr {
-    /// Service has more `Require=` entries than the child cspace
+    /// Service has more materialized attachment entries than the child cspace
     /// `[extras_base, frame_slot_start)` window can hold.
     SlotRangeExhausted,
     /// `cnode_mint` / `cnode_copy` from the procmgr provider slot into
@@ -105,10 +70,13 @@ pub enum ResolveErr {
     CnodeOpFailed,
     /// `CapTableBuilder::push` ran out of space.
     BuilderOverflow,
-    /// `Require=<provider>:<alias>` references a provider procmgr does
-    /// not know about. The boot order should arrange for the provider
-    /// to be spawned (and auto-registered) before any consumer.
+    /// A lowered local endpoint attachment references a provider procmgr does
+    /// not know about. The boot order should arrange for the provider to be
+    /// spawned (and auto-registered) before any consumer.
     UnknownProvider,
+    /// The registry described an attachment family procmgr cannot materialize
+    /// into the child cap_table yet.
+    UnsupportedAttachment,
 }
 
 impl From<CapTableErr> for ResolveErr {
@@ -117,50 +85,156 @@ impl From<CapTableErr> for ResolveErr {
     }
 }
 
-/// Resolve every `Require=` entry for `service_name` and push the
-/// resulting cap_table entries into `builder`.
+#[derive(Clone, Copy)]
+struct RegistryServiceView {
+    entry: *mut TronaServiceDef,
+    attachments: *mut TronaServiceAttachment,
+    attachment_total: usize,
+}
+
+#[inline]
+unsafe fn service_defs_ptr(header: *mut TronaServiceDefs) -> *mut TronaServiceDef {
+    unsafe {
+        (header as *mut u8).add(core::mem::size_of::<TronaServiceDefs>()) as *mut TronaServiceDef
+    }
+}
+
+#[inline]
+unsafe fn attachments_ptr(
+    header: *mut TronaServiceDefs,
+    service_count: usize,
+) -> *mut TronaServiceAttachment {
+    unsafe {
+        (service_defs_ptr(header) as *mut u8)
+            .add(service_count * core::mem::size_of::<TronaServiceDef>())
+            as *mut TronaServiceAttachment
+    }
+}
+
+fn attachment_kind_valid(kind: u8) -> bool {
+    kind == REQUIRE_KIND_SYSTEM || kind == REQUIRE_KIND_LOCAL
+}
+
+fn attachment_type_valid(attachment_type: u8) -> bool {
+    attachment_type == ATTACHMENT_TYPE_ENDPOINT || attachment_type == ATTACHMENT_TYPE_CAP
+}
+
+unsafe fn validate_registry_attachment(
+    service_name: &[u8],
+    entry: &TronaServiceAttachment,
+) -> Result<(), u64> {
+    if !attachment_kind_valid(entry.kind) {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] register_service_defs: invalid attachment kind for ");
+            _lb.bytes(service_name);
+            _lb.str(b"\n");
+        });
+        return Err(crate::TRONA_INVALID_ARGUMENT);
+    }
+    if !attachment_type_valid(entry.attachment_type) {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] register_service_defs: invalid attachment type for ");
+            _lb.bytes(service_name);
+            _lb.str(b"\n");
+        });
+        return Err(crate::TRONA_INVALID_ARGUMENT);
+    }
+    let provider_len = entry.provider_len as usize;
+    if provider_len == 0 || provider_len > MAX_REQUIRE_PROVIDER {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] register_service_defs: invalid provider name for ");
+            _lb.bytes(service_name);
+            _lb.str(b"\n");
+        });
+        return Err(crate::TRONA_INVALID_ARGUMENT);
+    }
+    if entry.badged > 1 || entry.raw > 1 {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] register_service_defs: invalid attachment flags for ");
+            _lb.bytes(service_name);
+            _lb.str(b"\n");
+        });
+        return Err(crate::TRONA_INVALID_ARGUMENT);
+    }
+    Ok(())
+}
+
+/// Resolve every lowered registry attachment entry for `service_name` and push
+/// the resulting cap_table entries into `builder`.
 ///
-/// - System-role entries are silently skipped — they have already been
-///   pushed by `ChildCapLayout::populate_cap_table` from the layout's
-///   well-known cap fields. Pushing them again would create duplicates.
+/// - System-scope entries are silently skipped — they have already been pushed
+///   by `ChildCapLayout::populate_cap_table` from the layout's well-known cap
+///   fields. Pushing them again would create duplicates.
 /// - `*_AUTHORITY_RAW` entries are skipped: they are procmgr-private and
 ///   never delivered to a child via the public cap_table.
-/// - Local-role entries trigger a `lookup_provider(provider_name)`. The
+/// - Local endpoint entries trigger a `lookup_provider(provider_name)`. The
 ///   matched procmgr-side cap is `cnode_mint`'d (badged with the consumer
 ///   `pid`) or `cnode_copy`'d (unbadged) into a freshly allocated slot in
 ///   `[cap_layout.extras_base, cap_layout.frame_slot_start)`, then pushed
 ///   to the builder.
+/// - Local capability entries are rejected explicitly for now. The registry
+///   can describe them, but procmgr does not yet have a generic
+///   materialization path for service-provided capabilities.
 ///
 /// `service_name` may be empty — in that case the function returns
 /// `Ok(0)` immediately. This lets fork/exec paths share a single helper
 /// without paying for a registry lookup.
-pub unsafe fn resolve_local_requires(
+pub unsafe fn resolve_registry_attachments(
     service_name: &[u8],
     pid: u32,
     child_cn: Cap,
-    cap_layout: &crate::base::child_layout::ChildCapLayout,
+    cap_layout: &trona_runtime::spawn::layout::ChildCapLayout,
     builder: &mut CapTableBuilder,
 ) -> Result<u32, ResolveErr> {
     if service_name.is_empty() {
         return Ok(0);
     }
-    let def = match lookup(service_name) {
-        Some(d) => d,
+    let view = match lookup_service_view(service_name) {
+        Some(v) => v,
         None => return Ok(0),
     };
+    let def = unsafe { &*view.entry };
 
     let mut next_slot = cap_layout.extras_base;
     let limit = cap_layout.frame_slot_start;
     let mut emitted: u32 = 0;
+    let attachment_start = def.attachment_start as usize;
+    let attachment_count = def.attachment_count as usize;
+    if attachment_start > view.attachment_total
+        || attachment_start.saturating_add(attachment_count) > view.attachment_total
+    {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] resolve_registry_attachments: invalid attachment span for ");
+            _lb.bytes(service_name);
+            _lb.str(b"\n");
+        });
+        return Err(ResolveErr::UnknownProvider);
+    }
 
-    for r in 0..(def.require_count as usize) {
-        let entry = &def.requires[r];
-        // System roles are owned by populate_cap_table — never re-push.
+    for r in 0..attachment_count {
+        let entry = unsafe { &*view.attachments.add(attachment_start + r) };
+        // System-owned roles are materialized elsewhere — never re-push.
         if entry.kind == REQUIRE_KIND_SYSTEM {
             continue;
         }
         if entry.kind != REQUIRE_KIND_LOCAL {
             continue;
+        }
+        if entry.attachment_type == ATTACHMENT_TYPE_CAP {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] resolve_registry_attachments: unsupported local cap attachment for ");
+                _lb.bytes(service_name);
+                _lb.str(b"\n");
+            });
+            return Err(ResolveErr::UnsupportedAttachment);
+        }
+        if entry.attachment_type != ATTACHMENT_TYPE_ENDPOINT {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] resolve_registry_attachments: unknown attachment type for ");
+                _lb.bytes(service_name);
+                _lb.str(b"\n");
+            });
+            return Err(ResolveErr::UnsupportedAttachment);
         }
         // Privileged raw caps are procmgr-private and not deliverable
         // through the public cap_table. The parser only sets `raw = 1`
@@ -180,8 +254,8 @@ pub unsafe fn resolve_local_requires(
         let provider_slot = match lookup_provider(provider_name) {
             Some(s) => s,
             None => {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[PROCMGR] resolve_local_requires: ");
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] resolve_registry_attachments: ");
                     _lb.bytes(service_name);
                     _lb.str(b" needs unknown provider ");
                     _lb.bytes(provider_name);
@@ -192,8 +266,8 @@ pub unsafe fn resolve_local_requires(
         };
 
         if next_slot >= limit {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] resolve_local_requires: ");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] resolve_registry_attachments: ");
                 _lb.bytes(service_name);
                 _lb.str(b" extras window exhausted at slot ");
                 _lb.dec(next_slot);
@@ -205,7 +279,7 @@ pub unsafe fn resolve_local_requires(
         next_slot += 1;
 
         let mint_err = if entry.badged != 0 {
-            trona::invoke::cnode_mint(
+            trona_kernel::invoke::cnode_mint(
                 crate::CAP_SELF_CSPACE,
                 provider_slot,
                 child_cn,
@@ -213,7 +287,7 @@ pub unsafe fn resolve_local_requires(
                 pid as u64,
             )
         } else {
-            trona::invoke::cnode_copy(
+            trona_kernel::invoke::cnode_copy(
                 crate::CAP_SELF_CSPACE,
                 provider_slot,
                 child_cn,
@@ -222,8 +296,8 @@ pub unsafe fn resolve_local_requires(
             )
         };
         if mint_err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] resolve_local_requires: cnode op for ");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] resolve_registry_attachments: cnode op for ");
                 _lb.bytes(service_name);
                 _lb.str(b"<-");
                 _lb.bytes(provider_name);
@@ -244,8 +318,8 @@ pub unsafe fn resolve_local_requires(
     }
 
     if emitted > 0 {
-        trona::udebug!(|_lb| {
-            _lb.str(b"[PROCMGR] resolve_local_requires: ");
+        trona_runtime::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] resolve_registry_attachments: ");
             _lb.bytes(service_name);
             _lb.str(b" emitted ");
             _lb.dec(emitted as u64);
@@ -256,15 +330,15 @@ pub unsafe fn resolve_local_requires(
 }
 
 /// Adopt the provider EP currently sitting in `crate::CAP_RECV_SCRATCH`
-/// (received via PM_SPAWN cap transfer) into procmgr's permanent provider
-/// slot range. The scratch slot is **left intact** so the caller can still
+/// (received via INIT_SPAWN cap transfer) into a permanent allocator-managed
+/// CSpace slot. The scratch slot is **left intact** so the caller can still
 /// `cnode_move` it into the child's CSpace.
 ///
 /// This is the spawn-time auto-registration path: every post-procmgr
 /// service that init creates with a `pre_ep` (i.e. the listener EP shipped
-/// alongside `PM_SPAWN`) ends up here. The procmgr-side copy is what
+/// alongside `INIT_SPAWN`) ends up here. The procmgr-side copy is what
 /// `spawn_tx`'s cap_table builder later mints into other consumer
-/// children when they `Require=<this service>`.
+/// children when lowered local attachments reference this provider.
 ///
 /// Returns `true` on success or if the name was already registered (the
 /// scratch slot is left untouched in the duplicate case — caller still
@@ -276,18 +350,18 @@ pub unsafe fn adopt_provider_from_scratch(name: &[u8]) -> bool {
     if lookup_provider(name).is_some() {
         return true;
     }
-    let provider_slot = match alloc_provider_slot() {
+    let provider_slot = match unsafe { (&mut *(&raw mut crate::ALLOCATOR)).alloc_single_slot() } {
         Some(s) => s,
         None => {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] adopt_provider: slot range exhausted for ");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] adopt_provider: allocator exhausted for ");
                 _lb.bytes(name);
                 _lb.str(b"\n");
             });
             return false;
         }
     };
-    let copy_err = trona::invoke::cnode_copy(
+    let copy_err = trona_kernel::invoke::cnode_copy(
         crate::CAP_SELF_CSPACE,
         crate::CAP_RECV_SCRATCH,
         crate::CAP_SELF_CSPACE,
@@ -295,7 +369,7 @@ pub unsafe fn adopt_provider_from_scratch(name: &[u8]) -> bool {
         crate::CAP_RIGHTS_ALL,
     );
     if copy_err != 0 {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] adopt_provider: cnode_copy err=");
             _lb.hex(copy_err as u64);
             _lb.str(b" for ");
@@ -307,58 +381,103 @@ pub unsafe fn adopt_provider_from_scratch(name: &[u8]) -> bool {
     match register_provider(name, provider_slot) {
         RegisterOutcome::Added => true,
         RegisterOutcome::Duplicate => {
-            let _ = trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, provider_slot);
+            let _ = trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, provider_slot);
             true
         }
         RegisterOutcome::Failed => {
-            let _ = trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, provider_slot);
+            let _ = trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, provider_slot);
             false
         }
     }
 }
 
-/// Static registry of service defs received from init at boot. Indexed by
-/// `[..registry_count()]`. Touched only via raw pointers to satisfy the
-/// Rust 2024 `static mut` rules.
-static mut SERVICE_REGISTRY: [TronaProcmgrServiceDefV1; MAX_PROCMGR_SERVICE_DEFS] =
-    [TronaProcmgrServiceDefV1::zeroed(); MAX_PROCMGR_SERVICE_DEFS];
-static mut SERVICE_REGISTRY_COUNT: u32 = 0;
+/// Number of mapped registry chunks currently installed.
+static mut SERVICE_REGISTRY_CHUNK_COUNT: u32 = 0;
+/// Total number of service defs across all mapped chunks.
+static mut SERVICE_REGISTRY_ENTRY_COUNT: u32 = 0;
 
-/// Number of populated entries in the registry.
-pub fn registry_count() -> u32 {
-    unsafe { ptr::read_volatile(&raw const SERVICE_REGISTRY_COUNT) }
+#[inline]
+fn service_registry_chunk_vaddr(idx: u32) -> u64 {
+    SERVICE_REGISTRY_BASE_VADDR + (idx as u64) * SERVICE_REGISTRY_CHUNK_STRIDE
 }
 
-/// Number of populated entries in `PROVIDER_REGISTRY`.
-pub fn provider_count() -> u32 {
-    unsafe { ptr::read_volatile(&raw const PROVIDER_REGISTRY_COUNT) }
-}
-
-/// Look up a provider's cap slot by name. Returns `None` if not registered.
-///
-/// Used by `spawn_tx`'s cap_table builder to resolve `Require=<provider>:<alias>`
-/// service-local entries — the returned slot is procmgr's own CSpace slot,
-/// suitable for `cnode_copy` / `cnode_mint` into a consumer child's CSpace.
-pub fn lookup_provider(name: &[u8]) -> Option<u64> {
+unsafe fn reset_service_registry() {
     unsafe {
-        let n = provider_count() as usize;
-        let base = &raw const PROVIDER_REGISTRY as *const ProviderEntry;
-        for i in 0..n {
-            let entry = ptr::read_volatile(base.add(i));
-            let len = entry.name_len as usize;
-            if len == name.len() && &entry.name[..len] == name {
-                return Some(entry.slot);
+        let self_vspace = crate::CAP_SELF_VSPACE;
+        let chunk_count = ptr::read_volatile(&raw const SERVICE_REGISTRY_CHUNK_COUNT);
+        for idx in 0..chunk_count {
+            let _ =
+                trona_kernel::invoke::vspace_unmap(self_vspace, service_registry_chunk_vaddr(idx));
+        }
+        ptr::write_volatile(&raw mut SERVICE_REGISTRY_CHUNK_COUNT, 0);
+        ptr::write_volatile(&raw mut SERVICE_REGISTRY_ENTRY_COUNT, 0);
+        ptr::write_volatile(&raw mut SERVICE_REGISTRY_ATTACHMENT_COUNT, 0);
+        ptr::write_volatile(&raw mut REGISTERED_PROVIDER_COUNT, 0);
+    }
+}
+
+unsafe fn lookup_service_view(name: &[u8]) -> Option<RegistryServiceView> {
+    unsafe {
+        let chunk_count = ptr::read_volatile(&raw const SERVICE_REGISTRY_CHUNK_COUNT);
+        for idx in 0..chunk_count {
+            let header = service_registry_chunk_vaddr(idx) as *mut TronaServiceDefs;
+            let service_count = ptr::read_volatile(&raw const (*header).service_count) as usize;
+            let attachment_total =
+                ptr::read_volatile(&raw const (*header).attachment_count) as usize;
+            let services = service_defs_ptr(header);
+            let attachments = attachments_ptr(header, service_count);
+            for i in 0..service_count {
+                let entry = services.add(i);
+                let len = ptr::read_volatile(&raw const (*entry).name_len) as usize;
+                if len == name.len() && &(&(*entry).name)[..len] == name {
+                    return Some(RegistryServiceView {
+                        entry,
+                        attachments,
+                        attachment_total,
+                    });
+                }
             }
         }
         None
     }
 }
 
-fn provider_bootstrap_slot(name: &[u8]) -> Option<u64> {
+pub fn service_has_system_cap_attachment(service_name: &[u8], role_id: u32) -> bool {
+    if service_name.is_empty() {
+        return false;
+    }
+    let Some(view) = (unsafe { lookup_service_view(service_name) }) else {
+        return false;
+    };
+    let def = unsafe { &*view.entry };
+    let attachment_start = def.attachment_start as usize;
+    let attachment_count = def.attachment_count as usize;
+    if attachment_start > view.attachment_total
+        || attachment_start.saturating_add(attachment_count) > view.attachment_total
+    {
+        return false;
+    }
+    for r in 0..attachment_count {
+        let entry = unsafe { &*view.attachments.add(attachment_start + r) };
+        if entry.kind == REQUIRE_KIND_SYSTEM
+            && entry.attachment_type == ATTACHMENT_TYPE_CAP
+            && entry.role_id == role_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn lookup_service_def_ptr(name: &[u8]) -> Option<*mut TronaServiceDef> {
+    unsafe { lookup_service_view(name).map(|view| view.entry) }
+}
+
+fn bootstrap_provider_slot(name: &[u8]) -> Option<u64> {
     if name == b"namesrv" {
-        Some(trona::caps::namesrv_ep())
+        Some(trona_runtime::client::caps::namesrv_ep())
     } else if name == b"vfs" {
-        Some(trona::caps::vfs_ep())
+        Some(crate::base::cap_helpers::vfs_provider_ep())
     } else if name == b"mmsrv" {
         Some(crate::base::cap_helpers::mmsrv_authority_raw())
     } else if name == b"rsrcsrv" {
@@ -368,25 +487,83 @@ fn provider_bootstrap_slot(name: &[u8]) -> Option<u64> {
     }
 }
 
-unsafe fn refresh_bootstrap_provider_from_scratch(name: &[u8]) -> bool {
-    let Some(slot) = provider_bootstrap_slot(name) else {
-        return false;
-    };
+fn is_bootstrap_provider_slot(slot: u64) -> bool {
+    slot == trona_runtime::client::caps::namesrv_ep()
+        || slot == crate::base::cap_helpers::vfs_provider_ep()
+        || slot == crate::base::cap_helpers::mmsrv_authority_raw()
+        || slot == crate::base::cap_helpers::rsrcsrv_authority_raw()
+}
 
+unsafe fn seed_bootstrap_provider_slots(services: *mut TronaServiceDef, service_count: usize) {
+    unsafe {
+        for i in 0..service_count {
+            let entry = services.add(i);
+            if ptr::read_volatile(&raw const (*entry).provider_slot) != 0 {
+                continue;
+            }
+            let name_len = ptr::read_volatile(&raw const (*entry).name_len) as usize;
+            if name_len == 0 || name_len > MAX_REQUIRE_PROVIDER {
+                continue;
+            }
+            let name = &(&(*entry).name)[..name_len];
+            let Some(slot) = bootstrap_provider_slot(name) else {
+                continue;
+            };
+            ptr::write_volatile(&raw mut (*entry).provider_slot, slot);
+        }
+    }
+}
+
+/// Number of populated entries in the registry.
+pub fn registry_count() -> u32 {
+    unsafe { ptr::read_volatile(&raw const SERVICE_REGISTRY_ENTRY_COUNT) }
+}
+
+/// Number of populated lowered attachment entries in the registry.
+pub fn attachment_count() -> u32 {
+    unsafe { ptr::read_volatile(&raw const SERVICE_REGISTRY_ATTACHMENT_COUNT) }
+}
+
+/// Number of provider endpoints procmgr can resolve.
+pub fn provider_count() -> u32 {
+    unsafe { bootstrap_provider_count() + ptr::read_volatile(&raw const REGISTERED_PROVIDER_COUNT) }
+}
+
+/// Look up a provider's cap slot by name. Returns `None` if not registered.
+///
+/// Used by `spawn_tx`'s cap_table builder to resolve service-local attachment
+/// entries — the returned slot is procmgr's own CSpace slot, suitable for
+/// `cnode_copy` / `cnode_mint` into a consumer child's CSpace. Bootstrap
+/// providers are seeded directly into their streamed registry entries when
+/// the service-def chunks arrive, so provider resolution stays registry-based
+/// even for built-in singleton services.
+pub fn lookup_provider(name: &[u8]) -> Option<u64> {
+    unsafe {
+        if let Some(entry) = lookup_service_def_ptr(name) {
+            let slot = ptr::read_volatile(&raw const (*entry).provider_slot);
+            if slot != 0 {
+                return Some(slot);
+            }
+        }
+        None
+    }
+}
+
+unsafe fn refresh_provider_slot_from_scratch(name: &[u8], slot: u64) -> bool {
     let self_cspace = crate::CAP_SELF_CSPACE;
     let scratch = crate::CAP_RECV_SCRATCH;
 
-    let _ = trona::invoke::cnode_delete(self_cspace, slot);
-    let move_err = trona::invoke::cnode_move(self_cspace, slot, self_cspace, scratch);
+    let _ = trona_kernel::invoke::cnode_delete(self_cspace, slot);
+    let move_err = trona_kernel::invoke::cnode_move(self_cspace, slot, self_cspace, scratch);
     if move_err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[PROCMGR] register_provider: bootstrap refresh err=");
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] register_provider: provider refresh err=");
             _lb.hex(move_err as u64);
             _lb.str(b" for ");
             _lb.bytes(name);
             _lb.str(b"\n");
         });
-        let _ = trona::invoke::cnode_delete(self_cspace, scratch);
+        let _ = trona_kernel::invoke::cnode_delete(self_cspace, scratch);
         return false;
     }
 
@@ -407,48 +584,36 @@ pub enum RegisterOutcome {
 }
 
 /// Register a provider. **Strictly first-write-wins** — if `name` already
-/// exists in the registry, the existing slot is preserved and
-/// `RegisterOutcome::Duplicate` is returned. Callers that want to handle
-/// the duplicate case (release the speculative slot copy etc.) should use
-/// `lookup_provider` first or interpret the outcome.
+/// has a provider slot recorded in the streamed service registry, the
+/// existing slot is preserved and `RegisterOutcome::Duplicate` is returned.
+/// `name` must refer to a non-bootstrap service already present in the
+/// registry stream.
 pub fn register_provider(name: &[u8], slot: u64) -> RegisterOutcome {
     if name.is_empty() || name.len() > MAX_REQUIRE_PROVIDER {
         return RegisterOutcome::Failed;
     }
     unsafe {
-        let base = &raw mut PROVIDER_REGISTRY as *mut ProviderEntry;
-        let n = provider_count() as usize;
-
-        // First-write-wins: refuse silently if name already present.
-        for i in 0..n {
-            let entry = ptr::read_volatile(base.add(i));
-            let len = entry.name_len as usize;
-            if len == name.len() && &entry.name[..len] == name {
+        let Some(entry) = lookup_service_def_ptr(name) else {
+            if bootstrap_provider_slot(name).is_some() {
                 return RegisterOutcome::Duplicate;
             }
-        }
-
-        if n >= MAX_PROVIDERS {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] register_provider: registry full (");
-                _lb.dec(MAX_PROVIDERS as u64);
-                _lb.str(b" entries) - dropping ");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] register_provider: unknown service ");
                 _lb.bytes(name);
                 _lb.str(b"\n");
             });
             return RegisterOutcome::Failed;
+        };
+        if ptr::read_volatile(&raw const (*entry).provider_slot) != 0 {
+            return RegisterOutcome::Duplicate;
+        }
+        ptr::write_volatile(&raw mut (*entry).provider_slot, slot);
+        if bootstrap_provider_slot(name).is_none() {
+            let count = ptr::read_volatile(&raw const REGISTERED_PROVIDER_COUNT);
+            ptr::write_volatile(&raw mut REGISTERED_PROVIDER_COUNT, count.saturating_add(1));
         }
 
-        let mut entry = ProviderEntry::zeroed();
-        for j in 0..name.len() {
-            entry.name[j] = name[j];
-        }
-        entry.name_len = name.len() as u8;
-        entry.slot = slot;
-        ptr::write_volatile(base.add(n), entry);
-        ptr::write_volatile(&raw mut PROVIDER_REGISTRY_COUNT, (n + 1) as u32);
-
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] register_provider: ");
             _lb.bytes(name);
             _lb.str(b" -> slot ");
@@ -459,42 +624,19 @@ pub fn register_provider(name: &[u8], slot: u64) -> RegisterOutcome {
     }
 }
 
-/// Pre-populate the provider registry with the system-role caps procmgr
-/// already holds at boot. These come from procmgr's own `NeedEP=` slots
-/// (declared in `procmgr.service`) and are available the moment `main()`
-/// runs — no IPC required. The unbadged copies (`mmsrv:68`, `rsrcsrv:71`)
-/// are registered so future `cnode_mint` derivations can attach a
-/// per-consumer badge.
+/// Announce that bootstrap singleton provider slots are available. The
+/// concrete slot numbers still come from procmgr's own built-in attachment
+/// layout; when init streams the registry, matching service entries get
+/// those slots written into `provider_slot` so later lookups stay purely
+/// registry-driven.
 ///
 /// Should be called once from `main()` before the IPC dispatch loop starts.
 pub fn install_bootstrap_providers() {
-    let _ = register_provider(b"namesrv", trona::caps::namesrv_ep());
-    let _ = register_provider(b"vfs", trona::caps::vfs_ep());
-    let _ = register_provider(b"mmsrv", crate::base::cap_helpers::mmsrv_authority_raw());
-    let _ = register_provider(b"rsrcsrv", crate::base::cap_helpers::rsrcsrv_authority_raw());
-
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[PROCMGR] bootstrap providers installed: ");
-        _lb.dec(provider_count() as u64);
+        _lb.dec(bootstrap_provider_count() as u64);
         _lb.str(b"\n");
     });
-}
-
-/// Look up a service def by name. Returns a value copy (the type is `Copy`).
-/// `None` if no entry matches.
-pub fn lookup(name: &[u8]) -> Option<TronaProcmgrServiceDefV1> {
-    unsafe {
-        let n = registry_count() as usize;
-        let base = &raw const SERVICE_REGISTRY as *const TronaProcmgrServiceDefV1;
-        for i in 0..n {
-            let entry = ptr::read_volatile(base.add(i));
-            let len = entry.name_len as usize;
-            if len == name.len() && &entry.name[..len] == name {
-                return Some(entry);
-            }
-        }
-        None
-    }
 }
 
 /// Handle `PM_REGISTER_SERVICE_DEFS`.
@@ -502,113 +644,182 @@ pub fn lookup(name: &[u8]) -> Option<TronaProcmgrServiceDefV1> {
 /// Wire shape:
 ///
 /// - `extra_caps[0]` = frame cap (received at `crate::CAP_RECV_SCRATCH`)
-/// - `msg.regs[0]`   = byte length of the serialized payload (informational;
-///                     procmgr trusts the frame's own header)
+/// - `msg.regs[0]`   = byte length of the serialized payload (informational)
+/// - `msg.regs[1]`   = chunk flags mirror (informational)
 ///
-/// The frame is mapped read/write at `crate::PROCMGR_SCRATCH_VADDR`,
-/// validated, copied into `SERVICE_REGISTRY`, then unmapped. The cap at
-/// `CAP_RECV_SCRATCH` is deleted on the way out so the next IPC starts
+/// The frame is mapped read/write into the persistent service-registry VA
+/// range, validated in place, and left mapped there for later lookups. The
+/// cap at `CAP_RECV_SCRATCH` is deleted on the way out so the next IPC starts
 /// clean.
 pub unsafe fn handle_register_service_defs(_msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
-        let scratch_vaddr = crate::PROCMGR_SCRATCH_VADDR;
         let frame_cap = crate::CAP_RECV_SCRATCH;
         let self_vspace = crate::CAP_SELF_VSPACE;
         let self_cspace = crate::CAP_SELF_CSPACE;
+        let scratch_vaddr = crate::PROCMGR_SCRATCH_VADDR;
 
-        let map_err = trona::invoke::vspace_map(
+        let map_err = trona_kernel::invoke::vspace_map(
             self_vspace,
             frame_cap,
             scratch_vaddr,
             crate::VSPACE_FLAG_WRITABLE | crate::VSPACE_FLAG_USER,
         );
         if map_err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_service_defs: vspace_map err=");
                 _lb.hex(map_err as u64);
                 _lb.str(b"\n");
             });
-            let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
             reply.label = crate::TRONA_INVALID_OPERATION;
             return;
         }
 
-        let header = scratch_vaddr as *const TronaProcmgrServiceDefsV1;
+        let header = scratch_vaddr as *const TronaServiceDefs;
         let magic = ptr::read_volatile(&raw const (*header).magic);
-        let version = ptr::read_volatile(&raw const (*header).version);
-        let count = ptr::read_volatile(&raw const (*header).count);
+        let flags = ptr::read_volatile(&raw const (*header).flags);
+        let service_count = ptr::read_volatile(&raw const (*header).service_count);
+        let attachment_count = ptr::read_volatile(&raw const (*header).attachment_count);
 
-        if magic != TRONA_PROCMGR_DEFS_MAGIC {
-            trona::uerror!(|_lb| {
+        if magic != TRONA_SERVICE_DEFS_MAGIC {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_service_defs: bad magic=");
                 _lb.hex(magic as u64);
                 _lb.str(b"\n");
             });
-            let _ = trona::invoke::vspace_unmap(self_vspace, scratch_vaddr);
-            let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
+            let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
             reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         }
-        if version != TRONA_PROCMGR_DEFS_VERSION {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] register_service_defs: version mismatch got=");
-                _lb.hex(version as u64);
-                _lb.str(b" want=");
-                _lb.hex(TRONA_PROCMGR_DEFS_VERSION as u64);
-                _lb.str(b"\n");
+        let chunk_idx = if (flags & TRONA_SERVICE_DEFS_FLAG_FIRST) != 0 {
+            reset_service_registry();
+            0
+        } else {
+            ptr::read_volatile(&raw const SERVICE_REGISTRY_CHUNK_COUNT)
+        };
+        if chunk_idx == 0 && (flags & TRONA_SERVICE_DEFS_FLAG_FIRST) == 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] register_service_defs: first chunk missing FIRST flag\n");
             });
-            let _ = trona::invoke::vspace_unmap(self_vspace, scratch_vaddr);
-            let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
+            let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
             reply.label = crate::TRONA_INVALID_ARGUMENT;
-            return;
-        }
-        if count as usize > MAX_PROCMGR_SERVICE_DEFS {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] register_service_defs: count=");
-                _lb.dec(count as u64);
-                _lb.str(b" exceeds max=");
-                _lb.dec(MAX_PROCMGR_SERVICE_DEFS as u64);
-                _lb.str(b"\n");
-            });
-            let _ = trona::invoke::vspace_unmap(self_vspace, scratch_vaddr);
-            let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
-            reply.label = crate::TRONA_OUT_OF_RANGE;
             return;
         }
 
-        // Bounds-check: header + count*sizeof(def) ≤ FRAME_SIZE.
-        let entry_size = core::mem::size_of::<TronaProcmgrServiceDefV1>();
-        let header_size = core::mem::size_of::<TronaProcmgrServiceDefsV1>();
-        let total = header_size + (count as usize) * entry_size;
+        let header_size = core::mem::size_of::<TronaServiceDefs>();
+        let service_size = core::mem::size_of::<TronaServiceDef>();
+        let attachment_size = core::mem::size_of::<TronaServiceAttachment>();
+        let total = header_size
+            + (service_count as usize) * service_size
+            + (attachment_count as usize) * attachment_size;
         if total > FRAME_SIZE {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_service_defs: payload ");
                 _lb.dec(total as u64);
                 _lb.str(b" exceeds frame size\n");
             });
-            let _ = trona::invoke::vspace_unmap(self_vspace, scratch_vaddr);
-            let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
+            let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
             reply.label = crate::TRONA_OUT_OF_RANGE;
             return;
         }
 
-        let entries_src =
-            (scratch_vaddr as *const u8).add(header_size) as *const TronaProcmgrServiceDefV1;
-        let dst_base = &raw mut SERVICE_REGISTRY as *mut TronaProcmgrServiceDefV1;
-        for i in 0..count as usize {
-            let entry = ptr::read_volatile(entries_src.add(i));
-            ptr::write_volatile(dst_base.add(i), entry);
+        let services = service_defs_ptr(header as *mut TronaServiceDefs);
+        for i in 0..(service_count as usize) {
+            let entry = services.add(i);
+            let name_len = ptr::read_volatile(&raw const (*entry).name_len) as usize;
+            if name_len == 0 || name_len > MAX_REQUIRE_PROVIDER {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] register_service_defs: invalid service name length\n");
+                });
+                let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
+                reply.label = crate::TRONA_INVALID_ARGUMENT;
+                return;
+            }
+            let name = &(&(*entry).name)[..name_len];
+            let start = ptr::read_volatile(&raw const (*entry).attachment_start) as usize;
+            let count = ptr::read_volatile(&raw const (*entry).attachment_count) as usize;
+            if start > (attachment_count as usize)
+                || start.saturating_add(count) > (attachment_count as usize)
+            {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] register_service_defs: bad attachment span for ");
+                    _lb.bytes(name);
+                    _lb.str(b"\n");
+                });
+                let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
+                reply.label = crate::TRONA_INVALID_ARGUMENT;
+                return;
+            }
+            let attachments =
+                attachments_ptr(header as *mut TronaServiceDefs, service_count as usize);
+            for attachment_i in 0..count {
+                let attachment = &*attachments.add(start + attachment_i);
+                if let Err(err) = validate_registry_attachment(name, attachment) {
+                    let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+                    let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
+                    reply.label = err;
+                    return;
+                }
+            }
         }
-        ptr::write_volatile(&raw mut SERVICE_REGISTRY_COUNT, count);
+        seed_bootstrap_provider_slots(services, service_count as usize);
 
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[PROCMGR] service registry installed: ");
-            _lb.dec(count as u64);
-            _lb.str(b" defs\n");
+        let chunk_vaddr = service_registry_chunk_vaddr(chunk_idx);
+        let persist_map_err = trona_kernel::invoke::vspace_map(
+            self_vspace,
+            frame_cap,
+            chunk_vaddr,
+            crate::VSPACE_FLAG_WRITABLE | crate::VSPACE_FLAG_USER,
+        );
+        if persist_map_err != 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] register_service_defs: persistent map err=");
+                _lb.hex(persist_map_err as u64);
+                _lb.str(b"\n");
+            });
+            let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
+            reply.label = crate::TRONA_INVALID_OPERATION;
+            return;
+        }
+        let _ = trona_kernel::invoke::vspace_unmap(self_vspace, scratch_vaddr);
+
+        ptr::write_volatile(&raw mut SERVICE_REGISTRY_CHUNK_COUNT, chunk_idx + 1);
+        let total_entries = ptr::read_volatile(&raw const SERVICE_REGISTRY_ENTRY_COUNT);
+        let total_attachments = ptr::read_volatile(&raw const SERVICE_REGISTRY_ATTACHMENT_COUNT);
+        ptr::write_volatile(
+            &raw mut SERVICE_REGISTRY_ENTRY_COUNT,
+            total_entries.saturating_add(service_count),
+        );
+        ptr::write_volatile(
+            &raw mut SERVICE_REGISTRY_ATTACHMENT_COUNT,
+            total_attachments.saturating_add(attachment_count),
+        );
+
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[PROCMGR] service registry chunk installed: idx=");
+            _lb.dec(chunk_idx as u64);
+            _lb.str(b" defs=");
+            _lb.dec(service_count as u64);
+            _lb.str(b" attachments=");
+            _lb.dec(attachment_count as u64);
+            _lb.str(b" total=");
+            _lb.dec((total_entries + service_count) as u64);
+            if (flags & TRONA_SERVICE_DEFS_FLAG_FIRST) != 0 {
+                _lb.str(b" first");
+            }
+            if (flags & trona_kernel::core_types::core::TRONA_SERVICE_DEFS_FLAG_LAST) != 0 {
+                _lb.str(b" last");
+            }
+            _lb.str(b"\n");
         });
 
-        let _ = trona::invoke::vspace_unmap(self_vspace, scratch_vaddr);
-        let _ = trona::invoke::cnode_delete(self_cspace, frame_cap);
+        let _ = trona_kernel::invoke::cnode_delete(self_cspace, frame_cap);
         reply.label = crate::TRONA_OK;
     }
 }
@@ -621,10 +832,9 @@ pub unsafe fn handle_register_service_defs(_msg: &TronaMsg, reply: &mut TronaMsg
 /// - `msg.regs[0]`   = `name_len` (bytes)
 /// - `msg.regs[1..]` = packed provider name bytes (NUL-padded into u64 words)
 ///
-/// Procmgr allocates a fresh slot in `[PROVIDER_SLOT_BASE,
-/// PROVIDER_SLOT_LIMIT)`, copies the cap from `CAP_RECV_SCRATCH` to that
-/// slot, deletes the scratch slot, and registers `(name, slot)` in
-/// `PROVIDER_REGISTRY`.
+/// Procmgr allocates a fresh CSpace slot from its allocator, moves the cap
+/// from `CAP_RECV_SCRATCH` to that slot, and records the slot in the
+/// streamed service registry entry for `name`.
 ///
 /// The slot persists for the rest of procmgr's lifetime so future
 /// `cnode_mint` derivations (per-consumer badge) work without re-receiving
@@ -636,12 +846,12 @@ pub unsafe fn handle_register_provider(msg: &TronaMsg, reply: &mut TronaMsg) {
 
         let name_len = msg.regs[0] as usize;
         if name_len == 0 || name_len > MAX_REQUIRE_PROVIDER {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_provider: invalid name_len=");
                 _lb.dec(name_len as u64);
                 _lb.str(b"\n");
             });
-            let _ = trona::invoke::cnode_delete(self_cspace, scratch);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, scratch);
             reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         }
@@ -657,16 +867,20 @@ pub unsafe fn handle_register_provider(msg: &TronaMsg, reply: &mut TronaMsg) {
         // bootstrap provider), drop the just-received cap and report OK.
         // Init re-registers everything indiscriminately, so this is the
         // common case for namesrv/vfs/mmsrv/rsrcsrv.
-        if lookup_provider(&name[..name_len]).is_some() {
-            if refresh_bootstrap_provider_from_scratch(&name[..name_len]) {
-                trona::uinfo!(|_lb| {
+        if let Some(existing_slot) = lookup_provider(&name[..name_len]) {
+            if existing_slot != 0
+                && is_bootstrap_provider_slot(existing_slot)
+                && refresh_provider_slot_from_scratch(&name[..name_len], existing_slot)
+            {
+                publish_well_known_provider(&name[..name_len], existing_slot);
+                trona_runtime::uinfo!(|_lb| {
                     _lb.str(b"[PROCMGR] register_provider: refreshed bootstrap ");
                     _lb.bytes(&name[..name_len]);
                     _lb.str(b" slot\n");
                 });
             } else {
-                let _ = trona::invoke::cnode_delete(self_cspace, scratch);
-                trona::udebug!(|_lb| {
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, scratch);
+                trona_runtime::udebug!(|_lb| {
                     _lb.str(b"[PROCMGR] register_provider: ");
                     _lb.bytes(&name[..name_len]);
                     _lb.str(b" already registered, ignoring duplicate\n");
@@ -680,33 +894,35 @@ pub unsafe fn handle_register_provider(msg: &TronaMsg, reply: &mut TronaMsg) {
         // receive scratch slot. Using `cnode_copy` here leaves a CDT child
         // behind, so deleting `CAP_RECV_SCRATCH` would not actually free the
         // slot for the next cap-transfer IPC.
-        let provider_slot = match alloc_provider_slot() {
+        let provider_slot = match (&mut *(&raw mut crate::ALLOCATOR)).alloc_single_slot() {
             Some(s) => s,
             None => {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[PROCMGR] register_provider: provider slot range exhausted\n");
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] register_provider: allocator exhausted\n");
                 });
-                let _ = trona::invoke::cnode_delete(self_cspace, scratch);
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, scratch);
                 reply.label = crate::TRONA_OUT_OF_MEMORY;
                 return;
             }
         };
 
-        let move_err = trona::invoke::cnode_move(self_cspace, provider_slot, self_cspace, scratch);
+        let move_err =
+            trona_kernel::invoke::cnode_move(self_cspace, provider_slot, self_cspace, scratch);
         if move_err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_provider: cnode_move err=");
                 _lb.hex(move_err as u64);
                 _lb.str(b"\n");
             });
-            let _ = trona::invoke::cnode_delete(self_cspace, scratch);
+            let _ = trona_kernel::invoke::cnode_delete(self_cspace, scratch);
             reply.label = crate::TRONA_INVALID_OPERATION;
             return;
         }
 
         match register_provider(&name[..name_len], provider_slot) {
             RegisterOutcome::Added => {
-                trona::uinfo!(|_lb| {
+                publish_well_known_provider(&name[..name_len], provider_slot);
+                trona_runtime::uinfo!(|_lb| {
                     _lb.str(b"[PROCMGR] register_provider: ");
                     _lb.bytes(&name[..name_len]);
                     _lb.str(b" -> slot ");
@@ -719,11 +935,11 @@ pub unsafe fn handle_register_provider(msg: &TronaMsg, reply: &mut TronaMsg) {
                 // Race against an internal register_provider call between
                 // our lookup_provider above and now. Free the speculative
                 // copy and report OK.
-                let _ = trona::invoke::cnode_delete(self_cspace, provider_slot);
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, provider_slot);
                 reply.label = crate::TRONA_OK;
             }
             RegisterOutcome::Failed => {
-                let _ = trona::invoke::cnode_delete(self_cspace, provider_slot);
+                let _ = trona_kernel::invoke::cnode_delete(self_cspace, provider_slot);
                 reply.label = crate::TRONA_OUT_OF_MEMORY;
             }
         }

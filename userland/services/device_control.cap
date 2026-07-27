@@ -1,0 +1,5 @@
+[Unit]
+Name=device_control.cap
+
+[Capability]
+SourceSlot=24

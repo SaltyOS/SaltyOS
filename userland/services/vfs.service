@@ -1,15 +1,34 @@
 [Service]
 Name=vfs
 Binary=/bin/vfs
-Type=notify
+Type=broker
 Restart=always
-PreProcmgr=yes
 
 [Dependencies]
 After=console namesrv mmsrv
-Before=test_runner
+Before=test_runner posix_ttysrv netsrv
+Requires=namesrv.socket mmsrv.socket initrd_untyped.cap
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-CreateEP=63
-CopyCap=13:66 138:68 137:72
-NeedEP=console:64 namesrv:65 posix_ttysrv:67 mmsrv:69:badge procmgr:70 netsrv:71
+ProvidesInterface=process-client
+InterfaceRole=process-client:ROLE_VFS_CLIENT
+InterfaceFlags=process-client:clone,exec,drop
+Exports=backend_callback
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

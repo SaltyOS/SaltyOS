@@ -11,7 +11,7 @@ subdir = openssl-${version}
 sha256 = 002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3
 
 [depends]
-build = perl
+build = perl >= 5.40
 
 [build]
 type = custom
@@ -21,6 +21,7 @@ cd ${SRCDIR}
 if [ "${ARCH}" = "aarch64" ]; then OPENSSL_TARGET="linux-aarch64"; else OPENSSL_TARGET="linux-x86_64-clang"; fi
 perl ./Configure $OPENSSL_TARGET \
     --prefix=/usr \
+    --libdir=lib \
     --openssldir=/etc/ssl \
     no-shared \
     no-asm \
@@ -36,6 +37,12 @@ perl ./Configure $OPENSSL_TARGET \
     AR="${AR}" \
     RANLIB="${RANLIB}"
 
-[install]
-libcrypto.a = libcrypto.a
-libssl.a = libssl.a
+[stage]
+mode = script
+commands =
+    make install_sw DESTDIR=${STAGE} -j${NPROC}
+
+[stage.exclude]
+usr/share/man
+usr/share/doc
+usr/bin/c_rehash

@@ -23,5 +23,9 @@ ac_cv_func_mempcpy = no
 ac_cv_func_strlcpy = yes
 ac_cv_func_strrchrnul = no
 
-[install]
-bin/nasm = nasm
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/man
+usr/share/doc

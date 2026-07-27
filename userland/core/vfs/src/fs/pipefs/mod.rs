@@ -1,70 +1,57 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! pipefs — Win32 named pipe filesystem.
+//
+//! pipefs — named-pipe filesystem for the Win32 `\\.\pipe\`
+//! namespace.
 //!
-//! Exposes the `\\.\pipe\` namespace used by Win32 `CreateNamedPipe` /
-//! `ConnectNamedPipe`. Pipes created here are visible only to Win32
-//! processes via `namei_win32`.
-//!
-//! The filesystem uses a static pool of `NamedPipeSlot` entries for
-//! namespace management. Actual data transfer is delegated to the
-//! existing anonymous pipe infrastructure in `crate::fileops::pipe`.
-//!
-//! Vnodes are allocated from the global `Arena<Vnode>`. The mount data
-//! stores parallel arrays of `VnodeHandle` and `u64` (vnode id) for
+//! Static pool of `NamedPipeSlot` entries for the namespace; data
+//! transfer is delegated to `posix/pipe`'s anonymous-pipe arena.
+//! Vnodes live in the central `VfsState.vnodes`; per-mount state
+//! stores parallel arrays of `(VnodeHandle, vnode_id, vdata)` for
 //! handle-based lookup by id.
 
 pub(crate) mod types;
 mod vfsops;
 mod vops;
 
-use crate::vfs_core::error::VfsResult;
-use crate::vfs_core::vfs::{register_fs_type, VfsOps};
-use crate::vfs_core::vnode::VnodeHandle;
-use crate::vfs_core::vop::VopVector;
+use crate::arena::handle::Handle;
+use crate::core::pipe::PipeState;
+use crate::core::vnode::VnodeHandle;
+use crate::core::vop::{
+    DATA_OPS_DEFAULT, META_OPS_DEFAULT, VfsOps, VopDataOps, VopMetaOps, VopVector,
+};
 
-use types::{NamedPipeSlot, MAX_NAMED_PIPES};
+use types::{MAX_NAMED_PIPES, NamedPipeSlot};
 
 // =========================================================================
 // PipefsMountData — per-mount backend data
 // =========================================================================
 
-/// Maximum vnodes: 1 root dir + MAX_NAMED_PIPES pipe entries.
+/// Maximum vnodes: 1 root dir + `MAX_NAMED_PIPES` pipe entries.
 pub(crate) const MAX_PIPEFS_VNODES: usize = 1 + MAX_NAMED_PIPES;
 
-/// Per-mount state for pipefs.
-///
-/// Vnodes live in the global arena. This struct stores parallel arrays of
-/// handles and ids for reverse lookup.
+/// Per-mount state for pipefs. Vnodes live in the global arena;
+/// this struct stores parallel arrays of handles and ids for
+/// reverse lookup.
 #[repr(C)]
 pub(crate) struct PipefsMountData {
-    /// Handle to each vnode allocated for this mount.
     pub(crate) vnode_handles: [VnodeHandle; MAX_PIPEFS_VNODES],
-    /// Backend-assigned id for each vnode (parallel to `vnode_handles`).
     pub(crate) vnode_ids: [u64; MAX_PIPEFS_VNODES],
-    /// Parallel array of vnode-private data.
     pub(crate) vdata: [PipefsVnodeData; MAX_PIPEFS_VNODES],
-    /// Named pipe slot pool.
     pub(crate) slots: [NamedPipeSlot; MAX_NAMED_PIPES],
-    /// Number of vnodes currently populated (next allocation index).
     pub(crate) count: usize,
-    /// Monotonic id counter for new vnodes.
     pub(crate) next_id: u64,
 }
 
-// PipefsMountData is allocated via map_anon + write_bytes (zero-init).
-// VnodeHandle::INVALID has an all-ones representation for the slot field,
-// but zero-init produces slot=0/gen=0 which is also invalid (gen 0 is
-// never issued by the arena). So zero-init is safe for the handle arrays.
+// PipefsMountData is allocated via `map_anon` + `write_bytes` so a
+// zero-init image is valid. `Handle::INVALID` is the all-ones slot
+// pattern, but `slot=0/epoch=0` (the zero pattern) also fails the
+// generation check, so a fresh page reads back as all-stale slots
+// — matching the `count = 0` invariant.
 
-// =========================================================================
-// PipefsVnodeData — per-vnode backend data
-// =========================================================================
-
-/// Backend-private data hung off `Vnode.data` for pipefs vnodes.
 #[repr(C)]
 pub(crate) struct PipefsVnodeData {
-    /// Index into `PipefsMountData.slots` for pipe vnodes.
-    /// Unused (u32::MAX) for the root directory vnode.
+    /// Index into `PipefsMountData.slots` for pipe vnodes;
+    /// `u32::MAX` for the root directory.
     pub(crate) slot_idx: u32,
     /// `1` if this is the root directory vnode.
     pub(crate) is_root: u8,
@@ -80,51 +67,90 @@ impl PipefsVnodeData {
 }
 
 // =========================================================================
-// Mount-data helpers (used by vops)
+// Mount-data helpers
 // =========================================================================
 
-/// Find a free vdata slot and return its index.
 pub(super) unsafe fn alloc_vdata_slot(md: *mut PipefsMountData) -> Option<usize> {
     unsafe {
         let count = (*md).count;
         if count >= MAX_PIPEFS_VNODES {
             return None;
         }
-        let idx = count;
-        (*md).count = count + 1;
-        Some(idx)
+        Some(count)
     }
 }
 
-/// Record a vnode handle and id in the mount data arrays.
-pub(super) unsafe fn record_vnode(md: *mut PipefsMountData, vh: VnodeHandle, id: u64) {
+pub(super) unsafe fn record_vnode(md: *mut PipefsMountData, vnode_h: VnodeHandle, id: u64) {
     unsafe {
-        // The slot was already allocated by alloc_vdata_slot, so count-1 is
-        // the index of the most recently allocated entry.
-        let idx = (*md).count - 1;
-        (*md).vnode_handles[idx] = vh;
+        let idx = (*md).count;
+        (*md).vnode_handles[idx] = vnode_h;
         (*md).vnode_ids[idx] = id;
+        (*md).count = idx + 1;
     }
 }
 
-// =========================================================================
-// Static VfsOps / VopVector
-// =========================================================================
-
-pub(crate) static PIPEFS_VFSOPS: VfsOps = vfsops::PIPEFS_VFSOPS;
-pub(crate) static PIPEFS_VOPS: VopVector = vops::PIPEFS_VOPS;
-
-// =========================================================================
-// Registration
-// =========================================================================
-
-/// Register the `pipefs` filesystem type. Called during VFS bootstrap Stage 2.
-pub(crate) unsafe fn register() -> VfsResult<()> {
+#[allow(dead_code)]
+pub(super) unsafe fn lookup_handle(md: *mut PipefsMountData, id: u64) -> VnodeHandle {
     unsafe {
-        register_fs_type(
-            b"pipefs",
-            &raw const PIPEFS_VFSOPS,
-            &raw const PIPEFS_VOPS,
-        )
+        for j in 0..(*md).count {
+            if (*md).vnode_ids[j] == id && (*md).vnode_handles[j].is_valid() {
+                return (*md).vnode_handles[j];
+            }
+        }
+        VnodeHandle::INVALID
     }
 }
+
+// =========================================================================
+// Static dispatch tables
+// =========================================================================
+
+pub(crate) static PIPEFS_VOPS: VopVector = VopVector {
+    meta: VopMetaOps {
+        lookup: vops::pipefs_lookup,
+        lookup_ci: vops::pipefs_lookup,
+        create: vops::pipefs_create,
+        mkdir: META_OPS_DEFAULT.mkdir,
+        symlink: META_OPS_DEFAULT.symlink,
+        mkfifo: META_OPS_DEFAULT.mkfifo,
+        unlink: vops::pipefs_unlink,
+        rmdir: META_OPS_DEFAULT.rmdir,
+        link: META_OPS_DEFAULT.link,
+        rename: META_OPS_DEFAULT.rename,
+        open: vops::pipefs_open,
+        close: vops::pipefs_close,
+        getattr: vops::pipefs_getattr,
+        setattr: META_OPS_DEFAULT.setattr,
+        access: vops::pipefs_access,
+        readlink: META_OPS_DEFAULT.readlink,
+        truncate: META_OPS_DEFAULT.truncate,
+        data_size: META_OPS_DEFAULT.data_size,
+        inactive: vops::pipefs_inactive,
+    },
+    data: VopDataOps {
+        read: vops::pipefs_read,
+        write: vops::pipefs_write,
+        writeback: vops::pipefs_write,
+        fsync: DATA_OPS_DEFAULT.fsync,
+        readdir: vops::pipefs_readdir,
+        statfs: vops::pipefs_statfs,
+        getxattr: DATA_OPS_DEFAULT.getxattr,
+        setxattr: DATA_OPS_DEFAULT.setxattr,
+        listxattr: DATA_OPS_DEFAULT.listxattr,
+        removexattr: DATA_OPS_DEFAULT.removexattr,
+        ioctl: DATA_OPS_DEFAULT.ioctl,
+        mmap_get_page: DATA_OPS_DEFAULT.mmap_get_page,
+    },
+};
+
+pub(crate) static PIPEFS_VFSOPS: VfsOps = VfsOps {
+    mount: vfsops::pipefs_mount,
+    unmount: vfsops::pipefs_unmount,
+    root: vfsops::pipefs_root,
+    vget: vfsops::pipefs_vget,
+    statfs: vfsops::pipefs_statfs,
+    sync: vfsops::pipefs_sync,
+};
+
+#[allow(dead_code)]
+const _PIPE_HANDLE_TYPE: Option<Handle<PipeState>> = None;

@@ -2,12 +2,13 @@
 //! Ported from userland/mmap_test/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
-use trona::serial::LineBuf;
+use trona_kernel::uapi;
 use trona_posix;
+use trona_posix::consts::*;
 use trona_posix::mm as posix_mm;
+use trona_runtime::client::mm as runtime_mm;
+use trona_runtime::debug::serial;
+use trona_runtime::debug::serial::LineBuf;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -21,7 +22,7 @@ fn ensure_tmp_dir() -> bool {
 pub fn run() -> bool {
     puts(b"[TEST_MMAP] Starting memory management tests\n");
 
-    // posix_mm reads mmsrv via trona::caps::mmsrv_ep() now — no explicit
+    // posix_mm reads mmsrv via trona_runtime::client::caps::mmsrv_ep() now — no explicit
     // init call needed here.
 
     // Test 1: sbrk
@@ -166,6 +167,61 @@ pub fn run() -> bool {
         posix_mm::posix_munmap(p2, 8192);
     }
 
+    // Test 4b: munmap over multiple regions and holes
+    puts(b"[TEST_MMAP] Test 4b: munmap multi-region and hole ranges\n");
+    let multi = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            8192,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if multi as usize == usize::MAX {
+        puts(b"[TEST_MMAP] FAIL: multi-region setup mmap failed\n");
+        return false;
+    }
+    if unsafe { posix_mm::posix_mprotect(multi.add(4096), 4096, PROT_READ) } != 0 {
+        puts(b"[TEST_MMAP] FAIL: split mprotect for multi-region munmap failed\n");
+        unsafe {
+            posix_mm::posix_munmap(multi, 8192);
+        }
+        return false;
+    }
+    if unsafe { posix_mm::posix_munmap(multi, 8192) } != 0 {
+        puts(b"[TEST_MMAP] FAIL: munmap spanning adjacent regions failed\n");
+        return false;
+    }
+
+    let holed = unsafe {
+        posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            12288,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if holed as usize == usize::MAX {
+        puts(b"[TEST_MMAP] FAIL: holed-range setup mmap failed\n");
+        return false;
+    }
+    if unsafe { posix_mm::posix_munmap(holed.add(4096), 4096) } != 0 {
+        puts(b"[TEST_MMAP] FAIL: middle-page munmap for holed range failed\n");
+        unsafe {
+            posix_mm::posix_munmap(holed, 12288);
+        }
+        return false;
+    }
+    if unsafe { posix_mm::posix_munmap(holed, 12288) } != 0 {
+        puts(b"[TEST_MMAP] FAIL: munmap spanning hole failed\n");
+        return false;
+    }
+    puts(b"[TEST_MMAP] PASS: munmap multi-region and holes OK\n");
+
     // Test 5: file-backed lazy page-in
     puts(b"[TEST_MMAP] Test 5: file-backed mmap lazy page-in\n");
     if !ensure_tmp_dir() {
@@ -306,6 +362,45 @@ pub fn run() -> bool {
         core::ptr::write_volatile(fixed_base, 0x5A);
     }
 
+    let noreplace = unsafe {
+        runtime_mm::mmap(
+            fixed_base,
+            4096,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+            fd,
+            0,
+        )
+    };
+    match noreplace {
+        Err(label) if label == uapi::KERNITE_ERR_ALREADY_MAPPED as u64 => {}
+        Err(_) => {
+            puts(b"[TEST_MMAP] FAIL: MAP_FIXED_NOREPLACE collision did not return EEXIST\n");
+            unsafe {
+                posix_mm::posix_munmap(fixed_base, 4096);
+                trona_posix::posix_close(fd);
+            }
+            return false;
+        }
+        Ok(mapped) => {
+            puts(b"[TEST_MMAP] FAIL: MAP_FIXED_NOREPLACE collision unexpectedly mapped\n");
+            unsafe {
+                posix_mm::posix_munmap(mapped, 4096);
+                trona_posix::posix_close(fd);
+            }
+            return false;
+        }
+    }
+    unsafe {
+        if core::ptr::read_volatile(fixed_base) != 0x5A {
+            puts(b"[TEST_MMAP] FAIL: MAP_FIXED_NOREPLACE disturbed existing mapping\n");
+            posix_mm::posix_munmap(fixed_base, 4096);
+            trona_posix::posix_close(fd);
+            return false;
+        }
+    }
+    puts(b"[TEST_MMAP] PASS: MAP_FIXED_NOREPLACE collision returned EEXIST\n");
+
     let replaced = unsafe {
         posix_mm::posix_mmap(fixed_base, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0)
     };
@@ -413,7 +508,7 @@ pub fn run() -> bool {
 
     let mid = unsafe {
         posix_mm::posix_mmap(
-            unsafe { span.add(4096) },
+            span.add(4096),
             4096,
             PROT_READ,
             MAP_PRIVATE | MAP_FIXED,

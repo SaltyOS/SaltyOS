@@ -77,9 +77,17 @@ def append_cpio_entry(archive, ino, name, data, mode=0o100644, uid=0, gid=0):
     archive.extend(b'\x00' * pad_data)
 
 
-def should_page_align_entry(name, exts):
+def should_page_align_entry(name, exts, data):
     lower = name.lower()
-    return any(lower.endswith(ext) for ext in exts)
+    if any(lower.endswith(ext) for ext in exts):
+        return True
+    if data.startswith(b'\x7fELF') or data.startswith(b'MZ'):
+        return True
+    # Executables usually live in bin/ but may carry no extension. The boot
+    # loader backs code MemoryObjects with the initrd frames at the file's offset
+    # (mo_populate_borrowed), which requires that offset to be page-aligned.
+    stripped = lower.lstrip('/')
+    return stripped.startswith('bin/')
 
 
 def calc_next_data_start(archive_len, name):
@@ -139,9 +147,11 @@ def create_cpio_archive(entries, output_path, page_align_exts, permissions=None)
     pad_idx = 0
 
     for name, filepath in entries:
-        # For ELF/shared objects, align entry data start to 4KB so rtld can
-        # use direct page-granularity map_device without per-page copies.
-        if should_page_align_entry(name, page_align_exts):
+        data = filepath.read_bytes()
+
+        # Code payload data starts must be page-aligned because init can mint
+        # borrowed-frames code MemoryObjects directly over initrd bytes.
+        if should_page_align_entry(name, page_align_exts, data):
             next_data_start = calc_next_data_start(len(archive), name)
             if (next_data_start % DEFAULT_PAGE_ALIGN) != 0:
                 pad_name = f".pad/{pad_idx:04d}"
@@ -153,8 +163,6 @@ def create_cpio_archive(entries, output_path, page_align_exts, permissions=None)
                 append_cpio_entry(archive, ino, pad_name, b'\x00' * pad_payload)
                 ino += 1
                 pad_idx += 1
-
-        data = filepath.read_bytes()
 
         # Look up permissions: try the name as-is, then with leading '/'
         lookup_name = name if name.startswith('/') else '/' + name
@@ -234,7 +242,7 @@ def main():
     parser.add_argument(
         '--page-align-extensions',
         default=','.join(DEFAULT_PAGE_ALIGN_EXTENSIONS),
-        help='Comma-separated suffixes that should have 4KB-aligned data starts (default: .elf,.so)'
+        help='Comma-separated suffixes that should have 4KB-aligned data starts (default: .elf,.so,.dll)'
     )
     parser.add_argument(
         '--permissions',

@@ -768,7 +768,7 @@ three is deferred to the multi-user auth work.
 ### Set / Get / Remove / List
 
 All four operations are exposed as server labels
-`SALTYFS_{GET,SET,REMOVE,LIST}XATTR` (23..26) and exchange name/value
+`BACKEND_{GET,SET,REMOVE,LIST}XATTR` (23..26) and exchange name/value
 bytes over the VFS shared-memory channel (`VFS_SHM_VADDR`). See
 `userland/drivers/filesystems/saltyfs/src/xattr.rs` for the exact IPC
 register layout and the full rollback matrix (hidden-inode allocation,
@@ -825,7 +825,7 @@ The script is deterministic. Both the Unicode source
 
 ## Multi-user inbound protocol (V2)
 
-`SALTYFS_CREATE`, `SALTYFS_MKDIR`, and `SALTYFS_SYMLINK` understand two
+`BACKEND_CREATE`, `BACKEND_MKDIR`, and `BACKEND_SYMLINK` understand two
 register layouts distinguished by **bit 63 of `regs[0]`**
 (`SALTYFS_PROTO_V2`):
 
@@ -844,7 +844,7 @@ collision-free.
 
 ### Stat-merged lookup / readdir
 
-`SALTYFS_LOOKUP` and `SALTYFS_READDIR` replies now carry inode metadata
+`BACKEND_LOOKUP` and `BACKEND_READDIR` replies now carry inode metadata
 inline, eliminating the "one extra STAT per directory entry" round-trip
 pattern:
 
@@ -854,6 +854,25 @@ pattern:
   (`VFS_SHM_VADDR`), one record per entry, carrying the same stat
   metadata plus a 44-byte NUL-padded name. See `READDIR_ENTRY_BYTES` /
   `READDIR_NAME_MAX` in `handlers.rs` for the byte layout.
+
+## Backend callback contract
+
+`handle_mount` (IPC label `BACKEND_OPEN_SESSION = 1`) requests carry exactly
+one extra capability transfer — `extra_caps[0] = VFS backend_callback EP`.
+SaltyFS captures this slot unconditionally at dispatch time into
+`BACKEND_CALLBACK_EP`; any previously stored cap is `cnode_delete`-ed before
+replacement so a VFS restart cannot leave SaltyFS holding a dead endpoint.
+The captured slot is produced by the substrate helper
+`trona::recv_slot::capture_transferred_cap` after the per-saltyfs receive
+arena delivers the cap to `CURRENT_RECV_SLOT`.
+
+Every correlated async completion path (`emit_server_reply` in `main.rs`,
+`build_open_session_completion` / `build_read_blocks_completion` in
+`worker.rs`) routes replies through this EP. `emit_server_reply` checks
+the `ipc::send_ctx` return value and loud-logs on failure; a missing cap
+at completion time is an invariant violation that indicates a VFS-side
+protocol bug. The full wire contract lives in
+`lib/trona/uapi/protocol/fs_backend.rs`.
 
 ## Read-only mount
 

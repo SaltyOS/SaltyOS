@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Generate a compact kallsyms blob for Kernite."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import subprocess
+
+MAGIC = 0x4B_53_59_4D  # KSYM
+VERSION = 1
+ENTRY_SIZE = 24
+
+KIND_UNKNOWN = 0
+KIND_TEXT = 1
+KIND_RODATA = 2
+KIND_DATA = 3
+KIND_BSS = 4
+KIND_ABSOLUTE = 5
+
+
+def sym_kind(type_char: str, name: str) -> int:
+    t = type_char.upper()
+    if t in {"T", "W"}:
+        return KIND_TEXT
+    if t == "R":
+        return KIND_RODATA
+    if t == "D":
+        return KIND_DATA
+    if t == "B":
+        return KIND_BSS
+    if t == "A":
+        return KIND_ABSOLUTE
+    if name.startswith("_text") or ".text" in name:
+        return KIND_TEXT
+    if name.startswith("_rodata"):
+        return KIND_RODATA
+    if name.startswith("_data"):
+        return KIND_DATA
+    if name.startswith("_bss"):
+        return KIND_BSS
+    return KIND_UNKNOWN
+
+
+def keep_symbol(name: str, kind: int) -> bool:
+    if not name:
+        return False
+    if name.startswith("$"):
+        return False
+    if name.startswith(".L"):
+        return False
+    if name in {"_DYNAMIC", "_GLOBAL_OFFSET_TABLE_"}:
+        return False
+    return kind in {KIND_TEXT, KIND_RODATA, KIND_DATA, KIND_BSS, KIND_ABSOLUTE}
+
+
+def parse_nm(path: pathlib.Path) -> list[dict[str, int | str]]:
+    entries: list[dict[str, int | str]] = []
+    line_re = re.compile(
+        r"^(?P<name>\S+)\s+(?P<type>[A-Za-z?])\s+(?P<addr>[0-9A-Fa-f]+)(?:\s+(?P<size>[0-9A-Fa-f]+))?"
+    )
+    for line in path.read_text(errors="replace").splitlines():
+        m = line_re.match(line.strip())
+        if not m:
+            continue
+        name = m.group("name")
+        kind = sym_kind(m.group("type"), name)
+        if not keep_symbol(name, kind):
+            continue
+        size = int(m.group("size"), 16) if m.group("size") else 0
+        entries.append(
+            {
+                "name": name,
+                "display_name": name,
+                "addr": int(m.group("addr"), 16),
+                "size": size,
+                "kind": kind,
+            }
+        )
+
+    entries.sort(key=lambda e: (int(e["addr"]), str(e["name"])))
+    dedup: list[dict[str, int | str]] = []
+    last_addr = None
+    seen_at_addr: set[str] = set()
+    for e in entries:
+        addr = int(e["addr"])
+        if addr != last_addr:
+            seen_at_addr.clear()
+            last_addr = addr
+        name = str(e["name"])
+        if name in seen_at_addr:
+            continue
+        seen_at_addr.add(name)
+        dedup.append(e)
+
+    for i, e in enumerate(dedup):
+        if int(e["size"]) != 0:
+            continue
+        addr = int(e["addr"])
+        kind = int(e["kind"])
+        for j in range(i + 1, len(dedup)):
+            nxt = dedup[j]
+            if int(nxt["kind"]) == kind and int(nxt["addr"]) > addr:
+                e["size"] = int(nxt["addr"]) - addr
+                break
+    return dedup
+
+
+def demangle_entries(entries: list[dict[str, int | str]], demangler: str | None) -> None:
+    if demangler is None:
+        return
+    if not entries:
+        return
+
+    names = [str(e["name"]) for e in entries]
+    proc = subprocess.run(
+        [demangler],
+        input="\n".join(names) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"{demangler}: failed to demangle kallsyms input: {proc.stderr.strip()}"
+        )
+
+    demangled = proc.stdout.splitlines()
+    if len(demangled) != len(names):
+        raise SystemExit(
+            f"{demangler}: produced {len(demangled)} symbols for {len(names)} inputs"
+        )
+    for e, display in zip(entries, demangled, strict=True):
+        if display:
+            e["display_name"] = display
+
+
+def asm_quote(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--nm", required=True)
+    p.add_argument("--sections", required=True)
+    p.add_argument("--virt-base", default="0")
+    p.add_argument("--demangler")
+    p.add_argument("--output", required=True)
+    args = p.parse_args()
+
+    entries = parse_nm(pathlib.Path(args.nm))
+    demangle_entries(entries, args.demangler)
+    virt_base = int(args.virt_base, 0)
+    for e in entries:
+        if int(e["kind"]) in {KIND_TEXT, KIND_RODATA, KIND_DATA, KIND_BSS}:
+            e["addr"] = int(e["addr"]) + virt_base
+
+    strings = bytearray()
+    offsets: dict[str, int] = {}
+    for e in entries:
+        display_name = str(e["display_name"])
+        offsets[display_name] = len(strings)
+        strings.extend(display_name.encode("utf-8", "replace"))
+        strings.append(0)
+
+    out = pathlib.Path(args.output)
+    with out.open("w") as f:
+        f.write("/* Generated by tools/kernite-kallsyms.py. */\n")
+        f.write(".section .kallsyms.header,\"a\"\n")
+        f.write(".balign 8\n")
+        f.write(f"    .long 0x{MAGIC:08x}\n")
+        f.write(f"    .short {VERSION}\n")
+        f.write(f"    .short {ENTRY_SIZE}\n")
+        f.write(f"    .long {len(entries)}\n")
+        f.write(f"    .long {len(strings)}\n")
+        f.write(".section .kallsyms.entries,\"a\"\n")
+        f.write(".balign 8\n")
+        for e in entries:
+            display_name = str(e["display_name"])
+            f.write(f"    .quad 0x{int(e['addr']):016x}\n")
+            f.write(f"    .long {offsets[display_name]}\n")
+            f.write(f"    .long {int(e['size']) & 0xFFFFFFFF}\n")
+            f.write(f"    .short {int(e['kind'])}\n")
+            f.write("    .short 0\n")
+            f.write("    .long 0\n")
+        f.write(".section .kallsyms.strings,\"a\"\n")
+        f.write(".balign 8\n")
+        for e in entries:
+            f.write(f"    .asciz \"{asm_quote(str(e['display_name']))}\"\n")
+        f.write(".balign 8\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,27 +13,56 @@ pub mod fpu;
 pub mod gic;
 pub mod paging;
 pub mod pl011;
-pub mod timer;
 pub mod psci;
+pub mod random;
+pub mod stacktrace;
+pub mod timer;
 
 /// Maximum supported CPUs
 pub const MAX_CPUS: usize = 16;
+
+pub(crate) use stacktrace::capture_current_panic_context;
+
+unsafe extern "C" {
+    fn aarch64_mod_save_irq_disable() -> u64;
+    fn aarch64_mod_restore_irq(saved: u64);
+    fn aarch64_mod_sti();
+    fn aarch64_mod_cli();
+    fn aarch64_mod_halt();
+    fn aarch64_mod_current_el() -> u64;
+    fn aarch64_mod_read_mpidr_el1() -> u64;
+    fn aarch64_mod_read_tpidr_el0() -> u64;
+    fn aarch64_mod_write_tpidr_el0(value: u64);
+    fn aarch64_mod_read_cntpct_el0() -> u64;
+    fn aarch64_mod_read_cntfrq_el0() -> u64;
+    fn aarch64_mod_read_currentel_raw() -> u64;
+    fn aarch64_mod_read_daif() -> u64;
+    fn aarch64_mod_read_esr_el1() -> u64;
+    fn aarch64_mod_read_far_el1() -> u64;
+    fn aarch64_mod_read_ttbr0_el1() -> u64;
+    fn aarch64_mod_read_ttbr1_el1() -> u64;
+    fn aarch64_mod_read_tcr_el1() -> u64;
+    fn aarch64_mod_read_sctlr_el1() -> u64;
+    fn aarch64_mod_write_sctlr_el1_isb(value: u64);
+    fn aarch64_mod_read_ctr_el0() -> u64;
+    fn aarch64_mod_dsb_ishst_isb();
+    fn aarch64_mod_dsb_ish();
+    fn aarch64_mod_isb();
+    fn aarch64_mod_dsb_sy_isb();
+    fn aarch64_mod_dc_civac(addr: u64);
+    fn aarch64_mod_ic_ivau(addr: u64);
+    fn aarch64_mod_read_id_aa64isar0_el1() -> u64;
+    fn aarch64_mod_read_id_aa64mmfr1_el1() -> u64;
+    fn aarch64_mod_pan_clear();
+    fn aarch64_mod_pan_set();
+}
 
 // --- IRQ save/restore (DAIF manipulation) ---
 
 /// Save interrupt state and disable interrupts (mask DAIF.I)
 #[inline(always)]
 pub fn save_irq_disable() -> u64 {
-    let daif: u64;
-    // SAFETY: Reading DAIF is always safe
-    unsafe {
-        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack));
-    }
-    // SAFETY: Masking IRQ via DAIFSet is always safe
-    unsafe {
-        core::arch::asm!("msr DAIFSet, #0x2", options(nomem, nostack));
-    }
-    daif
+    unsafe { aarch64_mod_save_irq_disable() }
 }
 
 /// Restore interrupt state from saved DAIF
@@ -44,8 +73,15 @@ pub fn save_irq_disable() -> u64 {
 pub unsafe fn restore_irq(saved: u64) {
     // SAFETY: Caller guarantees saved is a valid DAIF value
     unsafe {
-        core::arch::asm!("msr DAIF, {}", in(reg) saved, options(nomem, nostack));
+        aarch64_mod_restore_irq(saved);
     }
+}
+
+/// Return true when IRQs are masked in DAIF.I.
+#[inline(always)]
+pub fn irqs_disabled() -> bool {
+    // SAFETY: Reading DAIF is side-effect free in kernel context.
+    unsafe { aarch64_mod_read_daif() & (1 << 7) != 0 }
 }
 
 /// Enable interrupts (unmask DAIF.I)
@@ -53,7 +89,7 @@ pub unsafe fn restore_irq(saved: u64) {
 pub fn sti() {
     // SAFETY: Unmasking IRQ is safe when called from kernel context
     unsafe {
-        core::arch::asm!("msr DAIFClr, #0x2", options(nomem, nostack));
+        aarch64_mod_sti();
     }
 }
 
@@ -62,7 +98,7 @@ pub fn sti() {
 pub fn cli() {
     // SAFETY: Masking IRQ is always safe
     unsafe {
-        core::arch::asm!("msr DAIFSet, #0x2", options(nomem, nostack));
+        aarch64_mod_cli();
     }
 }
 
@@ -71,7 +107,7 @@ pub fn cli() {
 pub fn halt() {
     // SAFETY: WFI is a hint instruction, always safe
     unsafe {
-        core::arch::asm!("wfi", options(nomem, nostack));
+        aarch64_mod_halt();
     }
 }
 
@@ -93,16 +129,47 @@ pub unsafe fn inb(_port: u16) -> u8 {
     0
 }
 
+/// I/O port output 16-bit (not available on aarch64 — panics)
+///
+/// # Safety
+/// Always panics on aarch64.
+#[inline(always)]
+pub unsafe fn outw(_port: u16, _value: u16) {
+    panic!("outw: I/O ports not available on aarch64");
+}
+
+/// I/O port input 16-bit (not available on aarch64 — returns 0)
+///
+/// # Safety
+/// Always returns 0 on aarch64.
+#[inline(always)]
+pub unsafe fn inw(_port: u16) -> u16 {
+    0
+}
+
+/// I/O port output 32-bit (not available on aarch64 — panics)
+///
+/// # Safety
+/// Always panics on aarch64.
+#[inline(always)]
+pub unsafe fn outl(_port: u16, _value: u32) {
+    panic!("outl: I/O ports not available on aarch64");
+}
+
+/// I/O port input 32-bit (not available on aarch64 — returns 0)
+///
+/// # Safety
+/// Always returns 0 on aarch64.
+#[inline(always)]
+pub unsafe fn inl(_port: u16) -> u32 {
+    0
+}
+
 // --- EL state ---
 
 /// Return the current exception level number.
 pub fn current_el() -> u64 {
-    let current_el: u64;
-    // SAFETY: Reading CurrentEL is always safe in privileged code.
-    unsafe {
-        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack));
-    }
-    current_el >> 2
+    unsafe { aarch64_mod_current_el() }
 }
 
 /// Returns true if the host kernel is running at EL2.
@@ -117,13 +184,19 @@ pub fn is_el2() -> bool {
 
 /// Get current CPU ID (from MPIDR_EL1)
 pub fn current_cpu() -> usize {
-    let mpidr: u64;
-    // SAFETY: Reading MPIDR_EL1 is always safe
-    unsafe {
-        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
-    }
+    let mpidr = unsafe { aarch64_mod_read_mpidr_el1() };
     // Aff0 field (bits 7:0) gives the CPU number on most platforms
     (mpidr & 0xFF) as usize
+}
+
+#[inline(always)]
+pub fn per_cpu_ready() -> bool {
+    true
+}
+
+#[inline(always)]
+pub fn diagnostic_current_cpu() -> usize {
+    current_cpu()
 }
 
 /// Next invocation sequence number for the current CPU.
@@ -141,6 +214,11 @@ pub fn set_kernel_stack(stack_top: u64) {
     cpu::set_kernel_stack(stack_top);
 }
 
+/// Return the kernel stack top for the current CPU.
+pub fn get_kernel_stack() -> u64 {
+    cpu::get_kernel_stack()
+}
+
 /// Set TSS RSP0 equivalent (stub for Phase 1, no TSS on aarch64)
 pub fn set_tss_rsp0(_stack_top: u64) {
     // No TSS on aarch64 — exception entry uses SP_EL1
@@ -148,21 +226,28 @@ pub fn set_tss_rsp0(_stack_top: u64) {
 
 /// Read thread-local base (TPIDR_EL0)
 pub fn read_fs_base() -> u64 {
-    let val: u64;
-    // SAFETY: Reading TPIDR_EL0 is always safe
-    unsafe {
-        core::arch::asm!("mrs {}, TPIDR_EL0", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_mod_read_tpidr_el0() }
 }
 
-/// Write thread-local base (TPIDR_EL0)
-pub fn write_fs_base(val: u64) {
-    // SAFETY: Writing TPIDR_EL0 is safe from kernel context
+/// Write thread-local base (TPIDR_EL0).
+///
+/// # Safety
+/// Caller must ensure `val` is a valid TLS base for the current
+/// thread. Marked `unsafe` to keep the arch trait shape symmetric
+/// with x86_64's `write_fs_base` (which writes an MSR and demands
+/// the same caller contract).
+pub unsafe fn write_fs_base(val: u64) {
     unsafe {
-        core::arch::asm!("msr TPIDR_EL0, {}", in(reg) val, options(nomem, nostack));
+        aarch64_mod_write_tpidr_el0(val);
     }
 }
+
+/// Update the user ABI thread pointer.
+///
+/// AArch64 restores the ABI register (`x18`) from the current TCB's saved
+/// thread state on return to EL0, so there is no live kernel register update
+/// to perform here.
+pub fn write_abi_tp_base(_val: u64) {}
 
 /// Generate a stack canary value
 pub fn generate_stack_canary() -> u64 {
@@ -170,30 +255,12 @@ pub fn generate_stack_canary() -> u64 {
     // systems without FEAT_RNG, executing RNDR itself raises an
     // undefined-instruction exception instead of returning failure.
     if cpuid::has_hw_rng() {
-        let val: u64;
-        let ok: u64;
-        // SAFETY: FEAT_RNG support has been checked above, so RNDR is a
-        // valid system register access here. NZCV flags report success.
-        unsafe {
-            core::arch::asm!(
-                "mrs {val}, S3_3_C2_C4_0",  // RNDR
-                "cset {ok}, ne",
-                val = out(reg) val,
-                ok = out(reg) ok,
-                options(nomem, nostack),
-            );
-        }
-        if ok != 0 {
+        if let Some(val) = random::rdrand64_once() {
             return val;
         }
     }
     // Fallback: CNTPCT_EL0 (not cryptographically random, but usable)
-    let fallback: u64;
-    // SAFETY: Reading CNTPCT is always safe
-    unsafe {
-        core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) fallback, options(nomem, nostack));
-    }
-    fallback
+    unsafe { aarch64_mod_read_cntpct_el0() }
 }
 
 /// Set per-CPU stack canary (via host TPIDR-backed per-CPU data).
@@ -212,21 +279,12 @@ pub enum IpiKind {
 
 /// Get timer tick count (CNTPCT_EL0)
 pub fn get_ticks() -> u64 {
-    let val: u64;
-    // SAFETY: Reading CNTPCT_EL0 is always safe from EL1
-    unsafe {
-        core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_mod_read_cntpct_el0() }
 }
 
 /// Get current time in nanoseconds
 pub fn now_ns() -> u64 {
-    let freq: u64;
-    // SAFETY: Reading CNTFRQ_EL0 is always safe
-    unsafe {
-        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq, options(nomem, nostack));
-    }
+    let freq = unsafe { aarch64_mod_read_cntfrq_el0() };
     if freq == 0 {
         return 0;
     }
@@ -236,14 +294,52 @@ pub fn now_ns() -> u64 {
     ((ticks as u128 * 1_000_000_000u128) / freq as u128) as u64
 }
 
+/// Print AArch64 detail for a generic panic without an exception frame.
+pub fn dump_panic_detail() {
+    use crate::kernel::printk::{serial_dec_raw, serial_hex_raw, serial_putc_hw, serial_puts_raw};
+
+    let current_el = unsafe { aarch64_mod_read_currentel_raw() };
+    let daif = unsafe { aarch64_mod_read_daif() };
+    let esr_el1 = unsafe { aarch64_mod_read_esr_el1() };
+    let far_el1 = unsafe { aarch64_mod_read_far_el1() };
+    let ttbr0_el1 = unsafe { aarch64_mod_read_ttbr0_el1() };
+    let ttbr1_el1 = unsafe { aarch64_mod_read_ttbr1_el1() };
+    let tcr_el1 = unsafe { aarch64_mod_read_tcr_el1() };
+    let sctlr_el1 = unsafe { aarch64_mod_read_sctlr_el1() };
+
+    serial_puts_raw("arch: aarch64 generic\n");
+    serial_puts_raw("cpu: ");
+    serial_dec_raw(diagnostic_current_cpu() as u64);
+    serial_puts_raw(" per_cpu_ready=");
+    serial_dec_raw(per_cpu_ready() as u64);
+    serial_puts_raw(" ticks=");
+    serial_dec_raw(get_ticks());
+    serial_putc_hw(b'\n');
+    serial_puts_raw("CurrentEL: ");
+    serial_hex_raw(current_el);
+    serial_puts_raw(" DAIF: ");
+    serial_hex_raw(daif);
+    serial_puts_raw(" ESR_EL1: ");
+    serial_hex_raw(esr_el1);
+    serial_puts_raw(" FAR_EL1: ");
+    serial_hex_raw(far_el1);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("TTBR0_EL1: ");
+    serial_hex_raw(ttbr0_el1);
+    serial_puts_raw(" TTBR1_EL1: ");
+    serial_hex_raw(ttbr1_el1);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("TCR_EL1: ");
+    serial_hex_raw(tcr_el1);
+    serial_puts_raw(" SCTLR_EL1: ");
+    serial_hex_raw(sctlr_el1);
+    serial_putc_hw(b'\n');
+}
+
 pub fn publish_page_table_page(table_phys: u64) {
     paging::flush_dcache_poc_page(crate::mm::phys_to_virt(table_phys));
     unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "isb",
-            options(nostack),
-        );
+        aarch64_mod_dsb_ishst_isb();
     }
 }
 
@@ -254,11 +350,7 @@ pub fn publish_page_table_page(table_phys: u64) {
 /// cache models this requires explicit cache maintenance on the written alias
 /// before the remap, otherwise the new mapping may observe stale data or code.
 pub fn sync_user_page_before_unmap(vaddr: u64) {
-    let ctr: u64;
-    // SAFETY: Reading CTR_EL0 from EL1 is always safe.
-    unsafe {
-        core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack));
-    }
+    let ctr = unsafe { aarch64_mod_read_ctr_el0() };
 
     let dline_shift = ((ctr >> 16) & 0xF) as usize;
     let iline_shift = (ctr & 0xF) as usize;
@@ -276,14 +368,14 @@ pub fn sync_user_page_before_unmap(vaddr: u64) {
         // returns; cleaning by VA is required to publish data written through
         // the scratch alias.
         unsafe {
-            core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack));
+            aarch64_mod_dc_civac(addr);
         }
         addr += dline as u64;
     }
 
     // SAFETY: Complete data cache clean before invalidating I-cache.
     unsafe {
-        core::arch::asm!("dsb ish", options(nomem, nostack));
+        aarch64_mod_dsb_ish();
     }
 
     let mut addr = page_start;
@@ -291,7 +383,7 @@ pub fn sync_user_page_before_unmap(vaddr: u64) {
         // SAFETY: Invalidating I-cache after publishing freshly written code
         // is harmless for data pages and required for executable remaps.
         unsafe {
-            core::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack));
+            aarch64_mod_ic_ivau(addr);
         }
         addr += iline as u64;
     }
@@ -299,8 +391,8 @@ pub fn sync_user_page_before_unmap(vaddr: u64) {
     // SAFETY: Ensure the invalidation is globally observed before returning
     // to the unmap/remap path.
     unsafe {
-        core::arch::asm!("dsb ish", options(nomem, nostack));
-        core::arch::asm!("isb", options(nomem, nostack));
+        aarch64_mod_dsb_ish();
+        aarch64_mod_isb();
     }
 }
 
@@ -315,7 +407,13 @@ const SGI_TLB_SHOOTDOWN_ALL: u32 = 2;
 const SGI_VSPACE_TEARDOWN: u32 = 3;
 
 /// Send an IPI to another CPU via GICv3 Software Generated Interrupt.
-pub fn send_ipi(target_cpu: usize, kind: IpiKind) {
+///
+/// # Safety
+/// Caller must ensure `target_cpu` is a valid online CPU id and
+/// `kind` matches a valid SGI binding. Marked `unsafe` to keep the
+/// arch trait shape symmetric with x86_64's `send_ipi` (which writes
+/// LAPIC ICR and demands the same caller contract).
+pub unsafe fn send_ipi(target_cpu: usize, kind: IpiKind) {
     let intid = match kind {
         IpiKind::Reschedule => SGI_RESCHEDULE,
         IpiKind::TlbShootdown => SGI_TLB_SHOOTDOWN,
@@ -330,8 +428,7 @@ pub fn send_ipi(target_cpu: usize, kind: IpiKind) {
 // ---------------------------------------------------------------------------
 
 /// Per-CPU TLB shootdown target address.
-static TLB_SHOOTDOWN_ADDR: [AtomicU64; MAX_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_ADDR: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Set the TLB shootdown address for a remote CPU.
 ///
@@ -388,7 +485,9 @@ fn pci_io_init() {
         }
     }
     // SAFETY: Single-threaded boot context, no concurrent access.
-    unsafe { *(&raw mut PCI_IO_VIRT_BASE) = virt; }
+    unsafe {
+        *(&raw mut PCI_IO_VIRT_BASE) = virt;
+    }
 }
 
 /// Read 8 bits from PCI I/O port `port`.
@@ -410,7 +509,9 @@ pub unsafe fn pci_io_read8(port: u16) -> u8 {
 pub unsafe fn pci_io_write8(port: u16, val: u8) {
     let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
     // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
-    unsafe { core::ptr::write_volatile(addr as *mut u8, val); }
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u8, val);
+    }
 }
 
 /// Read 16 bits from PCI I/O port `port`.
@@ -432,7 +533,9 @@ pub unsafe fn pci_io_read16(port: u16) -> u16 {
 pub unsafe fn pci_io_write16(port: u16, val: u16) {
     let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
     // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
-    unsafe { core::ptr::write_volatile(addr as *mut u16, val); }
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u16, val);
+    }
 }
 
 /// Read 32 bits from PCI I/O port `port`.
@@ -454,7 +557,9 @@ pub unsafe fn pci_io_read32(port: u16) -> u32 {
 pub unsafe fn pci_io_write32(port: u16, val: u32) {
     let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
     // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
-    unsafe { core::ptr::write_volatile(addr as *mut u32, val); }
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u32, val);
+    }
 }
 
 /// Context switch between threads.
@@ -467,9 +572,12 @@ pub unsafe fn pci_io_write32(port: u16, val: u32) {
 pub unsafe fn context_switch(
     old_context: *mut crate::sched::thread::ThreadContext,
     new_context: *const crate::sched::thread::ThreadContext,
+    old_tcb: *mut crate::sched::thread::Tcb,
 ) {
     // SAFETY: Caller guarantees both pointers are valid ThreadContext.
-    unsafe { context::context_switch(old_context, new_context); }
+    unsafe {
+        context::context_switch(old_context, new_context, old_tcb);
+    }
 }
 
 /// Trampoline to enter usermode for newly created threads.
@@ -483,7 +591,9 @@ pub unsafe fn context_switch(
 pub unsafe extern "C" fn usermode_trampoline() -> ! {
     // SAFETY: Caller guarantees this is a newly scheduled thread with
     // valid TCB fields.
-    unsafe { context::usermode_trampoline(); }
+    unsafe {
+        context::usermode_trampoline();
+    }
 }
 
 /// Initialize architecture-specific subsystems
@@ -497,7 +607,7 @@ pub unsafe extern "C" fn usermode_trampoline() -> ! {
 /// 6. GICv3 (distributor + BSP redistributor + CPU interface)
 /// 7. Generic Timer (configure, but do not start yet)
 /// 8. Frame bitmap remap + per-frame arrays
-pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
+pub fn init(boot_info: Option<&crate::init::bootinfo::ParsedBootInfo>) {
     // Initialize PL011 UART for serial output
     pl011::init();
 
@@ -540,10 +650,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Enable PAN runtime tracking before the first EL0 transition.
     uaccess::init();
 
-    // Initialize FPU lazy switching (trap NEON/FP access from EL0)
+    // Configure CPACR_EL1.FPEN=0b11 for eager FPU (no FP/SIMD trap)
     fpu::init();
 
-    crate::serial_puts("[ARCH] AArch64 subsystems initialized\n");
+    crate::kernel::printk::serial_puts("[ARCH] AArch64 subsystems initialized\n");
 }
 
 /// Initialize SMP — bring up Application Processors via PSCI CPU_ON.
@@ -555,11 +665,11 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 ///   4. Waits for the AP to signal ready
 ///
 /// Stops probing when PSCI returns an error (non-existent CPU).
-pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+pub fn init_smp(boot_info: Option<&crate::init::bootinfo::ParsedBootInfo>) {
     let info = match boot_info {
         Some(i) => i,
         None => {
-            crate::serial_puts("[SMP] No boot info, skipping SMP init\n");
+            crate::kernel::printk::serial_puts("[SMP] No boot info, skipping SMP init\n");
             return;
         }
     };
@@ -579,7 +689,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         trampoline_virt
     };
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[SMP] Trampoline phys=");
         _g.hex(trampoline_phys);
         _g.puts(" virt=");
@@ -591,8 +701,8 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     let mair = paging::read_mair();
     let tcr = paging::read_tcr();
     let sctlr = paging::read_sctlr();
-    let host_ttbr0 = paging::read_cr3();      // Shared bootstrap/full root
-    let compat_ttbr1 = paging::read_ttbr1();  // Kernel root template for EL1 compatibility
+    let host_ttbr0 = paging::read_cr3(); // Shared bootstrap/full root
+    let compat_ttbr1 = paging::read_ttbr1(); // Kernel root template for EL1 compatibility
     let entry_virt = ap_boot::ap_entry as *const () as u64;
 
     // Map GICR MMIO pages for all potential APs before starting them.
@@ -611,10 +721,13 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_phys = match crate::mm::pmm_alloc_contiguous(STACK_PAGES) {
+        let stack_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+            subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+        };
+        let stack_phys = match crate::mm::pmm_alloc_contiguous_owned(STACK_PAGES, &stack_owner) {
             Some(p) => p,
             None => {
-                crate::serial_puts("[SMP] Failed to allocate AP kernel stack\n");
+                crate::kernel::printk::serial_puts("[SMP] Failed to allocate AP kernel stack\n");
                 break;
             }
         };
@@ -648,17 +761,13 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
             let mb_size = core::mem::size_of::<boot::ApMailbox>() as u64;
             let mut addr = mb_addr;
             while addr < mb_addr + mb_size {
-                core::arch::asm!(
-                    "dc civac, {0}",
-                    in(reg) addr,
-                    options(nostack),
-                );
+                aarch64_mod_dc_civac(addr);
                 addr += 64; // Cache line size
             }
-            core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+            aarch64_mod_dsb_sy_isb();
         }
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[SMP] Starting AP cpu_id=");
             _g.dec(cpu_id as u64);
             _g.putc(b'\n');
@@ -673,7 +782,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
         if result != psci::PSCI_SUCCESS {
             // CPU doesn't exist or PSCI error — stop probing.
-            crate::kerror!(|_g| {
+            crate::kernel::printk::kerror!(|_g| {
                 _g.puts("[SMP] PSCI CPU_ON failed for cpu_id=");
                 _g.dec(cpu_id as u64);
                 _g.puts(" error=");
@@ -688,7 +797,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         let mut timeout = 500_000u32;
         while !ap_boot::is_ap_ready(cpu_id) {
             if timeout == 0 {
-                crate::kdebug!(arch, |_g| {
+                crate::kernel::printk::kdebug!(arch, |_g| {
                     _g.puts("[SMP] AP cpu_id=");
                     _g.dec(cpu_id as u64);
                     _g.puts(" timeout waiting for ready\n");
@@ -706,7 +815,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
     }
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[SMP] ");
         _g.dec(ap_count as u64);
         _g.puts(" AP(s) online\n");
@@ -728,17 +837,18 @@ pub fn shutdown() -> ! {
     psci::system_off();
 }
 
+/// Warm reboot via PSCI SYSTEM_RESET.
+pub fn reboot() -> ! {
+    psci::system_reset();
+}
+
 // CPUID-equivalent module: reports hardware RNG availability
 pub mod cpuid {
     /// Check if RNDR instruction is available (ARMv8.5 FEAT_RNG).
     ///
     /// Reads ID_AA64ISAR0_EL1.RNDR (bits 63:60); value >= 1 means supported.
     pub fn has_hw_rng() -> bool {
-        let isar0: u64;
-        // SAFETY: Reading ID_AA64ISAR0_EL1 is always safe from EL1.
-        unsafe {
-            core::arch::asm!("mrs {}, ID_AA64ISAR0_EL1", out(reg) isar0, options(nomem, nostack));
-        }
+        let isar0 = unsafe { super::aarch64_mod_read_id_aa64isar0_el1() };
         ((isar0 >> 60) & 0xF) >= 1
     }
 
@@ -756,6 +866,8 @@ pub mod cpuid {
 /// (SCTLR_EL1.SPAN=0), and provides an RAII guard for temporary access.
 pub mod uaccess {
     use super::{AtomicBool, Ordering};
+    use core::mem::MaybeUninit;
+    use core::ptr;
 
     /// True once FEAT_PAN has been detected and enabled for runtime use.
     static PAN_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -770,24 +882,15 @@ pub mod uaccess {
             return;
         }
 
-        let mmfr1: u64;
-        // SAFETY: Reading ID_AA64MMFR1_EL1 is always safe from EL1.
-        unsafe {
-            core::arch::asm!("mrs {}, ID_AA64MMFR1_EL1", out(reg) mmfr1, options(nomem, nostack));
-        }
+        let mmfr1 = unsafe { super::aarch64_mod_read_id_aa64mmfr1_el1() };
         if ((mmfr1 >> 20) & 0xF) >= 1 {
             // PAN is supported — clear SPAN so PAN is auto-set on exception entry
-            let mut sctlr: u64;
-            // SAFETY: Reading SCTLR_EL1 is safe from EL1.
-            unsafe {
-                core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) sctlr, options(nomem, nostack));
-            }
+            let mut sctlr = unsafe { super::aarch64_mod_read_sctlr_el1() };
             sctlr &= !(1u64 << 23); // Clear SPAN (bit 23)
             // SAFETY: Writing SCTLR_EL1 to enable PAN auto-set is safe.
             // ISB ensures the change takes effect before subsequent instructions.
             unsafe {
-                core::arch::asm!("msr SCTLR_EL1, {}", in(reg) sctlr, options(nomem, nostack));
-                core::arch::asm!("isb", options(nomem, nostack));
+                super::aarch64_mod_write_sctlr_el1_isb(sctlr);
             }
             PAN_ACTIVE.store(true, Ordering::Release);
         } else {
@@ -806,8 +909,7 @@ pub mod uaccess {
             // user-mapped pages. The guard's Drop impl will re-enable PAN.
             if PAN_ACTIVE.load(Ordering::Acquire) {
                 unsafe {
-                    // Clear PAN: MSR PAN, #0 → encoding 0xD500409F
-                    core::arch::asm!(".inst 0xD500409F", options(nomem, nostack));
+                    super::aarch64_mod_pan_clear();
                 }
             }
             UserAccessGuard
@@ -820,8 +922,7 @@ pub mod uaccess {
             // restoring the default protection.
             if PAN_ACTIVE.load(Ordering::Acquire) {
                 unsafe {
-                    // Set PAN: MSR PAN, #1 → encoding 0xD500419F
-                    core::arch::asm!(".inst 0xD500419F", options(nomem, nostack));
+                    super::aarch64_mod_pan_set();
                 }
             }
         }
@@ -841,31 +942,122 @@ pub mod uaccess {
         }
     }
 
-    /// Copy a value of type `T` from user-space address `addr`.
-    ///
-    /// # Safety
-    /// The user address must point to a mapped, readable page.
-    pub unsafe fn copy_from_user<T: Copy>(addr: u64) -> Option<T> {
-        if !validate_user_range(addr, core::mem::size_of::<T>()) {
+    #[inline]
+    fn current_vspace_root() -> Option<*mut crate::mm::VSpace> {
+        let current = crate::sched::scheduler::scheduler().current();
+        if current.is_null() {
             return None;
         }
-        let _guard = UserAccessGuard::new();
-        // SAFETY: Address validated; PAN relaxed by guard.
-        let val = unsafe { core::ptr::read_volatile(addr as *const T) };
-        Some(val)
+        let vspace = unsafe { (*current).vspace_root };
+        if vspace.is_null() {
+            return None;
+        }
+        Some(vspace)
+    }
+
+    /// Copy raw bytes from the current thread's user address space into kernel memory.
+    ///
+    /// Returns `false` when the range is out of user space or any covered page is not
+    /// currently mapped in the active thread's VSpace.
+    pub unsafe fn copy_from_user_bytes(addr: u64, dst: *mut u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if !validate_user_range(addr, len) {
+            return false;
+        }
+
+        let Some(vspace) = current_vspace_root() else {
+            return false;
+        };
+
+        let mut copied = 0usize;
+        while copied < len {
+            let cur = addr + copied as u64;
+            let page_off = cur as usize & (crate::mm::PAGE_SIZE - 1);
+            let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, len - copied);
+            let phys = match unsafe { (&*vspace).resolve_page(cur) } {
+                Some(phys) => phys,
+                None => return false,
+            };
+            let src = (crate::mm::phys_to_virt(phys) as *const u8).wrapping_add(page_off);
+            unsafe {
+                ptr::copy_nonoverlapping(src, dst.add(copied), chunk);
+            }
+            copied += chunk;
+        }
+
+        true
+    }
+
+    /// Copy raw bytes from kernel memory into the current thread's user address space.
+    ///
+    /// Returns `false` when the range is out of user space or any covered page cannot
+    /// be made writable in the active thread's VSpace.
+    pub unsafe fn copy_to_user_bytes(addr: u64, src: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if !validate_user_range(addr, len) {
+            return false;
+        }
+
+        let Some(vspace) = current_vspace_root() else {
+            return false;
+        };
+
+        let mut copied = 0usize;
+        while copied < len {
+            let cur = addr + copied as u64;
+            let page_off = cur as usize & (crate::mm::PAGE_SIZE - 1);
+            let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, len - copied);
+            let vspace_ref = unsafe { &mut *vspace };
+            if !vspace_ref.ensure_writable(cur) {
+                return false;
+            }
+            let phys = match vspace_ref.resolve_page(cur) {
+                Some(phys) => phys,
+                None => return false,
+            };
+            let dst = (crate::mm::phys_to_virt(phys) as *mut u8).wrapping_add(page_off);
+            unsafe {
+                ptr::copy_nonoverlapping(src.add(copied), dst, chunk);
+            }
+            copied += chunk;
+        }
+
+        true
+    }
+
+    /// Copy a value of type `T` from user-space address `addr`.
+    ///
+    /// Returns `None` if the address is not in the valid user range or is not
+    /// fully readable in the current thread's VSpace.
+    pub unsafe fn copy_from_user<T: Copy>(addr: u64) -> Option<T> {
+        let mut value = MaybeUninit::<T>::uninit();
+        if !unsafe {
+            copy_from_user_bytes(
+                addr,
+                value.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+        } {
+            return None;
+        }
+        Some(unsafe { value.assume_init() })
     }
 
     /// Write a value of type `T` to user-space address `addr`.
     ///
-    /// # Safety
-    /// The user address must point to a mapped, writable page.
+    /// Returns `false` if the address is not in the valid user range or is not
+    /// fully writable in the current thread's VSpace.
     pub unsafe fn copy_to_user<T: Copy>(addr: u64, val: &T) -> bool {
-        if !validate_user_range(addr, core::mem::size_of::<T>()) {
-            return false;
+        unsafe {
+            copy_to_user_bytes(
+                addr,
+                (val as *const T).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
         }
-        let _guard = UserAccessGuard::new();
-        // SAFETY: Address validated; PAN relaxed by guard.
-        unsafe { core::ptr::write_volatile(addr as *mut T, *val); }
-        true
     }
 }

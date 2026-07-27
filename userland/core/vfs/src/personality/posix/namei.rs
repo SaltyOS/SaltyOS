@@ -1,299 +1,253 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! POSIX path resolution (`namei`).
+//
+//! POSIX path-policy decisions consumed by the namei async
+//! state machine.
 //!
-//! Implements the standard POSIX path walk: slash-separated components,
-//! case-sensitive lookup, `..` crossing mount boundaries, symbolic link
-//! resolution (up to `NAMEI_SYMLINK_MAX_DEPTH`), and mount-coverage
-//! traversal.
+//! `core::namei_async` owns the *mechanics* — splitting the
+//! path into components, recursing on dotdot, parking on
+//! BACKEND_LOOKUP / BACKEND_READLINK responses. This module owns
+//! the *policy* — what is the absolute root, how does dotdot
+//! behave, where do `.` / empty / repeated `/` collapse, what is
+//! the symlink-loop hop limit, what does AT_FDCWD select.
 //!
-//! Uses the common helpers from `vfs_core::namei_common` (`walk_dotdot`,
-//! `cross_covered`, `lookup_component`, `readlink_vnode`) and delegates
-//! single-component lookup through `VopMetaOps::lookup` via `VopContext`.
+//! Win32 has its own (drive-letter rooted, `\` separated, UNC,
+//! DOS reserved) policy in [`super::super::win32::namei`].
+#![allow(dead_code)]
 
-use crate::server::consts::MAX_PATH_LEN;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::namei_common::{
-    cross_covered, finish_namei, lookup_component, mount_nosymfollow, readlink_vnode, vnode_vtype,
-    walk_dotdot, NameiArgs, NameiCtx, NameiResult, NAMEI_CREATE, NAMEI_DIRECTORY, NAMEI_FOLLOW,
-    NAMEI_NOFOLLOW_ANY, NAMEI_NOFOLLOW_FINAL, NAMEI_SYMLINK_MAX_DEPTH,
-};
-use crate::vfs_core::vnode::{VnodeHandle, VT_DIR, VT_LNK};
+use trona_kernel::core_types::TronaMsg;
 
-/// POSIX path resolution.
-///
-/// Walks the path described by `args`, resolving each slash-delimited
-/// component through `VopMetaOps::lookup`. Handles `.`, `..`, symlinks,
-/// mount-point crossing, and the `NAMEI_*` flag set.
-///
-/// On success the returned `NameiResult` contains:
-/// - `vp`: the resolved vnode handle, or `VnodeHandle::INVALID` when
-///   `NAMEI_CREATE` is set and the final component is missing.
-/// - `dvp`: the parent directory handle when `NAMEI_WANTPARENT` is set.
-/// - `last_name` / `last_name_len`: final component pointer+length (into
-///   `args.path` or a symlink scratch buffer).
-///
-/// # Safety
-///
-/// `args.path` must point to `args.path_len` readable bytes.
-pub(crate) fn namei_posix(ctx: &NameiCtx<'_>, args: &NameiArgs) -> VfsResult<NameiResult> {
-    namei_posix_inner(ctx, args, 0)
+use crate::core::identity::VnodeKey;
+use crate::owner::VfsState;
+use crate::owner::pending::{WALK_PATH_MAX, WalkPolicy as CoreWalkPolicy};
+use crate::owner::resume::NameiTerminal;
+use crate::server::types::ClientHandle;
+
+use crate::ops::anchor::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW};
+
+/// POSIX-mandated maximum number of symlinks resolved during a
+/// single namei walk before the kernel returns ELOOP. Linux
+/// uses 40; the personality layer enforces it as the
+/// `WalkPolicy::max_symlink_hops` ceiling regardless of the
+/// individual mount's preferences.
+pub(crate) const POSIX_SYMLOOP_MAX: u8 = 40;
+
+/// POSIX-mandated maximum filename length per component. Same
+/// as `Dirent::POSIX_NAME_MAX` — re-exported here so the namei
+/// driver can consult one constant.
+pub(crate) const POSIX_NAME_MAX: usize = super::types::POSIX_NAME_MAX;
+
+/// POSIX-mandated maximum total path length, including the
+/// terminating NUL. Linux uses 4096.
+pub(crate) const POSIX_PATH_MAX: usize = 4096;
+
+/// POSIX wire wrapper for the shared async namei walker.
+pub(crate) unsafe fn begin_path_walk(
+    state: &mut VfsState,
+    client: ClientHandle,
+    anchor_override: VnodeKey,
+    msg: &TronaMsg,
+    path_words_start: usize,
+    path_len: usize,
+    policy: CoreWalkPolicy,
+    flags: u32,
+    terminal: NameiTerminal,
+    reply_lease: trona_server::ReplyLease,
+) {
+    unsafe {
+        let mut path_buf = [0u8; WALK_PATH_MAX];
+        let copied = path_len.min(WALK_PATH_MAX);
+        super::wire::decode_path_bytes(msg, path_words_start, copied, &mut path_buf);
+        crate::core::namei_async::begin_path_walk_from_bytes(
+            state,
+            client,
+            anchor_override,
+            &path_buf[..copied],
+            copied,
+            policy,
+            flags,
+            terminal,
+            reply_lease,
+        );
+    }
 }
 
-/// Inner walk with symlink depth tracking.
-fn namei_posix_inner(
-    ctx: &NameiCtx<'_>,
-    args: &NameiArgs,
-    sym_depth: u32,
-) -> VfsResult<NameiResult> {
-    let path = args.path;
-    let path_len = args.path_len as usize;
-    let flags = args.flags;
+/// Resolution roots — what the namei walker is rooted at when
+/// it starts the descent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalkRoot {
+    /// `/` — namespace root for the caller's mount namespace.
+    NamespaceRoot,
+    /// `dirfd` — caller passed `*at(dirfd, …)` and the dirfd
+    /// resolves to a directory vnode.
+    DirFd { fd: i32 },
+    /// AT_FDCWD shortcut — caller passed AT_FDCWD; resolve
+    /// against the caller's per-process CWD vnode.
+    Cwd,
+}
 
-    if path.is_null() || path_len == 0 {
-        return Err(VfsError::Inval);
-    }
+/// What to do when the final component is a symlink. Bit-flag
+/// boolean so the caller can read `at_flags & AT_SYMLINK_NOFOLLOW`
+/// directly off the wire and translate it through
+/// [`final_symlink_policy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinalSymlinkPolicy {
+    /// Always resolve through the symlink (default for `open`,
+    /// `stat`, etc.).
+    Follow,
+    /// Stop at the symlink itself — return its vnode (used by
+    /// `lstat`, `readlink`, `O_NOFOLLOW open`, etc.).
+    DoNotFollow,
+}
 
-    // ---- Determine starting vnode ----
-    let mut vp: VnodeHandle;
+/// Whether the walk demands the resolved vnode be a directory.
+/// Used by `chdir`, `opendir`, `O_DIRECTORY`, and the trailing
+/// `/` rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectoryRequirement {
+    /// Either a file or a directory is acceptable.
+    Either,
+    /// Walk must end at a directory; if not, return `ENOTDIR`.
+    MustBeDirectory,
+}
 
-    if unsafe { *path } == b'/' {
-        // Absolute path — start from the namespace root vnode.
-        if !args.root.is_valid() {
-            return Err(VfsError::Io);
+/// Policy bundle that the personality layer hands the namei
+/// driver alongside the path bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WalkPolicy {
+    pub root: WalkRoot,
+    pub final_symlink: FinalSymlinkPolicy,
+    pub directory_required: DirectoryRequirement,
+    /// Maximum symlinks the walker is allowed to traverse.
+    /// Capped at [`POSIX_SYMLOOP_MAX`].
+    pub max_symlink_hops: u8,
+    /// `AT_EMPTY_PATH` was set — the path is allowed to be
+    /// empty, in which case the walk ends at `root`.
+    pub allow_empty_path: bool,
+}
+
+impl WalkPolicy {
+    /// Build a policy from the AT_FDCWD selector + at-flags + a
+    /// directory-required hint. The hint comes from the caller
+    /// (`O_DIRECTORY` / `chdir` set it, others leave it
+    /// `Either`).
+    pub(crate) fn from_at(
+        dirfd: i32,
+        at_flags: i32,
+        directory_required: DirectoryRequirement,
+    ) -> Self {
+        let root = if dirfd == AT_FDCWD {
+            WalkRoot::Cwd
+        } else {
+            WalkRoot::DirFd { fd: dirfd }
+        };
+        let final_symlink = if (at_flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            FinalSymlinkPolicy::DoNotFollow
+        } else if (at_flags & AT_SYMLINK_FOLLOW) != 0 {
+            FinalSymlinkPolicy::Follow
+        } else {
+            FinalSymlinkPolicy::Follow
+        };
+        let allow_empty_path = (at_flags & AT_EMPTY_PATH) != 0;
+        Self {
+            root,
+            final_symlink,
+            directory_required,
+            max_symlink_hops: POSIX_SYMLOOP_MAX,
+            allow_empty_path,
         }
-        vp = args.root;
+    }
+}
+
+/// Component-level classification used by the namei step
+/// dispatcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Component<'a> {
+    /// Empty component — collapsed by the walker (matches
+    /// repeated / leading slash semantics).
+    Empty,
+    /// `.` — the current directory; the walker drops the step.
+    Dot,
+    /// `..` — pop one level. The walker handles the
+    /// mount-crossing case (`..` at a mount point goes back to
+    /// the parent mount's directory).
+    DotDot,
+    /// Regular name component.
+    Name(&'a [u8]),
+}
+
+/// Classify a component, applying POSIX `.` / `..` semantics.
+/// The walker calls this on every separator-bounded slice it
+/// pulls off the path. Empty strings (from `//`, leading `/`,
+/// or trailing `/`) classify as `Empty` so the walker can
+/// treat them uniformly.
+#[inline]
+pub(crate) fn classify_component(bytes: &[u8]) -> Component<'_> {
+    if bytes.is_empty() {
+        return Component::Empty;
+    }
+    if bytes == b"." {
+        return Component::Dot;
+    }
+    if bytes == b".." {
+        return Component::DotDot;
+    }
+    Component::Name(bytes)
+}
+
+/// Trailing-slash semantics: if the path ends with `/` (or
+/// `/.` / `/..`), POSIX requires the resolved vnode to be a
+/// directory. The personality layer sets
+/// [`DirectoryRequirement::MustBeDirectory`] when this returns
+/// true.
+#[inline]
+pub(crate) fn trailing_slash_demands_directory(path: &[u8]) -> bool {
+    if let Some(&last) = path.last() {
+        if last == b'/' {
+            return true;
+        }
+    }
+    if path.ends_with(b"/.") || path.ends_with(b"/..") {
+        return true;
+    }
+    false
+}
+
+/// Project the policy into `final_symlink_policy(at_flags)`
+/// the way `posix/open` and friends invoke it directly off
+/// the wire.
+#[inline]
+pub(crate) const fn final_symlink_policy(at_flags: i32) -> FinalSymlinkPolicy {
+    if (at_flags & AT_SYMLINK_NOFOLLOW) != 0 {
+        FinalSymlinkPolicy::DoNotFollow
     } else {
-        // Relative path — use the caller's start handle.
-        vp = args.start;
+        FinalSymlinkPolicy::Follow
     }
+}
 
-    // Handle bare "/" — just return the root.
-    if path_len == 1 && unsafe { *path } == b'/' {
-        let mut res = NameiResult::empty();
-        res.vp = vp;
-        res.last_name = path;
-        res.last_name_len = 1;
-        return Ok(res);
+/// Validate the path's encoding against POSIX rules. Returns
+/// `false` on malformed input the dispatcher must reject with
+/// EINVAL — interior NUL byte (POSIX strings are NUL-terminated;
+/// an interior NUL is a wire-encoding bug) or oversize total
+/// length (longer than [`POSIX_PATH_MAX`]).
+///
+/// Component-level NAME_MAX checking happens lazily inside the
+/// walker so a single overlong component does not invalidate the
+/// entire path eagerly.
+#[inline]
+pub(crate) fn is_valid_path_encoding(path: &[u8]) -> bool {
+    if path.len() >= POSIX_PATH_MAX {
+        return false;
     }
-
-    let mut pos: usize = 0;
-
-    // Skip leading slashes for absolute paths.
-    while pos < path_len && unsafe { *path.add(pos) } == b'/' {
-        pos += 1;
+    if path.contains(&0) {
+        return false;
     }
+    true
+}
 
-    // Symlink scratch buffer — used when we need to concatenate a
-    // symlink target with the remaining path tail.
-    let mut sym_buf = [0u8; MAX_PATH_LEN];
-
-    // ---- Main component loop ----
-    while pos < path_len {
-        // Parse next component: advance past non-'/' bytes.
-        let comp_start = pos;
-        while pos < path_len && unsafe { *path.add(pos) } != b'/' {
-            pos += 1;
-        }
-        let comp_len = pos - comp_start;
-
-        // Skip trailing slashes after this component.
-        while pos < path_len && unsafe { *path.add(pos) } == b'/' {
-            pos += 1;
-        }
-
-        let is_last = pos >= path_len;
-
-        // Empty component (consecutive slashes) — skip.
-        if comp_len == 0 {
-            continue;
-        }
-
-        // ---- "." — stay at current vnode ----
-        if comp_len == 1 && unsafe { *path.add(comp_start) } == b'.' {
-            if is_last && (flags & NAMEI_DIRECTORY) != 0 && vnode_vtype(ctx, vp)? != VT_DIR {
-                return Err(VfsError::NotDir);
-            }
-            if is_last {
-                vp = cross_covered(ctx, vp)?;
-                return finish_namei(
-                    vp,
-                    VnodeHandle::INVALID,
-                    unsafe { path.add(comp_start) },
-                    1,
-                    flags,
-                );
-            }
-            continue;
-        }
-
-        // ---- ".." — walk up ----
-        if comp_len == 2
-            && unsafe { *path.add(comp_start) } == b'.'
-            && unsafe { *path.add(comp_start + 1) } == b'.'
-        {
-            vp = walk_dotdot(ctx, vp, args.root)?;
-            if is_last {
-                if (flags & NAMEI_DIRECTORY) != 0 && vnode_vtype(ctx, vp)? != VT_DIR {
-                    return Err(VfsError::NotDir);
-                }
-                return finish_namei(
-                    vp,
-                    VnodeHandle::INVALID,
-                    unsafe { path.add(comp_start) },
-                    2,
-                    flags,
-                );
-            }
-            continue;
-        }
-
-        // ---- Regular component lookup ----
-
-        // The current vnode must be a directory to descend into.
-        if vnode_vtype(ctx, vp)? != VT_DIR {
-            return Err(VfsError::NotDir);
-        }
-
-        // Cross into a covering mount before looking up the component.
-        vp = cross_covered(ctx, vp)?;
-
-        // Perform a single-component lookup via VopMetaOps::lookup.
-        let comp_ptr = unsafe { path.add(comp_start) };
-        let result = lookup_component(ctx, vp, comp_ptr, comp_len as u8);
-
-        match result {
-            Ok(child) if !child.is_valid() => {
-                // ENOENT — lookup returned Ok(INVALID).
-                if is_last && (flags & NAMEI_CREATE) != 0 {
-                    let mut res = NameiResult::empty();
-                    res.dvp = vp;
-                    res.last_name = comp_ptr;
-                    res.last_name_len = comp_len as u8;
-                    return Ok(res);
-                }
-                return Err(VfsError::NotFound);
-            }
-            Ok(child) => {
-                let dvp = vp;
-                vp = child;
-
-                // ---- Symbolic link handling ----
-                if vnode_vtype(ctx, vp)? == VT_LNK {
-                    let should_follow = if is_last {
-                        (flags & NAMEI_FOLLOW) != 0
-                            && (flags & NAMEI_NOFOLLOW_ANY) == 0
-                            && (flags & NAMEI_NOFOLLOW_FINAL) == 0
-                    } else {
-                        (flags & NAMEI_NOFOLLOW_ANY) == 0
-                    };
-
-                    let mount_nosym = mount_nosymfollow(ctx, vp);
-
-                    if should_follow && !mount_nosym {
-                        if sym_depth >= NAMEI_SYMLINK_MAX_DEPTH {
-                            return Err(VfsError::Loop);
-                        }
-
-                        // Read the symlink target.
-                        let mut target_buf = [0u8; MAX_PATH_LEN];
-                        let target_len = readlink_vnode(
-                            ctx,
-                            vp,
-                            target_buf.as_mut_ptr(),
-                            MAX_PATH_LEN,
-                            &args.cred,
-                        )?;
-
-                        if target_len == 0 {
-                            return Err(VfsError::Io);
-                        }
-
-                        // Build the new path: target + "/" + remaining.
-                        let remaining = path_len - pos;
-                        let new_len = target_len + if remaining > 0 { 1 + remaining } else { 0 };
-                        if new_len > MAX_PATH_LEN {
-                            return Err(VfsError::NameTooLong);
-                        }
-
-                        for i in 0..target_len {
-                            sym_buf[i] = target_buf[i];
-                        }
-                        if remaining > 0 {
-                            sym_buf[target_len] = b'/';
-                            for i in 0..remaining {
-                                sym_buf[target_len + 1 + i] = unsafe { *path.add(pos + i) };
-                            }
-                        }
-
-                        // Determine the new start vnode for the recursive walk.
-                        let new_start = if target_buf[0] == b'/' {
-                            // Absolute symlink target — start from namespace root.
-                            if !args.root.is_valid() {
-                                return Err(VfsError::Io);
-                            }
-                            args.root
-                        } else {
-                            // Relative symlink target — start from parent dir.
-                            dvp
-                        };
-
-                        let inner_args = NameiArgs {
-                            start: new_start,
-                            path: sym_buf.as_ptr(),
-                            path_len: new_len as u16,
-                            flags,
-                            cred: args.cred,
-                            root: args.root,
-                        };
-                        return namei_posix_inner(ctx, &inner_args, sym_depth + 1);
-                    }
-
-                    // Not following the symlink (lstat / O_NOFOLLOW).
-                    if is_last {
-                        return finish_namei(vp, dvp, comp_ptr, comp_len as u8, flags);
-                    }
-                    // Intermediate non-followed symlink is an error — cannot
-                    // traverse through a non-directory.
-                    return Err(VfsError::NotDir);
-                }
-
-                // ---- Non-symlink child ----
-
-                // If this is the last component, we're done.
-                if is_last {
-                    vp = cross_covered(ctx, vp)?;
-                    if (flags & NAMEI_DIRECTORY) != 0 && vnode_vtype(ctx, vp)? != VT_DIR {
-                        return Err(VfsError::NotDir);
-                    }
-                    return finish_namei(vp, dvp, comp_ptr, comp_len as u8, flags);
-                }
-
-                // Not the last component — continue with child as current.
-                // No vrele needed — handles are lightweight identity tokens.
-            }
-            Err(e) => {
-                // Lookup error on an intermediate or final component.
-                if is_last && (flags & NAMEI_CREATE) != 0 && e == VfsError::NotFound {
-                    let mut res = NameiResult::empty();
-                    res.dvp = vp;
-                    res.last_name = comp_ptr;
-                    res.last_name_len = comp_len as u8;
-                    return Ok(res);
-                }
-                return Err(e);
-            }
-        }
-    }
-
-    // Walked the entire path without hitting a return — the final vnode
-    // is the target. This happens when the path ended with trailing
-    // slashes (all consumed by the skip-slash loop).
-    vp = cross_covered(ctx, vp)?;
-    if (flags & NAMEI_DIRECTORY) != 0 && vnode_vtype(ctx, vp)? != VT_DIR {
-        return Err(VfsError::NotDir);
-    }
-
-    let mut res = NameiResult::empty();
-    res.vp = vp;
-    Ok(res)
+/// Determine whether a path is absolute (starts with `/`).
+/// Absolute paths root at [`WalkRoot::NamespaceRoot`]; relative
+/// paths use the policy's [`WalkRoot`].
+#[inline]
+pub(crate) const fn is_absolute(path: &[u8]) -> bool {
+    !path.is_empty() && path[0] == b'/'
 }

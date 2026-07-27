@@ -19,7 +19,10 @@
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 use trona_posix::*;
 
@@ -45,9 +48,8 @@ struct PamResponse {
     resp_retcode: i32,
 }
 
-type PamConvFn = unsafe extern "C" fn(
-    i32, *const *const PamMessage, *mut *mut PamResponse, *mut u8,
-) -> i32;
+type PamConvFn =
+    unsafe extern "C" fn(i32, *const *const PamMessage, *mut *mut PamResponse, *mut u8) -> i32;
 
 #[repr(C)]
 struct PamConv {
@@ -96,10 +98,10 @@ const PAM_TTY: i32 = 3;
 const MAX_ATTEMPTS: i32 = 3;
 const RTLD_NOW: i32 = 0x0002;
 
-type OpenpamTtyconvFn = unsafe extern "C" fn(
-    i32, *const *const PamMessage, *mut *mut PamResponse, *mut u8,
-) -> i32;
-type PamStartFn = unsafe extern "C" fn(*const u8, *const u8, *const PamConv, *mut *mut PamHandle) -> i32;
+type OpenpamTtyconvFn =
+    unsafe extern "C" fn(i32, *const *const PamMessage, *mut *mut PamResponse, *mut u8) -> i32;
+type PamStartFn =
+    unsafe extern "C" fn(*const u8, *const u8, *const PamConv, *mut *mut PamHandle) -> i32;
 type PamEndFn = unsafe extern "C" fn(*mut PamHandle, i32) -> i32;
 type PamAuthFn = unsafe extern "C" fn(*mut PamHandle, i32) -> i32;
 type PamGetUserFn = unsafe extern "C" fn(*mut PamHandle, *mut *const u8, *const u8) -> i32;
@@ -183,18 +185,21 @@ impl PamApi {
 
 impl Drop for PamApi {
     fn drop(&mut self) {
-        unsafe {
-            if !self.handle.is_null() {
-                dlclose(self.handle);
-            }
+        if !self.handle.is_null() {
+            dlclose(self.handle);
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    trona_runtime::debug::serial::serial_puts(b"[LOGIN] main entered\n");
     unsafe {
+        trona_runtime::debug::serial::serial_puts(b"[LOGIN] calling PamApi::load\n");
         let Some(pam) = PamApi::load() else {
+            trona_runtime::debug::serial::serial_puts(
+                b"[LOGIN] PamApi::load returned None, exiting(1)\n",
+            );
             write_str(2, b"login: failed to load /usr/lib/libpam.so\n");
             let err = dlerror();
             if !err.is_null() {
@@ -203,6 +208,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             }
             posix_exit(1);
         };
+        trona_runtime::debug::serial::serial_puts(b"[LOGIN] PamApi::load OK\n");
 
         preflight_login_pam_modules();
 
@@ -210,6 +216,16 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
         // before handing control to the interactive shell.
         let mut saved_termios = Termios::zeroed();
         let have_saved_termios = posix_tcgetattr(0, &raw mut saved_termios) == 0;
+
+        let tty_dev = posix_get_session_tty_dev();
+        let mut tty_env_buf = [0u8; 40];
+        let mut pam_tty_buf = [0u8; 32];
+        if tty_dev <= 0
+            || !build_current_tty_strings(tty_dev as u64, &mut tty_env_buf, &mut pam_tty_buf)
+        {
+            write_str(2, b"login: failed to resolve controlling tty\n");
+            posix_exit(1);
+        }
 
         // Extract username from argv[1] if provided (getty may pass it)
         let mut preset_user: *const u8 = core::ptr::null();
@@ -241,22 +257,23 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
 
             // Start PAM session
             let mut pamh: *mut PamHandle = core::ptr::null_mut();
-            let ret = (pam.pam_start)(
-                b"login\0".as_ptr(),
-                preset_user,
-                &conv,
-                &mut pamh,
-            );
+            let ret = (pam.pam_start)(b"login\0".as_ptr(), preset_user, &conv, &mut pamh);
             if ret != PAM_SUCCESS {
                 report_pam_error(&pam, pamh, b"login: pam_start failed: ", ret);
                 posix_exit(1);
             }
 
-            // PAM_TTY should be the tty name ("pts/0"), not the device path.
+            // PAM_TTY should be the tty name ("console" or "pts/N"), not the
+            // device path.
             // pam_securetty looks up this value in /etc/ttys.
-            let tty_ret = (pam.pam_set_item)(pamh, PAM_TTY, b"pts/0\0".as_ptr());
+            let tty_ret = (pam.pam_set_item)(pamh, PAM_TTY, pam_tty_buf.as_ptr());
             if tty_ret != PAM_SUCCESS {
-                report_pam_error(&pam, pamh, b"login: pam_set_item(PAM_TTY) failed: ", tty_ret);
+                report_pam_error(
+                    &pam,
+                    pamh,
+                    b"login: pam_set_item(PAM_TTY) failed: ",
+                    tty_ret,
+                );
                 (pam.pam_end)(pamh, tty_ret);
                 posix_exit(1);
             }
@@ -264,11 +281,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             // If no preset user, prompt via PAM
             let mut user_ptr: *const u8 = core::ptr::null();
             if preset_user.is_null() {
-                let pret = (pam.pam_get_user)(
-                    pamh,
-                    &mut user_ptr,
-                    b"login: \0".as_ptr(),
-                );
+                let pret = (pam.pam_get_user)(pamh, &mut user_ptr, b"login: \0".as_ptr());
                 if pret != PAM_SUCCESS || user_ptr.is_null() || *user_ptr == 0 {
                     if have_saved_termios {
                         let _ = posix_tcsetattr(0, 0, &raw const saved_termios);
@@ -292,11 +305,11 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
                 (pam.pam_end)(pamh, auth_ret);
                 preset_user = core::ptr::null();
                 // Brief delay to deter brute force
-                trona::syscall::syscall(
-                    trona::SYS_NANOSLEEP, 0,
-                    2_000_000_000u64, // 2 seconds
-                    0, 0, 0, 0,
-                );
+                let req = Timespec {
+                    tv_sec: 2,
+                    tv_nsec: 0,
+                };
+                let _ = posix_nanosleep(&raw const req, core::ptr::null_mut());
                 continue;
             }
 
@@ -337,9 +350,8 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
 
             // Collect supplementary groups from /etc/group
             let mut sup_groups = [0u32; 32];
-            let mut nsup = 0usize;
             sup_groups[0] = gid;
-            nsup = 1;
+            let mut nsup = 1usize;
 
             setgrent();
             loop {
@@ -385,7 +397,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
 
             // Build environment for the shell
             let mut path_buf = [0u8; 48];
-            build_env_var(&mut path_buf, b"PATH=", trona::consts::posix::DEFAULT_PATH);
+            build_env_var(&mut path_buf, b"PATH=", trona_posix::consts::DEFAULT_PATH);
 
             let mut home_buf = [0u8; 80];
             build_env_var_cstr(&mut home_buf, b"HOME=", home);
@@ -403,7 +415,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             let shell_path = if !shell.is_null() && *shell != 0 {
                 shell
             } else {
-                b"/bin/bash\0".as_ptr()
+                b"/usr/bin/bash\0".as_ptr()
             };
 
             // Extract shell basename for argv[0] (prefixed with '-' for login shell)
@@ -417,10 +429,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             }
             shell_name[k + 1] = 0;
 
-            let new_argv: [*const u8; 2] = [
-                shell_name.as_ptr(),
-                core::ptr::null(),
-            ];
+            let new_argv: [*const u8; 2] = [shell_name.as_ptr(), core::ptr::null()];
 
             let new_envp: [*const u8; 8] = [
                 path_buf.as_ptr(),
@@ -429,7 +438,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
                 user_buf.as_ptr(),
                 logname_buf.as_ptr(),
                 b"TERM=vt100\0".as_ptr(),
-                b"TTY=/dev/pts/0\0".as_ptr(),
+                tty_env_buf.as_ptr(),
                 core::ptr::null(),
             ];
 
@@ -443,15 +452,16 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             // Exec the shell
             posix_execve(shell_path, new_argv.as_ptr(), new_envp.as_ptr());
 
-            // If execve failed, try /bin/bash as fallback
-            write_str(2, b"login: exec shell failed, trying /bin/bash\n");
-            let fallback_argv: [*const u8; 2] = [
-                b"-bash\0".as_ptr(),
-                core::ptr::null(),
-            ];
-            posix_execve(b"/bin/bash\0".as_ptr(), fallback_argv.as_ptr(), new_envp.as_ptr());
+            // If execve failed, try /usr/bin/bash as fallback
+            write_str(2, b"login: exec shell failed, trying /usr/bin/bash\n");
+            let fallback_argv: [*const u8; 2] = [b"-bash\0".as_ptr(), core::ptr::null()];
+            posix_execve(
+                b"/usr/bin/bash\0".as_ptr(),
+                fallback_argv.as_ptr(),
+                new_envp.as_ptr(),
+            );
 
-            write_str(2, b"login: exec /bin/bash failed\n");
+            write_str(2, b"login: exec /usr/bin/bash failed\n");
             posix_exit(1);
         }
     }
@@ -461,10 +471,104 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn append_decimal(buf: &mut [u8], pos: &mut usize, mut value: u64) -> bool {
+    if value == 0 {
+        if *pos >= buf.len() {
+            return false;
+        }
+        buf[*pos] = b'0';
+        *pos += 1;
+        return true;
+    }
+
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    while value != 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    if *pos + count > buf.len() {
+        return false;
+    }
+    while count != 0 {
+        count -= 1;
+        buf[*pos] = digits[count];
+        *pos += 1;
+    }
+    true
+}
+
+fn build_current_tty_strings(tty_dev: u64, tty_env: &mut [u8], pam_tty: &mut [u8]) -> bool {
+    let mut tty_env_pos = 0usize;
+    let tty_prefix = b"TTY=";
+    if tty_prefix.len() >= tty_env.len() {
+        return false;
+    }
+    while tty_env_pos < tty_prefix.len() {
+        tty_env[tty_env_pos] = tty_prefix[tty_env_pos];
+        tty_env_pos += 1;
+    }
+
+    let mut pam_pos = 0usize;
+    if tty_dev == trona_posix::consts::TTY_DEV_CONSOLE {
+        let tty_suffix = b"/dev/console";
+        let pam_suffix = b"console";
+        if tty_env_pos + tty_suffix.len() + 1 > tty_env.len()
+            || pam_suffix.len() + 1 > pam_tty.len()
+        {
+            return false;
+        }
+        for &b in tty_suffix {
+            tty_env[tty_env_pos] = b;
+            tty_env_pos += 1;
+        }
+        for &b in pam_suffix {
+            pam_tty[pam_pos] = b;
+            pam_pos += 1;
+        }
+    } else if tty_dev >= trona_posix::consts::TTY_DEV_PTS_BASE {
+        let pty_id = tty_dev - trona_posix::consts::TTY_DEV_PTS_BASE;
+        let tty_suffix = b"/dev/pts/";
+        let pam_prefix = b"pts/";
+        if tty_env_pos + tty_suffix.len() + 1 > tty_env.len()
+            || pam_prefix.len() + 1 > pam_tty.len()
+        {
+            return false;
+        }
+        for &b in tty_suffix {
+            tty_env[tty_env_pos] = b;
+            tty_env_pos += 1;
+        }
+        for &b in pam_prefix {
+            pam_tty[pam_pos] = b;
+            pam_pos += 1;
+        }
+        if !append_decimal(tty_env, &mut tty_env_pos, pty_id)
+            || !append_decimal(pam_tty, &mut pam_pos, pty_id)
+        {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if tty_env_pos >= tty_env.len() || pam_pos >= pam_tty.len() {
+        return false;
+    }
+    tty_env[tty_env_pos] = 0;
+    pam_tty[pam_pos] = 0;
+    true
+}
+
 unsafe fn write_str(fd: i32, s: &[u8]) {
     unsafe {
         let len = s.len();
-        let wlen = if len > 0 && s[len - 1] == 0 { len - 1 } else { len };
+        let wlen = if len > 0 && s[len - 1] == 0 {
+            len - 1
+        } else {
+            len
+        };
         posix_write(fd, s.as_ptr(), wlen as u64);
     }
 }
@@ -566,8 +670,12 @@ unsafe fn cstr_eq(a: *const u8, b: *const u8) -> bool {
         loop {
             let ca = *a.add(i);
             let cb = *b.add(i);
-            if ca != cb { return false; }
-            if ca == 0 { return true; }
+            if ca != cb {
+                return false;
+            }
+            if ca == 0 {
+                return true;
+            }
             i += 1;
         }
     }
@@ -576,10 +684,16 @@ unsafe fn cstr_eq(a: *const u8, b: *const u8) -> bool {
 fn build_env_var(dst: &mut [u8], key: &[u8], val: &[u8]) {
     let mut i = 0;
     for &b in key {
-        if i < dst.len() - 1 { dst[i] = b; i += 1; }
+        if i < dst.len() - 1 {
+            dst[i] = b;
+            i += 1;
+        }
     }
     for &b in val {
-        if i < dst.len() - 1 { dst[i] = b; i += 1; }
+        if i < dst.len() - 1 {
+            dst[i] = b;
+            i += 1;
+        }
     }
     dst[i] = 0;
 }
@@ -587,7 +701,10 @@ fn build_env_var(dst: &mut [u8], key: &[u8], val: &[u8]) {
 unsafe fn build_env_var_cstr(dst: &mut [u8], key: &[u8], val: *const u8) {
     let mut i = 0;
     for &b in key {
-        if i < dst.len() - 1 { dst[i] = b; i += 1; }
+        if i < dst.len() - 1 {
+            dst[i] = b;
+            i += 1;
+        }
     }
     if !val.is_null() {
         unsafe {

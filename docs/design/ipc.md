@@ -1,370 +1,556 @@
 # IPC Design
 
-This document describes the Inter-Process Communication system in SaltyOS.
+This document describes the Inter-Process Communication system in
+SaltyOS / kernite.
 
 ## Overview
 
-SaltyOS implements two IPC primitives:
+kernite is a Fuchsia-style edge microkernel: every cross-process
+communication primitive is a kernel object reached through the
+single `KERNITE_SYS_INVOKE` syscall. There is no rendezvous-style
+endpoint, no asynchronous notification bitmap, and no kernel-side
+multiplexing primitive. Instead, the IPC surface is decomposed
+along three planes:
 
-1. **Endpoints**: Synchronous, rendezvous-style message passing
-2. **Notifications**: Lightweight asynchronous signaling
+| Plane | Primitives | Concern |
+|-------|-----------|---------|
+| **IPC plane** | `MessagePipe` (records + cap carriers + `MP_CALL` / reply-marked `MP_WRITE`), `DataPipe` (byte stream / datagram), per-task fault `MessagePipe`, `Futex` | Synchronous data + cap transfer between threads |
+| **Event plane** | `EventQueue` (bounded record ring), `Watch` (state-mask registration on a watchable object), `Timer` (ns-precision deadline arm) | Asynchronous state-change delivery |
+| **Wait / wake plane** | `deadline_queue` (`Sleep` / `FutexTimed` / `IpcTimeout` / `TimerFire`), `WakeTransition` plans | Bounded blocking + timeout enforcement |
 
-This dual-primitive design follows the L4/seL4 tradition, providing both reliable message passing and efficient event notification.
+Cross-cutting:
+
+- All transport objects use the **Core + Side** split: a
+  `MessagePipeCore` / `DataPipeCore` carries the cross-side state
+  (rings, locks, waiter queues, watcher lists), and two lightweight
+  side handles each reference the same core. Closing one side
+  asserts `STATE_PEER_CLOSED` on the other; reaping the last side
+  reaps the core. There is no peer pointer between sides — every
+  cross-side interaction routes through the core under its own
+  lock, eliminating refcount cycles and use-after-reap on a half-
+  closed channel.
+- Capability transfer rides on **`CapRef` move semantics**: at
+  `MP_WRITE` the kernel validates each carrier's `TRANSFER` right,
+  `take_ref`s it out of the sender's CNode (sender slot becomes
+  empty), and stores the moved `CapRef` in the message's hidden
+  carrier array. The underlying global slot's CDT linkage and
+  object refcount are untouched. At `MP_READ` the receiver's
+  install path `insert_ref`s each carrier into the receiver's
+  CNode. On install failure the message stays at the head of the
+  ring and the carriers are rolled back via the canonical
+  `CDT::delete_capability` teardown if reinsertion races a sibling
+  thread that filled the sender slot.
+- Every blocking transport syscall honours an `IpcBuffer.timeout_ns`
+  knob: `0` = non-blocking (`KERNITE_ERR_WOULD_BLOCK`), `u64::MAX`
+  = wait forever, finite = arm an `IpcTimeout` deadline so the
+  syscall returns `KERNITE_ERR_TIMED_OUT` if the wake doesn't
+  arrive in time.
 
 ## Implementation Status
 
 | Feature | Status |
 |---------|--------|
-| Endpoint send/recv | Implemented |
-| Endpoint call/reply_recv | Implemented |
-| NBSend (non-blocking) | Implemented |
-| Notifications (signal/wait/poll) | Implemented |
-| Combined notification + endpoint wait | Implemented |
-| IPC buffer overflow (MR4-MR19) | Implemented |
-| Capability transfer via IPC | Implemented |
-| Fault delivery via endpoint | Implemented |
-| IPC assembly fastpath | Implemented |
-| Timed IPC (SendTimed/RecvTimed) | Implemented |
-| Multi-endpoint receive (RecvAny/ReplyRecvAny) | Implemented |
-| Timed multi-endpoint receive (RecvAnyTimed/ReplyRecvAnyTimed) | Implemented |
-| Notification return (NotifReturn) | Implemented |
-| Futex (userspace mutex primitive) | Implemented |
-| IPC wait queue management | Implemented |
+| `MessagePipe` `MP_WRITE` / `MP_READ` / `MP_CLOSE` | Implemented |
+| `MessagePipe` `MP_CALL` / reply-marked `MP_WRITE` | Implemented |
+| `MessagePipe` cross-CPU `try_write_fast` (mailbox publish) | Implemented |
+| `MessagePipeCore` / `DataPipeCore` retype + `MP_PAIR` / `DP_PAIR` | Implemented |
+| `DataPipe` `DP_PRODUCE` / `DP_CONSUME` (peek-then-commit) / `DP_QUERY` / `DP_CLOSE` | Implemented |
+| `DataPipe` datagram mode + RX/TX thresholds + half-close (`DP_SHUTDOWN`) | Implemented |
+| `EventQueue` `EQ_WAIT` / `EQ_POLL` / `EQ_CANCEL` | Implemented |
+| `Watch` `WATCH_REGISTER` / `WATCH_DISARM` (one-shot, lost-wakeup-free) | Implemented |
+| `Timer` `TIMER_SET` / `TIMER_CANCEL` / `TIMER_QUERY` (one-shot + periodic) | Implemented |
+| Per-task fault `MessagePipe` (`TCB_SET_FAULT_PIPE`) | Implemented |
+| Capability transfer via IPC carrier array | Implemented |
+| `IpcTimeout` deadline integration | Implemented |
+| Futex (wait / wake / requeue, optional `IpcTimeout`) | Implemented |
+| v1 IPC fastpath (`MP_WRITE` → mailbox publish to peer parked on `PipeRead`) | Implemented |
+| Full assembly fastpath retarget (Send / Recv / Call / ReplyRecv) | Pending (`F` step) |
 
-## Synchronous IPC (Endpoints)
+## Single Syscall — `KERNITE_SYS_INVOKE`
 
-### Concept
+Every operation is a capability invocation. `KERNITE_SYS_INVOKE`
+takes `(cap_ptr, msg_info, mr0, mr1, mr2, mr3)`. The `msg_info`
+word packs the invoke label + register count + extra-cap count;
+the per-object handler in `syscall/{pipe, event, mo, vspace, tcb,
+cap, sc, ioport, system, misc}.rs` reads inline MR overflow from
+the calling thread's IPC buffer.
 
-An Endpoint is a kernel object that facilitates synchronous message passing between threads:
+Invoke labels are blocked into 0x20-stride hex regions per object
+type (see `kernite/include/uapi/invoke.h`). Dispatch keys on
+`(cap.obj_type, label)`; two object types may share a label hex
+slot since dispatch is type-disambiguated.
 
-- **Rendezvous**: Sender blocks until receiver is ready (and vice versa)
-- **Badge**: Identifies sender to receiver (set via `CNode_Mint`)
-- **Reply capability**: One-shot reply path for Call/ReplyRecv RPC pattern
+## MessagePipe
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Endpoint
-    participant Server
+`MessagePipe` is the synchronous record-passing channel. Userland
+retypes one `MessagePipeCore` and two `MessagePipe` sides from an
+untyped, then calls `MP_PAIR(core_cap, side_a_cap, side_b_cap)` to
+wire them — each side bumps the core's refcount by one.
 
-    Note over Client: Wants to send message
-    Client->>Endpoint: send(msg)
-    Note over Client: BLOCKED (waiting for receiver)
-
-    Note over Server: Ready to receive
-    Server->>Endpoint: recv()
-    Note over Endpoint: Rendezvous!
-
-    Endpoint-->>Server: msg + sender_badge
-    Endpoint-->>Client: UNBLOCKED
-
-    Note over Server: Process request...
-
-    Server->>Client: reply(response)
-    Note over Client: Receives response
-```
-
-### Endpoint Structure
-
-```rust
-pub struct Endpoint {
-    pub header: KernelObject,
-    state: EndpointState,
-    send_queue: WaitQueue,
-    recv_queue: WaitQueue,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum EndpointState {
-    Idle,
-    SendBlocked,
-    RecvBlocked,
-}
-```
-
-### Message Format
-
-```rust
-/// IPC Message (kernel-internal)
-pub struct Message {
-    pub label: u64,      // Extracted from msg_info bits 51:12
-    pub length: usize,   // Extracted from msg_info bits 6:0
-    pub regs: [u64; 4],  // Inline register MRs (MR0-MR3)
-}
-```
-
-Messages carry up to 4 inline register words. For longer messages (length > 4), additional words overflow to the IPC buffer.
-
-### Message Info Word
-
-The msg_info word packs label, length, and extra caps count:
-
-```
-Bits  6:0  = Length (0-127)
-Bits 11:7  = ExtraCaps (0-31)
-Bits 51:12 = Label (40 bits)
-Bits 63:52 = Reserved
-```
-
-### IPC Buffer
-
-Each thread has an IPC buffer (4KB page) mapped at a configurable virtual address:
+### Record layout
 
 ```rust
 #[repr(C)]
-pub struct IpcBuffer {
-    pub msg: [u64; 22],         // 0x000: label, length, MR0..MR19 (176 bytes)
-    pub badge: u64,             // 0x0B0: Received badge
-    pub caps: [u64; 4],         // 0x0B8: Cap slots to transfer (sender-side)
-    pub receive_cnode: u64,     // 0x0D8: CNode for receiving caps
-    pub receive_index: u64,     // 0x0E0: Starting slot index
-    pub receive_depth: u64,     // 0x0E8: CNode depth
-    pub reserved: [u64; 478],   // 0x0F0: Future use (3824 bytes)
+pub struct MpRecord {
+    pub label: u64,
+    pub length: u64,
+    pub cap_count: u64,
+    pub flags: u64,    // KERNITE_MP_FLAG_* (CALL / REPLY / fault hint)
+    pub badge: u64,
+    pub words: [u64; MP_MSG_WORDS],
 }
 ```
 
-**Message overflow:** MR0-MR3 are passed in CPU registers for low latency. When length > 4, the kernel reads MR4-MR19 from the sender's IPC buffer and writes them to the receiver's IPC buffer.
-
-**Capability transfer:** The sender sets `caps[0..3]` to slot indices in its CNode. The receiver configures `receive_cnode`, `receive_index`, and `receive_depth` to specify where received capabilities should be placed. The `ExtraCaps` field in msg_info indicates how many caps to transfer.
-
-### Operations
-
-#### Send
-
-```
-Fastpath (receiver waiting):
-  1. Pop receiver from recv_queue
-  2. Set reply_tcb in receiver's TCB (for Call pattern)
-  3. Transfer message: copy MRs + badge to receiver's saved state
-  4. Transfer capabilities if ExtraCaps > 0
-  5. Wake receiver (enqueue to scheduler)
-
-Slowpath (no receiver):
-  1. Push sender onto send_queue
-  2. Set state to SendBlocked
-  3. Block current thread (context switch)
-```
-
-#### Receive
-
-```
-Fastpath (sender waiting):
-  1. Pop sender from send_queue
-  2. Extract message from sender's BlockedReason
-  3. Set reply_tcb in current thread's TCB
-  4. Transfer message to current thread
-  5. Wake sender (unless fault-blocked)
-
-Slowpath (no sender):
-  1. Push receiver onto recv_queue
-  2. Set state to RecvBlocked
-  3. Block current thread
-  4. On wake: read message from saved_caller_msg
-```
-
-#### Call (Send + Receive)
-
-Atomic send-then-block-for-reply:
-1. Perform send (which may fastpath or slowpath)
-2. Set current thread to ReplyWait blocked state
-3. Context switch
-4. On wake: reply message is in `saved_caller_msg`
-
-#### ReplyRecv
-
-Atomic reply-then-receive:
-1. Reply to `reply_tcb` (if non-null): copy reply message, wake caller
-2. Clear reply capability (one-shot)
-3. Perform receive on the endpoint
-
-### Capability Transfer
-
-When `ExtraCaps > 0` in the msg_info word, the kernel transfers capabilities from sender to receiver during message transfer:
-
-1. **Sender setup:** Write CNode slot indices into `ipc_buffer.caps[0..3]`
-2. **Receiver setup:** Configure `receive_cnode`, `receive_index`, `receive_depth`
-3. **Transfer:** For each cap (up to ExtraCaps count):
-   - Read sender's `caps[i]` (slot index in sender's CNode)
-   - Look up capability in sender's CSpace
-   - Check Grant right on the capability
-   - Copy into receiver's CNode at `receive_index + i`
-
-### Fault Delivery
-
-When a thread faults (page fault, invalid cap, etc.), the kernel delivers a fault message to the thread's fault handler endpoint:
-
-```
-Fault message format:
-  label  = fault type (e.g., VM_FAULT, CAP_FAULT)
-  length = 4
-  regs[0] = fault address
-  regs[1] = fault status / error code
-  regs[2] = faulting instruction pointer
-  regs[3] = reserved
-```
-
-The faulting thread is always blocked (even on fastpath). The fault handler receives a reply capability and can:
-- Map the missing page and reply to resume the thread
-- Kill the thread by not replying
-
-## Notifications
-
-### Concept
-
-Notifications provide lightweight, asynchronous signaling:
-
-- **Word-sized bitmap**: Very small kernel object
-- **Non-blocking signal**: Sender never blocks
-- **Coalescing**: Multiple signals merge (OR semantics)
-
-Use cases:
-- IRQ delivery
-- Event flags
-- Waking async waiters
-
-### Notification Structure
-
-```rust
-pub struct Notification {
-    pub header: KernelObject,
-    pub bits: AtomicU64,        // Pending notification bits
-    waiting: *mut Tcb,          // Thread directly Wait()-ing
-    pub bound_tcb: *mut Tcb,    // Thread with this notification bound
-}
-```
-
-The `bound_tcb` field maintains a bidirectional link with the TCB's `bound_notification` pointer. Bind/unbind operations update both sides, and cleanup on either object destruction clears the back-pointer to prevent use-after-free.
+The wire layout matches `kernite_mp_record` in `uapi/ipc.h`. Each
+ring slot pairs an `MpRecord` with a `[CapRef; MP_MSG_CAPS]`
+carrier array; the pairing is invisible to userspace (the receiver
+sees only the install slots' indices).
 
 ### Operations
 
-#### Signal
+- **`MP_WRITE`** — non-blocking enqueue per attempt; the syscall
+  layer drives a retry loop with `block_writer_with_timeout` so
+  `timeout_ns` can park the caller on the writer waiter queue with
+  an `IpcTimeout` deadline. `TryWriteErr::PeerClosed` surfaces
+  immediately as `KERNITE_ERR_PEER_CLOSED`; `TryWriteErr::WouldBlock`
+  becomes `KERNITE_ERR_WOULD_BLOCK` (timeout=0) or parks the
+  caller.
+- **`MP_READ`** — fastpath drains the caller's `MpFastMailbox`
+  first (5-state CAS protocol pinning the source via refcount).
+  Otherwise `peek_and_claim` reserves the head ring slot under the
+  core lock, the syscall layer runs the install closure
+  **outside** the lock so it can take `CAP_LOCK` to walk the
+  receiver CNode, and `pop_claimed` advances the head only if the
+  install succeeded. Install failure writes the (possibly
+  partially-rolled-back) carrier snapshot back via
+  `release_claim_with_carriers` so the next reader sees the
+  surviving `CapRef`s.
+- **`MP_CLOSE`** — asserts `STATE_CLOSED` on this side and
+  `STATE_PEER_CLOSED` on the other, drains both sides' waiter
+  queues, and republishes state to any registered watches. The
+  ring carriers are NOT cleaned here (CAP_LOCK ordering forbids
+  taking it under the core lock); the `MessagePipeCore` finalizer
+  drains them via `drain_carriers_via_cdt` when the core's
+  refcount reaches zero.
+- **`MP_CALL` / reply-marked `MP_WRITE`** — see the next section.
 
-Atomically ORs bits into the notification word. Wake behavior:
-1. If a thread is directly waiting (via `Wait` syscall), wake it with accumulated bits.
-2. Otherwise, if `bound_tcb` is non-null and the bound thread is `RecvBlocked` on an endpoint, remove it from the endpoint's recv queue and deliver the notification bits as the badge.
+### Cross-CPU `try_write_fast`
 
-#### Wait
+When the peer side already has a thread parked on `PipeRead`, the
+fastpath skips the bounded ring entirely: it pins the `MessagePipeCore`
+via refcount, publishes the `MpRecord` into the parked thread's
+`mp_fast_mailbox` (`MailboxKind::Message`) under a 5-state CAS
+protocol, and dispatches the wake plan (which handles same- or
+cross-CPU IPI). Bailouts: `record.cap_count != 0`,
+`record.length > 4`, unpaired pipe, side closed, or no waiter
+parked — in all cases the caller's record is untouched and the
+slowpath retries.
 
-If notification word is non-zero: returns immediately with value (word is cleared). Otherwise, blocks until signaled.
+## MP_CALL / reply-marked MP_WRITE
 
-#### Poll
+`MP_CALL` is a synchronous convenience over `MessagePipe`: the
+caller writes a request record with `KERNITE_MP_FLAG_CALL` and a
+kernel-generated transaction id, then blocks as a call waiter. A
+server reads the request with `MP_READ`, captures `mp_txid`, and
+answers with a reply-marked `MP_WRITE` carrying the same txid in the
+IPC buffer metadata.
 
-Non-blocking check. Returns current word value or WouldBlock.
+No separate reply object or reply syscall exists. The txid is only a
+message-header correlation field: matching replies complete the
+blocked caller directly, while unmatched reply-marked writes remain
+ordinary queued records for the peer to read later. This follows the
+Zircon channel-call shape more closely than a one-shot reply-cap
+object.
 
-### Combined Notification + Endpoint Wait
+Transaction-id ranges follow Zircon's split so sync and async traffic
+share one pipe without collision: the kernel allocates `MP_CALL` txids
+in the reserved **high** range (`KERNITE_MP_TXID_KERNEL_BIT`, bit 63
+set), while userspace `MP_WRITE` request/reply correlation txids must
+stay in the **low** range (bit clear). `txid == 0` is the
+"no correlation" sentinel (also used by kernel fault delivery). A
+userspace write that forges a high-range txid is rejected, so an async
+write can never spoof a reply to a parked sync caller.
 
-A thread can bind a notification to itself via `TCB_BindNotification`. The kernel maintains a bidirectional link: `tcb.bound_notification` ↔ `notification.bound_tcb`.
+`MP_CALL` order of operations:
 
-When calling `recv()` on an endpoint with no sender waiting, the kernel checks the bound notification for pending bits before blocking. If bits are pending, they are atomically swapped out and returned immediately as the badge (with an empty message), avoiding the block entirely.
+1. Validate per-message cap budget (`cap_count <= MP_MSG_CAPS`) and
+   move outgoing carrier caps into kernel-owned carrier slots.
+2. Mark the request record with `KERNITE_MP_FLAG_CALL` and the
+   sender cap badge, allocate a non-zero txid, and register the
+   caller as a waiter for that txid.
+3. `try_call_write_record` retry loop. `PeerClosed` or timeout rolls
+   the carriers back into the caller's CSpace.
+4. Wait until a reply-marked write with the same txid arrives, then
+   copy that reply record into the caller's IPC buffer.
 
-Additionally, if a signal arrives on the bound notification while the thread is `RecvBlocked` on an endpoint, the signal handler wakes the thread by removing it from the endpoint's recv queue and delivering the notification bits. This enables servers to wait on both client IPC and async events (e.g., IRQs) simultaneously.
+`reply-marked MP_WRITE` order of operations:
 
-The IPC fastpath (ReplyRecv) bails to the slowpath when no sender is waiting, ensuring the bound notification check occurs correctly.
+1. Build an ordinary `MpRecord`.
+2. Set `KERNITE_MP_FLAG_REPLY`, copy the saved txid into
+   `ipc_buffer.mp_txid`, and send with `MP_WRITE`.
+3. If the txid matches a blocked caller, complete that waiter
+   directly. Otherwise enqueue the record on the peer side using the
+   same carrier-transfer path as ordinary `MP_WRITE`.
 
-## IRQ Handling
+## DataPipe
 
-IRQs are delivered via notifications:
+Bulk byte stream channel. Same Core + Side split as MessagePipe;
+no carrier arrays.
 
+Operations: `DP_PRODUCE` (byte/record append) / `DP_CONSUME`
+(byte/record drain) / `DP_QUERY` (pending byte count + state) /
+`DP_CLOSE` / `DP_SET_RX_THRESHOLD` / `DP_SET_TX_THRESHOLD` /
+`DP_SHUTDOWN`. The transport mode (byte stream vs datagram) is fixed at
+`DP_PAIR` time.
+
+`DP_CONSUME` uses a **peek-then-commit** protocol so a userspace
+copy fault (EFAULT) does not lose ring data:
+
+1. `try_consume_chunk` copies bytes from the head into a kernel
+   staging buffer **without** advancing the head.
+2. Syscall layer copies staging → user buffer.
+3. On user-copy success, `commit_consume(n)` advances the head and
+   republishes `STATE_WRITABLE` to the peer.
+4. On user-copy failure, the syscall returns `Ok(consumed_so_far)`
+   or `BadAddress`; the head stays put and the next read attempt
+   sees the same data.
+
+Producer side (`DP_PRODUCE`) uses the simpler push model — bytes
+go from a kernel staging buffer into the ring under the core
+lock; `try_produce_chunk` returns the byte count actually written
+and the syscall layer iterates with `block_dp_writer_with_timeout`
+on `WouldBlock`.
+
+DataPipe sides are designed for **single-reader-per-side**
+semantics; the cap-mediated layout makes each side a single-
+consumer endpoint, so peek-then-commit is race-free against the
+producer (different ring) and against itself (single reader).
+
+**Datagram mode** (`zx_socket` DATAGRAM parity) is selected at
+`DP_PAIR` time. Each record is length-prefixed (`[u32 len][payload]`)
+in the same ring: `DP_PRODUCE` writes one frame atomically
+(`WouldBlock` if it does not fit — a datagram is never split) and
+`DP_CONSUME` returns exactly one record, truncating to the caller's
+buffer while still dropping the whole frame. Max payload is
+`DATA_PIPE_MAX_DATAGRAM`.
+
+**RX/TX thresholds** (`DP_SET_RX_THRESHOLD` / `DP_SET_TX_THRESHOLD`,
+`0` disables) drive the watchable `STATE_READ_THRESHOLD` /
+`STATE_WRITE_THRESHOLD` signals: read-threshold asserts while inbound
+`used >= rx`, write-threshold while outbound `free >= tx` — Zircon
+`ZX_SOCKET_*_THRESHOLD` parity for backpressure hints.
+
+**Half-close** (`DP_SHUTDOWN`, `zx_socket_set_disposition` parity)
+disables one direction: further produce on that side returns
+`PeerClosed` and the peer reader drains the ring then sees EOF, while
+the reverse direction stays open.
+
+## EventQueue + Watch
+
+`EventQueue` is a bounded record ring with a dropped-event counter.
+Userland sizes it at retype time. `EQ_WAIT` / `EQ_POLL` drain the
+ring (one record at a time); the queue's own state is itself
+watchable, so a thread can wait on multiple EventQueues by
+arming `Watch`es against them and waiting on a parent EQ.
+
+`Watch` is a retypable kernel object that registers a `(state_mask,
+EventQueue, cookie)` triple against a watchable target object.
+When the target's `state_flags` transition asserts any bit in
+`state_mask`, the kernel atomically (1) detaches the watch from
+the target's `WatcherList` if `one_shot`, (2) bumps the watch's
+`KernelObject` refcount across the fire dispatch, (3) enqueues an
+`EVENT_TYPE_OBJECT_WATCH` record into the bound EventQueue. The
+fire is **lost-wakeup-free**: the assert and the watch list walk
+share the target's lock, so a watch registered while the bit was
+already set fires immediately on registration.
+
+Watchable objects (each with a `state_flags: AtomicU64` + a
+`WatcherList`):
+
+- `MessagePipe` (per-side): `READABLE / WRITABLE / PEER_CLOSED /
+  CLOSED`.
+- `DataPipe` (per-side): same.
+- `EventQueue`: `READABLE` (records pending), `OVERRUN`.
+- `IrqHandler`: `SIGNALED` (IRQ fired, awaiting `IRQ_ACK`).
+- `Timer`: transient `SIGNALED` on each fire.
+
+`IRQ_BIND_EQ` pins a refcount on the bound EventQueue so the
+`dispatch_irq` path in interrupt context can dereference
+`bound_eq` without locking. `IRQ_UNBIND_EQ` releases the pin.
+
+## Timer
+
+`Timer` arms an absolute monotonic ns deadline via `TIMER_SET`,
+optionally with `period_ns` for periodic schedules (with missed-
+period coalescing — if the dispatcher catches up `N` periods
+behind, it advances to the next future deadline rather than tight-
+looping). `TIMER_QUERY` reports the remaining ns to fire.
+
+Fires enqueue an `EVENT_TYPE_TIMER` record into the bound
+EventQueue and assert `STATE_SIGNALED` (transient — cleared at the
+end of fire so the next periodic publish fires watchers again).
+
+The timer object's deadline + `bound_eq` mutate under the timer's
+own lock; the deadline queue's membership pin is bumped via
+`KernelObject.ref_count` so a concurrent `cancel` on another CPU
+cannot release the EventQueue ref while a fire is still using it.
+
+## Fault delivery (reply-to-resume)
+
+A thread can install a fault `MessagePipe` via
+`TCB_SET_FAULT_PIPE`. When the thread takes a fault that the
+kernel cannot service inline (page fault without an MO mapping,
+illegal instruction, breakpoint trap, OOM during commit,
+user-issued fault intent), the arch fault handler builds an
+`MpRecord` carrying the fault label + diagnostic regs and hands
+the faulting thread to `ipc::fault::deliver_fault`.
+
+Fault delivery is **`MP_CALL`-shaped, not fire-and-forget**: the
+kernel writes the fault record with `KERNITE_MP_FLAG_CALL |
+KERNITE_MP_FLAG_FAULT`, parks the faulting thread on the bound
+fault pipe, and waits for a reply record on the same pipe. A reply
+with label `KERNITE_OK` resumes the faulting instruction; any
+non-OK, malformed reply, or closed fault pipe escalates to thread
+destroy.
+
+### Delivery sequence
+
+```mermaid
+sequenceDiagram
+    participant Hw as Arch fault entry
+    participant Faulter as Faulting thread
+    participant FaultPipe as Fault MessagePipe
+    participant Handler as Fault handler
+
+    Hw->>Hw: build fault MpRecord (label + regs)
+    Hw->>FaultPipe: deliver_fault(tcb, record)
+    Note over FaultPipe: write MP_CALL|MP_FLAG_FAULT<br/>with no hidden carrier
+    FaultPipe->>Handler: try_write_record (wakes parked MP_READ)
+    Note over Faulter: park on fault-pipe reply wait
+    Handler->>FaultPipe: MP_READ — fault record
+    Handler->>Handler: handle fault<br/>(commit page / instrument / log / decide)
+    Handler->>FaultPipe: reply-marked MP_WRITE(KERNITE_OK or error)
+    Note over Faulter: wake — read reply from fault pipe
+    Faulter->>Faulter: kernel returns to userspace<br/>at the faulting RIP/ELR (retry)
 ```
-Hardware IRQ → Kernel IRQ Handler → Signal Notification → Wake Driver Thread → Handle IRQ in Userspace → Ack via IRQHandler cap
-```
 
-Each IRQ handler object binds to a notification. When the IRQ fires, the kernel signals `1 << (irq_num % 64)` into the notification word.
+### Handler-side outcomes
 
-## Timed IPC
+The handler chooses the resumption policy by the reply it sends:
 
-Two additional syscalls extend the basic Send/Recv with timeout support:
+- **`reply-marked MP_WRITE` with `KERNITE_OK`** → caller resumes. The arch fault handler
+  returns to userspace at the *original* faulting RIP/ELR with
+  the original register state, so the same instruction is
+  retried. The handler is expected to have made the retry safe
+  before replying OK (e.g., committed the missing page via
+  `VSPACE_MAP_MO`, set up CoW, mapped a stack-extension MO).
+  Reply payload is currently informational only.
+- **`reply-marked MP_WRITE` with any non-OK label** → kernel destroys the
+  faulting thread.
+- **No reply** (handler exits or the fault pipe closes) → kernel
+  destroys the faulting thread. Same effect as an explicitly
+  rejected fault reply.
+- **`TCB_KILL` against the faulting thread** → handler kills the
+  thread directly; the faulter never resumes.
 
-| Syscall # | Name | Description |
-|-----------|------|-------------|
-| 21 | SendTimed | Blocking send with timeout (microseconds) |
-| 22 | RecvTimed | Blocking receive with timeout (microseconds) |
+### `deliver_fault` semantics
 
-When the timeout expires before a partner arrives, the blocked thread is removed
-from the endpoint's wait queue by the sleep queue timer and the syscall returns
-`TRONA_CANCELLED`. This uses the same sleep queue infrastructure as `NanoSleep`
-(syscall 13), implemented in `sched/sleep_queue.rs`.
+`deliver_fault(tcb, record)` runs in the arch fault entry path
+(EL1 exception or x86 IDT vector) and is responsible for the
+publish-and-wait dance the same way `MP_CALL` is in the syscall
+path:
 
-Timed IPC prevents indefinite blocking in client-server interactions. A server
-can use `RecvTimed` to periodically perform housekeeping even when no client
-requests arrive, and a client can use `SendTimed` to detect unresponsive servers.
+1. If `tcb.fault_pipe` is null, return `false` — the arch handler
+   escalates to `begin_destroy` immediately.
+2. Mark the fault record `MP_CALL | MP_FLAG_FAULT`, with no cap
+   carriers.
+3. `try_write_record` against the fault pipe. On `PeerClosed` or
+   `WouldBlock`, return `false`.
+4. Park `tcb` on the fault pipe's reader wait path and reschedule.
 
-## Multi-Endpoint Receive (RecvAny / ReplyRecvAny)
+When the parked faulter wakes, the arch return path reads a reply
+record:
 
-For servers that handle requests from multiple endpoints, the kernel provides
-multi-endpoint receive syscalls:
+- `reply-marked MP_WRITE` with label `KERNITE_OK` → return to userspace with
+  original register state — instruction retry.
+- Any other outcome → hand off to `begin_destroy`.
 
-| Syscall # | Name | Description |
-|-----------|------|-------------|
-| 23 | RecvAny | Block until a message arrives on any of N registered endpoints |
-| 24 | ReplyRecvAny | Reply to previous caller, then RecvAny |
-| 25 | RecvAnyTimed | RecvAny with timeout (microseconds) |
-| 26 | ReplyRecvAnyTimed | ReplyRecvAny with timeout |
+Fault label set lives in `kernite/include/uapi/fault.h`
+(`KERNITE_FAULT_NONE / PAGE_FAULT / ILLEGAL_INSTRUCTION /
+BREAKPOINT / USER_EXCEPTION / OOM / CAP`). Fault replies currently
+use `KERNITE_OK` for resume and any non-OK label for abort.
 
-Each thread can register up to 32 endpoints in its `RecvWaitLink` array
-(defined in `sched/thread.rs`, `MAX_RECV_WAIT_ENDPOINTS = 32`). When a RecvAny
-syscall is issued, the thread is simultaneously enqueued on all registered
-endpoint recv queues. Whichever endpoint receives a sender first wakes the
-thread and removes it from all other queues.
+## IPC timeout integration
 
-The return value indicates which endpoint was selected (`wait_index`), allowing
-the server to dispatch to the correct handler.
+Every blocking transport block path (`block_writer_with_timeout`,
+`block_reader_with_timeout`, `block_dp_writer_with_timeout`,
+`block_dp_reader_with_timeout`) follows the same template:
 
-## Notification Return (NotifReturn)
+1. Read `timeout_ns` from the caller's IPC buffer.
+   - `0` → return `WouldBlock` immediately.
+   - `u64::MAX` → no deadline armed.
+   - finite → arm `arm_thread_ipc_timeout(current, now + timeout)`.
+2. Push the caller onto the pipe's writer / reader waiter queue
+   via `enqueue_*_waiter` (which takes the queue's own
+   `sched_ref` pin) — block path itself does NOT take an extra
+   pin.
+3. `reschedule()`.
+4. After wake: `cancel_thread(current)` drops any unfired
+   deadline-queue pin (no-op if the deadline already fired).
+5. If `futex_wakeup_result == TimedOut`, the deadline fired —
+   call `MessagePipeCore::detach_waiter` /
+   `DataPipeCore::detach_waiter` to remove the (possibly stale)
+   waiter from the pipe queue. Per
+   `WakeTransition::PipeWait`'s contract, the deadline dispatch
+   only runs the wake plan; the waiter unlink is the caller's
+   responsibility.
 
-| Syscall # | Name | Description |
-|-----------|------|-------------|
-| 27 | NotifReturn | Return from notification dispatch handler |
+`sched_ref` accounting: each queue (pipe waiter + deadline) takes
+its own pin internally; the wake path that fires releases its
+pin via `wake_thread` (pipe queue) or `sched_ref_release_may_destroy`
+(deadline dispatch). Block helpers do not double-pin.
 
-When a thread has a notification dispatcher set (via `TCB_SET_NOTIFICATION_DISPATCHER`,
-label `0x4E`), incoming signals on the bound notification invoke the dispatcher
-function. `NotifReturn` (syscall 27) is used by the dispatcher to return to the
-interrupted context after handling the notification.
+## Userland reactor: async cross-service queries
+
+SaltyOS userland servers are single-threaded `EventQueue`-driven
+reactors. A reactor handler that makes a blocking `MP_CALL` to a peer
+**which can itself block on this reactor** deadlocks the pair. The
+canonical instance is **init ↔ VFS**: init's reactor blocks on VFS
+during `spawn` / `fork` / `exec`, so a VFS handler must never block on
+init. The invariant:
+
+> No VFS `EventLoop` handler may make a blocking `mp_call` to init.
+
+A synchronous call to an *always-replying* peer that never depends on
+the VFS reactor's progress is fine; only the cyclic edge is forbidden.
+
+VFS `/proc`, `kern.proc.*`, and ctty reads need init-owned process-table
+data, so they are **async-parked** (`core/vfs/src/owner/init_rpc.rs`):
+
+1. The read VOP allocates a per-read **snapshot** in
+   `VfsState.init_snapshots`, parks the client's reply-lease on it, and
+   fires the first sub-query with a non-blocking `mp_write_request_ctx`
+   carrying a low-range correlation `tx_id` (= the kernel `mp_txid`).
+   The VOP returns `Parked`; the reactor keeps running.
+2. init's reply rides the `KIND_INIT_REPLY` watch on VFS's init pipe and
+   is demuxed by `tx_id` (the per-query `PendingOp`'s `Resume::Init`
+   points back at the snapshot + plan stage) — **not** through the
+   backend-session 5-tuple that saltyfs / netsrv replies use.
+3. Each reply decodes into the snapshot; the chain issues the next plan
+   step (or, for `kern.proc.*` listings, the next kinfo page) until the
+   plan drains, then **re-enters the existing synchronous content
+   generator** against the snapshot and emits via the parked lease.
+
+Secondary attributes are joined from their own authorities during the
+same decode pass, synchronously, because those peers are not in the
+cycle: per-process memory from **mmsrv** (`MM_GET_CLIENT_VM_STATS`).
+
+### Controlling-terminal join (dump-first)
+
+A process's `tty_dev` (procfs `/proc/<pid>/stat` field 7, FreeBSD
+`KinfoProc.tty_dev`, the `kern.proc.tty` filter) lives in the tty layer
+— **posix_ttysrv** owns the session→pty binding — mirroring how a
+monolithic kernel reads `signal->tty` during the proc-table walk. VFS
+joins it, but posix_ttysrv delivers pty callbacks to VFS with a
+*blocking* `mp_write`, so posix_ttysrv can block on VFS: a synchronous
+VFS→ttysrv call would deadlock exactly like the init edge.
+
+So tty-bearing reads are **dump-first**: before the init query runs, the
+snapshot prefetches every active `(sid → tty_dev)` binding in one async
+`POSIX_TTYSRV_CTTY_DUMP` round-trip (≤ `MAX_PTYS`, fits one record) and
+caches them. `decode` then joins `tty_dev` locally per record from the
+cache — so a filter keyed on it (`kern.proc.tty`) works in the same
+pass, with no post-enrich fixup. The dump is best-effort: if
+posix_ttysrv is unreachable the cache stays empty and records report
+`tty_dev = 0` (honest "no controlling terminal"), never a hard failure.
+The single-pid on-demand path (`VFS_GET_CTTY_DEV`, `open("/dev/tty")`)
+keeps its own init→ttysrv async chain.
 
 ## Futex
 
-The kernel provides a userspace futex primitive (syscall 18, implemented in
-`ipc/futex.rs`) for building efficient userspace synchronization:
+Userspace futex on a `VSpace` cap (`VSPACE_FUTEX_WAIT` /
+`VSPACE_FUTEX_WAKE` / `VSPACE_FUTEX_REQUEUE`). The wait key is the
+`(VSpace, vaddr)` pair; the kernel hashes it to locate a wait bucket.
+`BlockedReason` is `FutexBlocked` (no timeout) or `FutexTimedBlocked`
+(timeout arm via `arm_thread_futex_timed`).
 
-| Operation | Description |
-|-----------|-------------|
-| FUTEX_WAIT | Sleep if `*uaddr == expected_val`, wake on FUTEX_WAKE |
-| FUTEX_WAKE | Wake up to N threads sleeping on `uaddr` |
-| FUTEX_REQUEUE | Wake N threads, requeue remaining to a different `uaddr` |
+`VSPACE_FUTEX_REQUEUE` (`zx_futex_requeue` shape) wakes up to `N`
+waiters on one futex and re-homes up to `M` of the remaining waiters
+onto a second futex in the same `VSpace`, acquiring the two bucket
+locks in ascending-index order to stay deadlock-free against an
+opposing requeue.
 
-The futex syscall takes a userspace virtual address as the wait key. The kernel
-hashes the (VSpace, vaddr) pair to locate the wait queue. Threads blocked on a
-futex have `BlockedReason::FutexBlocked` (or `FutexTimedBlocked` for timed waits)
-and can be woken by any thread that calls FUTEX_WAKE on the same address.
+Futexes are the building block for userspace mutexes, condition
+variables, semaphores, and rwlocks in trona (see
+`lib/trona/substrate/src/sync/`).
 
-Futexes are the building block for userspace mutexes, condition variables,
-semaphores, and rwlocks in trona (see `lib/trona/substrate/src/sync/`).
+## Lock ordering
 
-## IPC Wait Queue
+```
+CAP_LOCK
+  → mp_core.lock / dp_core.lock / eq.lock / tcb_lock   (per-object)
+    → scheduler.lock_cpu                                (per-CPU)
+      → VSpaceTracking.waiter_lock
+        → VSpace.lock
+          → MemoryObject.rmap_lock
+            → MM_LOCK / FRAME_LOCK
+```
 
-Wait queues (`ipc/queue.rs`) are the shared infrastructure underlying endpoint
-send/recv queues, notification waiters, and futex wait lists. Each queue is an
-intrusive linked list threaded through TCB fields (no heap allocation):
+Slowpath capture / install patterns nest the CAP_LOCK ↔ core lock
+relationship deliberately:
 
-- `tcb.queue_next` / `tcb.queue_prev` -- doubly-linked list pointers
-- Enqueue/dequeue are O(1) operations
-- Priority-ordered insertion is used when priority inheritance is active
+- **`MP_WRITE` capture**: `read_current_ipc_word` (no lock) →
+  `CAP_LOCK` → walk sender CNode + `take_ref` → release `CAP_LOCK`
+  → `core.lock` for `try_write_record`.
+- **`MP_READ` install**: `core.lock` for `peek_and_claim` →
+  release → `CAP_LOCK` for `install_carriers_into_receiver` →
+  release → `core.lock` for `pop_claimed` (or
+  `release_claim_with_carriers` on install failure).
+- **Drain on close**: `core.lock` (close / state mark / waiter
+  drain) — carriers stay in the ring. The
+  `MessagePipeCore` finalizer (refcount → 0, runs under
+  `CAP_LOCK`) calls `drain_all_carriers` which walks both rings
+  via the canonical `CDT::delete_capability` path.
 
 ## Performance Considerations
 
-### IPC Latency Goals
+### v1 IPC fastpath
 
-| Operation | Target Latency |
-|-----------|---------------|
-| Send/Recv (fastpath) | < 500 cycles |
-| Send/Recv (slowpath) | < 2000 cycles |
-| Notification signal | < 200 cycles |
-| Notification wait | < 300 cycles |
+`MP_WRITE` against a `MessagePipe` whose peer is parked on
+`PipeRead` skips the bounded ring entirely: the kernel pins the
+`MessagePipeCore` via refcount, publishes the `MpRecord` into the
+parked thread's `mp_fast_mailbox` under a 5-state CAS, and
+dispatches the wake plan. Same- and cross-CPU wakes share the
+plan — the wake helper handles IPI dispatch. Bailouts return the
+caller's record untouched and the slowpath retries.
 
-### Optimization Techniques
+### Optimization techniques
 
-1. **Register passing**: MR0-MR3 in CPU registers, not memory
-2. **Direct switch**: Skip scheduler for IPC rendezvous
-3. **Lazy FPU**: Don't save FPU unless used
-4. **No allocation**: All structures pre-allocated
-5. **Assembly fastpath**: Hybrid asm/Rust fastpath for Call + ReplyRecv (short messages, no cap transfer)
+1. **Connection-local replies** — `MP_CALL` publishes one request
+   and immediately waits on the caller's side of the same
+   `MessagePipe`; services use one connection per client or carry a
+   transaction id in the payload for multiplexing.
+2. **Register passing** — MR0..MR3 in CPU registers; MR4..MR19
+   overflow through the IPC buffer.
+3. **Per-thread mp_fast_mailbox** — 5-state CAS protocol pins the
+   source via refcount across the publish-claim window, so the
+   raw pointer is safe to dereference even if the source is
+   reaped between publish and claim.
+4. **No allocation in the hot path** — every per-call structure
+   lives in pre-existing kernel storage (carrier rings, futex
+   waiter slots, untyped-derived objects).
+5. **Lost-wakeup-free Watch publication** — the assert and the
+   watcher walk share the target's lock; a watch registered with
+   `armed_state` already set fires on registration.
+
+### Pending work
+
+- Full IPC fastpath retarget at the assembly level (Send / Recv /
+  Call / ReplyRecv) — currently only `MP_WRITE` has the
+  cross-CPU mailbox fastpath; the legacy x86_64 `syscall.S`
+  fastpath dispatch is being rewritten to route through the new
+  primitives.
+- `DataPipe` zero-copy (shared-memory backing via a separately
+  retyped `MemoryObject`) — intentionally NOT a `DP_MAP` op on the
+  DataPipe itself; the `MemoryObject` route keeps the byte-stream
+  semantics decoupled from address-space mapping.

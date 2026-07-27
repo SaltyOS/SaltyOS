@@ -1,24 +1,104 @@
 # Scheduler Design
 
-This document describes the Earliest Deadline First (EDF) scheduler in SaltyOS.
+This document describes SaltyOS's multi-class scheduler and the constraints
+it enforces on thread lifetime, preemption, and priority donation.
 
 ## Overview
 
-SaltyOS uses EDF scheduling with budget enforcement, inspired by seL4's MCS (Mixed Criticality Systems) extensions. This provides:
+The scheduler is **class-based**: every runnable thread belongs to one of
+four classes, and strict class ordering governs preemption. Each per-CPU
+ready queue is really four queues keyed by class; `pick_next` scans them
+in class order.
 
-- **Real-time support**: Threads can meet hard deadlines
-- **Temporal isolation**: Budget limits prevent starvation
-- **Flexibility**: Both real-time and best-effort workloads
+| Class | `SCHED_CLASS_*` id | Queue shape | Key | Used for |
+|-------|---------------------|-------------|-----|----------|
+| Deadline | 0 | per-CPU linked list, sorted by deadline | absolute deadline | Hard real-time, budgeted workloads (seL4-MCS-inspired) |
+| RT FIFO | 1 | per-CPU linked list, sorted by priority | static priority (0..=99) | Soft real-time / driver threads |
+| Fair | 2 | per-CPU EEVDF-style treap | `(vruntime, lag)` weighted by `FAIR_DEFAULT_WEIGHT = 1024` | General-purpose threads |
+| Idle | 3 | one per CPU (pinned idle TCB) | — | Runs when nothing else is runnable |
+
+The Fair treap reuses intrusive TCB pointers (`sleep_next` / `futex_next`
+/ `vspace_wait_next`) as `left` / `right` / `parent`; any transition
+between queue types must reset these via `fair_tree_reset_node` (see
+`sched/scheduler.rs`).
 
 ## Source Modules
 
 | File | Purpose |
 |------|---------|
-| `sched/mod.rs` | Module entry, re-exports |
-| `sched/scheduler.rs` | EDF scheduler, global ready queue, context switch |
-| `sched/thread.rs` | TCB, SchedContext, ThreadState definitions |
+| `sched/mod.rs` | Module entry, re-exports, bootstrap TCB + idle-thread setup |
+| `sched/scheduler.rs` + `sched/scheduler/` | Class-based scheduler, per-CPU ready queues, context switch, VSpace waiter drain |
+| `sched/thread.rs` | TCB, SchedContext, ThreadState definitions, `tcb_lock`, sched_ref / cap_ref surfaces |
+| `sched/control.rs` | Wake-plan transitions (`PipeWait` / `Futex` / `EventQueueWait` / `VSpaceWait`), task-control follow-ups |
 | `sched/pip.rs` | Priority Inheritance Protocol (prevents priority inversion in IPC) |
-| `sched/sleep_queue.rs` | Timed sleep queue (NanoSleep, timed IPC timeouts) |
+| `sched/deadline_queue.rs` | Unified ns-precision deadline queue (intrusive treap) — fires `DeadlineKind::{Sleep, FutexTimed, IpcTimeout, TimerFire}` with `Tcb` / `Timer` membership pins |
+
+## TCB Reference-Count Invariants
+
+Each TCB carries two independent reference counts:
+
+- `KernelObject.ref_count` (**cap_ref**) — capabilities pointing at the
+  TCB. Incremented on capability copy, decremented on capability delete.
+  Reaching 0 means "no userspace / CNode path can ever reach this TCB
+  again"; destruction may then fire.
+- `Tcb.sched_ref` — scheduler-owned pointer slots that hold a raw
+  `*mut Tcb`. Incremented when a pointer enters a scheduler slot
+  (`current[]`, ready-queue insertion, `pending_enqueue` slot,
+  VSpace-waiter-list membership); decremented after the slot is cleared
+  (typically deferred to `flush_deferred_sched_release` outside the
+  scheduler lock to respect lock ordering).
+
+Destruction rule (`cap/refcount.rs::release_object`):
+
+1. `fetch_sub(cap_ref)` returning `1` ⇒ last capability gone.
+2. If the object is a TCB, re-check `sched_ref`:
+   - `sched_ref > 0` ⇒ set `pending_destroy`, defer; the scheduler
+     destroys when its last slot releases (`sched_ref_release_may_destroy`).
+   - `sched_ref == 0` ⇒ destroy immediately.
+
+**Invariant**: every path that parks a `*mut Tcb` in a location the
+scheduler owns MUST bump `sched_ref` BEFORE publishing the pointer, and
+MUST release `sched_ref` AFTER clearing the pointer. Ready-queue
+transfers (`enqueue_unlocked`) follow "inc destination before dec source"
+so the count is never transiently zero across the move.
+
+**VSpace waiter membership is a scheduler-owned slot.** A thread blocked
+on `VSpaceTracking.waiter_head` sits on a pointer the scheduler owns (it
+is drained and woken by `drain_vspace_waiters_batch_locked` /
+`wake_drained_batch`). `block_current_on_vspace` therefore increments
+`sched_ref` before enqueuing, and the drain path decrements it after the
+pointer has been transferred into the wake batch / ready queue. This is
+what prevents a concurrent last-`cap_ref` drop from destroying the TCB
+out from under the drain.
+
+## Deferred sched_ref releases: `DeferredReleaseList`
+
+The `CAP_LOCK` lock ordering (outermost) forbids taking `CAP_LOCK` while a
+per-CPU scheduler lock is held. But many `sched_ref` decrements happen
+*inside* a scheduler lock (stale ready-queue skips, `pending_enqueue`
+displacements, ready-queue exits) and a decrement that reaches zero with
+`pending_destroy` set must fire `destroy_object_deferred` under
+`CAP_LOCK`.
+
+The reconciliation: each top-level scheduler API that acquires a per-CPU
+lock also creates a **stack-local** `DeferredReleaseList`, threads it
+through inner helpers (`schedule_unlocked`, `set_pending_enqueue`,
+`track_pending_switch_out`, `process_pending_enqueue`,
+`enqueue_unlocked`, `publish_outgoing_before_current_flip_locked`),
+and drains it via `Scheduler::drain_release` *after* releasing the
+lock. Each drained entry calls `sched_ref_release_may_destroy`, which
+acquires `CAP_LOCK` cleanly at the outermost layer.
+
+The list uses an intrusive `Tcb.deferred_release_next` link, so it has
+**no fixed capacity** and no separate per-CPU storage — all state lives
+on the top-level caller's kernel stack for the duration of one API
+call. There is no "deferred release overflow" failure mode; under any
+workload the list is bounded by the number of TCB transitions the
+scheduler actually performs within that one critical section.
+Context-switch paths (`context_switch_local`, `reschedule`,
+`yield_current`, `block_current_*`) drain the list BEFORE the register
+swap so destroy cannot be arbitrarily delayed by the switched-away
+thread never being re-scheduled.
 
 ## Scheduling Model
 
@@ -96,10 +176,10 @@ Earliest Deadline First:
 - Optimal for uniprocessor systems (can schedule any feasible workload)
 
 ```rust
-/// EDF scheduler (single global ready queue, no heap allocation).
+/// EDF scheduler (per-CPU ready queues, no heap allocation).
 /// Implemented in sched/scheduler.rs.
 pub struct Scheduler {
-    /// Global ready queue head, sorted by deadline.
+    /// Per-CPU ready queue head, sorted by deadline within each class.
     /// Intrusive linked list threaded through TCB fields
     /// (no BinaryHeap/Vec -- raw pointers in #![no_std] kernel).
     ready_head: *mut Tcb,
@@ -113,11 +193,11 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Get next thread to run on the given CPU.
-    /// Walks the global ready list to find the earliest-deadline
-    /// thread whose affinity allows running on this CPU.
+    /// Scans this CPU's per-class ready queues in class order to find
+    /// the earliest-deadline thread eligible to run on this CPU.
     /// Returns a raw pointer to the TCB (null if no runnable thread).
     pub fn pick_next(&mut self, cpu: usize) -> *mut Tcb {
-        // Walk global ready list, find first TCB eligible for this CPU
+        // Scan per-CPU class queues for first TCB eligible for this CPU
         let tcb = self.dequeue_for_cpu_unlocked(cpu);
         if tcb.is_null() {
             return core::ptr::null_mut();
@@ -234,7 +314,7 @@ pub fn check_replenishments() {
             (*sc).state = ScState::Ready;
         }
 
-        // Insert back into the global ready queue
+        // Re-enqueue onto the appropriate per-CPU ready queue
         enqueue_unlocked(sc);
     }
 }
@@ -275,7 +355,7 @@ pub fn schedule(cpu: usize) {
         }
     }
 
-    // Put old thread back in global ready queue if still runnable
+    // Return old thread to its per-CPU ready queue if still runnable
     if !old.is_null() {
         unsafe {
             if (*old).state == ScState::Running && (*old).remaining > 0 {
@@ -327,6 +407,33 @@ stateDiagram-v2
     Running --> Suspended: suspend
 ```
 
+## TCB Lifetime & `sched_ref`
+
+Each `Tcb` carries a `sched_ref: AtomicU32` counter tracking how many
+scheduler-owned raw pointer slots currently reference it:
+
+- `current[cpu]` on each CPU running the thread
+- entry in a per-CPU ready queue (Fair tree / RT FIFO / Deadline)
+- per-CPU `pending_enqueue` deferred-wake slot
+
+When the capability system's refcount drops to zero, `release_object`
+consults `sched_ref`: if non-zero, it sets `pending_destroy` and defers
+`cleanup()` until the scheduler releases the last slot. Transitions
+between slots preserve the invariant that `sched_ref > 0` whenever *any*
+scheduler pointer exists — increments on the destination slot happen
+**before** the source slot is released — so a concurrent
+`release_object` on another CPU never observes a transient zero during
+a transfer (dequeue → `set_current`, pending-slot swap, steal, etc.).
+
+Release points whose dec may hit zero with `pending_destroy` set
+(ready-queue exit from `remove_from_ready_queue_unlocked`, pending-slot
+drop from `cancel_pending_enqueue` / `yield_current` CAS,
+`prepare_switch_target_full` idle fallback) stage the decrement through
+`queue_deferred_sched_release` while the scheduler lock is held; the
+actual dec and any `destroy_object_deferred` call run in
+`flush_deferred_sched_release()` after the lock is released, keeping
+the `CAP_LOCK → scheduler.lock_state` ordering intact.
+
 ## Priority Inversion Handling
 
 ### Problem
@@ -347,68 +454,95 @@ When Thread A blocks on Thread B:
 3. B completes, A resumes
 4. B's priority reverts
 
-The implementation in `sched/pip.rs` handles priority inheritance during IPC
-blocking. When a sender with an earlier deadline blocks on an endpoint whose
-receiver has a later deadline, the receiver's effective deadline is temporarily
-lowered:
+The implementation in `sched/pip.rs` handles priority inheritance during
+`MP_CALL` chains. When a caller with an earlier deadline blocks waiting
+for a server reply, the server temporarily inherits the caller's
+deadline:
 
 ```rust
-/// Called when sender blocks on endpoint (simplified from sched/pip.rs)
-fn do_send_blocking(sender: *mut Tcb, endpoint: *mut Endpoint) {
-    // SAFETY: sender and endpoint are valid kernel object pointers
+/// Called when MP_CALL parks waiting for a reply (simplified from
+/// `sched/pip.rs`).
+fn pip_donate_call(caller: *mut Tcb, server: *mut Tcb) {
+    // SAFETY: both pointers are sched_ref-pinned for the duration of
+    // the call — the caller pin lives on the waiter state, the server
+    // pin lives on whichever waiter queue surfaced the server.
     unsafe {
-        (*sender).state = ThreadState::BlockedOnSend;
-        (*endpoint).send_queue.enqueue(sender);
-
-        // Priority inheritance (pip.rs):
-        // If the receiver's SC has a later deadline than the sender's SC,
-        // temporarily inherit the sender's deadline.
-        let receiver = (*endpoint).recv_queue.peek();
-        if !receiver.is_null() {
-            pip::maybe_inherit_priority(sender, receiver);
-            // Re-sort receiver in ready queue if deadline changed
+        if !server.is_null() {
+            pip::maybe_inherit_priority(caller, server);
+            // Re-sort server in its ready queue if effective deadline
+            // moved earlier.
         }
     }
-
     schedule(current_cpu());
 }
 
 // In sched/pip.rs:
-// - Inheritance is transitive across IPC chains
-// - Reverted automatically on reply/ReplyRecv completion
+// - Inheritance is transitive across MP_CALL chains.
+// - Reverted automatically when the caller leaves the reply wait path.
 ```
 
 ### Priority Inheritance Protocol (sched/pip.rs)
 
 The priority inheritance logic is implemented in `sched/pip.rs`. When a
-high-priority thread blocks on an endpoint (Send) and a lower-priority thread
-is the receiver, the kernel temporarily elevates the receiver's effective
-deadline to match the sender's. This prevents unbounded priority inversion where
-a medium-priority thread could starve the low-priority receiver and transitively
-block the high-priority sender.
+high-priority caller blocks on `MP_CALL` and the server has a later
+effective deadline, the kernel temporarily elevates the server's
+deadline to match the caller's. This prevents unbounded priority
+inversion where a medium-priority thread could starve the low-priority
+server and transitively block the high-priority caller.
 
 Key behaviors:
 - Inheritance is transitive: if thread A waits on B which waits on C, C inherits A's deadline
 - Inheritance is automatically reverted when the IPC completes (reply or ReplyRecv)
 - The ready queue is re-sorted after inheritance changes
 
-### Sleep Queue (sched/sleep_queue.rs)
+### Deadline Queue (sched/deadline_queue.rs)
 
-The sleep queue (`sched/sleep_queue.rs`) manages threads that are sleeping for
-a bounded duration. It is used by:
+`sched/deadline_queue.rs` is the single ns-precision deadline source for
+the kernel. It replaces the older split between a per-tick sleep list and
+a hierarchical timer wheel — both jiffy-resolution structures jittered
+above the precision EDF and POSIX `clock_nanosleep` need.
 
-- **NanoSleep** (syscall 13) -- sleep for a specified number of nanoseconds
-- **SendTimed** (syscall 21) -- blocking send with timeout
-- **RecvTimed** (syscall 22) -- blocking receive with timeout
+The queue is an **intrusive treap** keyed on `(deadline_ns, insert_seq)`:
+the same data structure already used by the EEVDF fair class for
+`vruntime` ordering, so the implementation cost was zero. Each entry is a
+`DeadlineNode` embedded inside the owning object — TCBs carry one for
+`Sleep` / `FutexTimed` / `IpcTimeout` waits, `Timer` objects carry one
+for `TimerFire` arms — so insert / cancel / pop never allocate.
 
-The sleep queue is a sorted intrusive linked list ordered by absolute wakeup
-time. On each timer tick, the kernel checks the head of the queue and wakes
-all threads whose deadline has passed. Woken threads are moved to the
-`ThreadState::Ready` state and enqueued on the global ready queue.
+`DeadlineKind` variants:
 
-For timed IPC, the thread is simultaneously on both the endpoint's wait queue
-and the sleep queue. Whichever fires first (partner arrival or timeout) removes
-the thread from the other queue.
+- **Sleep** — armed by `arm_thread_sleep` from `clock_nanosleep`-style
+  paths. Wake plan: `WakeTransition::Futex` against the sleeping thread
+  (the thread parked itself with `BlockedReason::TimerBlocked`).
+- **FutexTimed** — armed alongside a futex bucket wait. Wake fires
+  `KERNITE_ERR_TIMED_OUT` into the thread's `futex_wakeup_result` so the
+  syscall return path distinguishes timeout from a real wake.
+- **IpcTimeout** — armed alongside a `MessagePipe` / `DataPipe` waiter
+  push. Wake plan is `WakeTransition::PipeWait`; the **caller is
+  responsible for unlinking** the thread from the pipe waiter queue
+  before issuing the wake plan, so the syscall layer's
+  `block_*_with_timeout` helpers call `MessagePipeCore::detach_waiter` /
+  `DataPipeCore::detach_waiter` after a timeout return.
+- **TimerFire** — armed by `arm_timer` when userland calls
+  `KERNITE_INV_TIMER_SET`. Fire dispatch enqueues an `EVENT_TYPE_TIMER`
+  record into the bound `EventQueue`, optionally re-arms the timer for a
+  periodic schedule with missed-period coalescing, and clears the
+  transient `STATE_SIGNALED` bit on the timer object.
+
+Membership pinning: `arm_thread_*` bumps the TCB's `sched_ref`; `arm_timer`
+bumps the `Timer.KernelObject.ref_count`. Both pins are released either
+by `cancel_thread` / `cancel_timer` (no-fire branch) or by the
+`check_wakeups` dispatch (fire branch). `NEXT_DEADLINE_NS` is an
+`AtomicU64` hint set at every insert so the timer ISR can `peek_expired`
+without taking the queue lock — only when the hint says "due now" does
+the dispatch acquire the lock and walk.
+
+A thread waiting on a `MessagePipe` with a finite `timeout_ns` is
+simultaneously on (1) the pipe's per-side waiter queue and (2) the
+deadline queue under `IpcTimeout`. Whichever fires first detaches the
+other: producer pop → `wake_thread` in the pipe path, or deadline
+dispatch → `cancel_thread` + `detach_waiter` in the syscall layer's
+post-reschedule cleanup.
 
 ## Sporadic Servers
 
@@ -435,13 +569,13 @@ Sporadic servers:
 
 ## SMP Considerations
 
-### Global Ready Queue with Affinity-Aware Dequeue
+### Per-CPU Ready Queues with IPI-Driven Reschedule
 
-The scheduler uses a **single global ready queue** (`ready_head`), not
-per-CPU queues. CPU affinity is stored in each TCB (as a `u8` CPU ID,
-`0xFF` = any CPU). When a CPU needs work, `dequeue_for_cpu_unlocked(cpu)`
-walks the global list and picks the earliest-deadline thread whose affinity
-matches:
+The scheduler maintains **per-CPU ready queues**, one set of four class
+queues per CPU. CPU affinity is stored in each TCB (as a `u8` CPU ID,
+`0xFF` = any CPU). When a thread becomes runnable on a remote CPU,
+`dequeue_for_cpu_unlocked(cpu)` selects from that CPU's own class queues
+and an IPI triggers reschedule on the target CPU:
 
 ```rust
 /// In Tcb:
@@ -468,7 +602,7 @@ fn balance_load() {
 ```rust
 /// Wake a thread on another CPU
 fn cross_cpu_wakeup(tcb: TcbRef, target_cpu: usize) {
-    // Add to global ready queue
+    // Enqueue onto the target CPU's ready queue
     enqueue_unlocked(tcb);
 
     // Send IPI to trigger reschedule on target CPU

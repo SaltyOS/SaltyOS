@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Line discipline and input processing for PTY.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::ipc;
 use trona_posix::consts::*;
+use trona_protocol::posix::*;
 
 use crate::types::*;
-use crate::{ipc_ctx, display_write, serial_write_queued, PTYS};
+use crate::{PTYS, display_write, ipc_ctx, serial_write_queued};
 
 /// Echo a control character as ^X to serial.
 pub fn echo_ctrl_serial(c: u8) {
@@ -33,53 +31,45 @@ fn echo_backspace_erase(buf: &mut [u8; 64], len: &mut usize) {
     echo_push(buf, len, 0x08);
 }
 
-/// Write a byte slice with CR/LF translation to serial (queued).
-pub fn serial_puts_opost(s: &[u8]) {
-    let mut buf = [0u8; 80];
-    let mut buf_len = 0;
-    for &c in s {
-        if c == b'\n' {
-            buf[buf_len] = b'\r';
-            buf_len += 1;
-            if buf_len >= buf.len() {
-                serial_write_queued(&buf[..buf_len]);
-                buf_len = 0;
-            }
-        }
-        buf[buf_len] = c;
-        buf_len += 1;
-        if buf_len >= buf.len() {
-            serial_write_queued(&buf[..buf_len]);
-            buf_len = 0;
-        }
-    }
-    if buf_len > 0 {
-        serial_write_queued(&buf[..buf_len]);
-    }
-}
-
-/// Send signal to foreground process group via nbsend to procmgr (fire-and-forget).
-/// Uses PM_KILL_PGID to target an explicit pgid.
+/// Send signal to foreground process group via blocking send to procmgr.
+/// Uses INIT_KILL_PGID to target an explicit pgid.
+///
+/// This used to be a fire-and-forget `nbsend` call; `SYS_NBSEND` was
+/// retired alongside the per-Endpoint ring. Signal delivery is
+/// infrequent (tty control keys) and procmgr handles INIT_KILL_PGID
+/// promptly, so a blocking `send` is acceptable here.
 pub fn send_signal_pgid(pgid: u32, sig: i32) {
     let mut msg = TronaMsg::zeroed();
-    msg.label = PM_KILL_PGID;
+    msg.label = INIT_KILL_PGID;
     msg.length = 2;
     msg.regs[0] = pgid as u64;
     msg.regs[1] = sig as u64;
     unsafe {
-        ipc::nbsend_ctx(ipc_ctx(), trona::caps::procmgr_ep(), &raw const msg);
+        ipc::mp_write_ctx(
+            ipc_ctx(),
+            trona_runtime::client::caps::init_ep().addr(),
+            &raw const msg,
+        );
     }
 }
 
-/// Signal VFS's bound notification to wake it for PTY data.
-/// Badge bits encode the PTY id.
 pub fn signal_vfs(pty_id: usize) {
-    let _r = trona::syscall::syscall(
-        trona::SYS_SIGNAL,
-        CAP_VFS_NTFN,
-        1u64 << pty_id as u64,
-        0, 0, 0, 0,
-    );
+    let vfs = trona_runtime::client::caps::vfs_ep().addr();
+    if vfs == 0 {
+        return;
+    }
+    let mut msg = TronaMsg::zeroed();
+    msg.label = VFS_POSIX_PTY_READY;
+    msg.regs[0] = pty_id as u64;
+    msg.length = 1;
+    // One-way readiness kick (the reply was always discarded). Non-blocking so
+    // the ttysrv reactor never parks on VFS — that blocking call was one side of
+    // the VFS↔ttysrv reactor deadlock. A dropped wakeup on a full ring is safe:
+    // VFS's `handle_pty_ready` is level-triggered (re-scans every parked PTY
+    // reader), so the next input byte / poll re-delivers it; no retain queue.
+    unsafe {
+        let _ = ipc::mp_write_ctx(ipc_ctx(), vfs, &raw const msg);
+    }
 }
 
 pub(crate) fn pty_has_readable_data(pty: &PtyInstance) -> bool {
@@ -87,14 +77,16 @@ pub(crate) fn pty_has_readable_data(pty: &PtyInstance) -> bool {
 }
 
 pub(crate) fn signal_vfs_if_readable(pty_id: usize, pty: &PtyInstance) {
-    if pty_has_readable_data(pty) {
+    if pty.vfs_pending_slave && pty_has_readable_data(pty) {
         signal_vfs(pty_id);
     }
 }
 
 pub(crate) fn refill_slave_ring(pty: &mut PtyInstance) {
     while !pty.slave_ring.is_full() {
-        let Some(byte) = pty.spill_ring.pop() else { break };
+        let Some(byte) = pty.spill_ring.pop() else {
+            break;
+        };
         if !pty.slave_ring.push(byte) {
             break;
         }
@@ -106,7 +98,9 @@ pub(crate) fn push_slave_byte(pty_id: usize, pty: &mut PtyInstance, byte: u8) {
         return;
     }
     if pty.spill_ring.push(byte) {
-        signal_vfs(pty_id);
+        if pty.vfs_pending_slave {
+            signal_vfs(pty_id);
+        }
         return;
     }
     serial_write_queued(b"[TTYD] WARN: input queues full, input dropped\n");
@@ -128,9 +122,14 @@ pub fn flush_line_to_ring(pty_id: usize, pty: &mut PtyInstance) {
 }
 
 /// Process a single input character through the line discipline for a PTY.
-/// Readability notifications are emitted at line-delivery boundaries and once
-/// again after each input batch so VFS sees buffered data as level-triggered.
-pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], echo_len: &mut usize) {
+/// Readability kicks are emitted at line-delivery boundaries and once again
+/// after each input batch so VFS sees buffered data as level-triggered.
+pub unsafe fn process_input_char(
+    pty_id: usize,
+    c: u8,
+    echo_buf: &mut [u8; 64],
+    echo_len: &mut usize,
+) {
     unsafe {
         let pty = &mut *(&raw mut PTYS[pty_id]);
         let mut ch = c;
@@ -281,20 +280,40 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
     }
 }
 
-/// POSIX_TTYSRV_INPUT_EVENT: raw bytes from console server.
-/// msg.regs[0] = byte_count, msg.regs[1..] = packed bytes.
-pub unsafe fn handle_input_event(msg: &TronaMsg) {
+/// Drain all available bytes from the console input SHM ring into PTY 0.
+/// Called when posix_ttysrv receives `POSIX_TTYSRV_INPUT_KICK` from console.
+///
+/// # Safety
+/// `CONSOLE_INPUT_RING_BASE` must point to a valid mapped SHM ring header.
+/// `CONSOLE_INPUT_RING_ACTIVE` must be true before calling.
+pub unsafe fn drain_console_input_ring(ring_base: *mut u8, ring_size: usize, ring_hdr_size: usize) {
     unsafe {
-        let count = msg.regs[0] as usize;
-        if count == 0 || count > 128 { return; }
-
-        let src = &msg.regs[1] as *const u64 as *const u8;
         let mut echo_buf = [0u8; 64];
         let mut echo_len: usize = 0;
 
-        // Route all console input to PTY 0 (the console PTY)
-        for i in 0..count {
-            let c = *src.add(i);
+        loop {
+            // tail is written only by us (single consumer); read it without fence.
+            let tail = core::ptr::read_volatile(ring_base.add(4) as *const u32) as usize;
+            let head = core::ptr::read_volatile(ring_base as *const u32) as usize;
+            // Acquire: ensure we observe all data the producer wrote before it
+            // advanced head. Fence must be after the head read so data written
+            // before head was published is visible before we read ring[tail].
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+            if head == tail {
+                break;
+            } // ring empty
+
+            let c = core::ptr::read_volatile(ring_base.add(ring_hdr_size).add(tail % ring_size));
+
+            // Release: data read above must complete before we publish the new
+            // tail to the producer (so it doesn't reclaim space we haven't read).
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(
+                ring_base.add(4) as *mut u32,
+                ((tail + 1) % ring_size) as u32,
+            );
+
             process_input_char(0, c, &mut echo_buf, &mut echo_len);
         }
 

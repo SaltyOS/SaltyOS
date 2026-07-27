@@ -17,11 +17,10 @@
  * All parameters are 32-bit because this is called from 32-bit code.
  * 64-bit values are split into low/high halves.
  */
-void enter_long_mode_and_jump_asm(
-    uint32_t pml4,
-    uint32_t entry_lo, uint32_t entry_hi,
-    uint32_t bootinfo_lo, uint32_t bootinfo_hi,
-    uint32_t stack_lo, uint32_t stack_hi);
+void enter_long_mode_and_jump_asm(uint32_t pml4, uint32_t entry_lo,
+                                  uint32_t entry_hi, uint32_t bootinfo_lo,
+                                  uint32_t bootinfo_hi, uint32_t stack_lo,
+                                  uint32_t stack_hi);
 
 /*
  * Switch to long mode and jump to kernel
@@ -37,19 +36,16 @@ void enter_long_mode_and_jump_asm(
  *
  * This function does NOT return.
  */
-static inline NORETURN void enter_long_mode_and_jump(
-    uint32_t pml4_addr,
-    uint64_t entry_point,
-    uint64_t bootinfo_addr,
-    uint64_t stack_top)
-{
-    enter_long_mode_and_jump_asm(
-        pml4_addr,
-        (uint32_t)entry_point, (uint32_t)(entry_point >> 32),
-        (uint32_t)bootinfo_addr, (uint32_t)(bootinfo_addr >> 32),
-        (uint32_t)stack_top, (uint32_t)(stack_top >> 32));
+static inline NORETURN void enter_long_mode_and_jump(uint32_t pml4_addr,
+                                                     uint64_t entry_point,
+                                                     uint64_t bootinfo_addr,
+                                                     uint64_t stack_top) {
+  enter_long_mode_and_jump_asm(
+      pml4_addr, (uint32_t)entry_point, (uint32_t)(entry_point >> 32),
+      (uint32_t)bootinfo_addr, (uint32_t)(bootinfo_addr >> 32),
+      (uint32_t)stack_top, (uint32_t)(stack_top >> 32));
 
-    __builtin_unreachable();
+  __builtin_unreachable();
 }
 
 #endif /* BOOT_STAGE3_ARCH_X86_BIOS_MODE_SWITCH_H */

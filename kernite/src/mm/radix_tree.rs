@@ -12,8 +12,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::node_alloc::NodeAllocator;
 use super::PAGE_SIZE;
+use super::node_alloc::NodeAllocator;
 
 const ENTRIES_PER_NODE: usize = PAGE_SIZE / 8; // 512
 const BITS_PER_LEVEL: u32 = 9;
@@ -285,6 +285,38 @@ impl RadixTree {
         unsafe {
             *node.add(leaf_idx) = 0;
         }
+    }
+
+    /// Overwrite the value at `page_idx` only if the radix path to its leaf
+    /// already exists — no node allocation. Returns `true` if updated,
+    /// `false` if the path is absent. Used to flip an existing committed
+    /// entry's tag bits in place (e.g. mark `PHYS_TAG_BUSY` during eviction)
+    /// without going through the allocating commit path.
+    pub fn set_existing(&mut self, page_idx: usize, value: u64) -> bool {
+        if self.root.is_null() || self.depth == 0 {
+            return false;
+        }
+        if page_idx >= (1usize << (self.depth * BITS_PER_LEVEL)) {
+            return false;
+        }
+
+        let mut node = self.root;
+        for level in (2..=self.depth).rev() {
+            let idx = Self::level_index(page_idx, level);
+            // SAFETY: node is valid.
+            let entry = unsafe { *node.add(idx) };
+            if entry == 0 {
+                return false;
+            }
+            node = entry as *mut u64;
+        }
+
+        let leaf_idx = Self::level_index(page_idx, 1);
+        // SAFETY: node is valid leaf.
+        unsafe {
+            *node.add(leaf_idx) = value;
+        }
+        true
     }
 
     /// Iterate all non-zero entries. Calls `f(page_idx, value)` for each.

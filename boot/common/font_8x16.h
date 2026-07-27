@@ -10,7 +10,7 @@
 
 #include "types.h"
 
-#define FONT_GLYPH_WIDTH  8
+#define FONT_GLYPH_WIDTH 8
 #define FONT_GLYPH_HEIGHT 16
 
 extern const uint8_t font_8x16_data[4096]; /* 256 glyphs * 16 bytes */

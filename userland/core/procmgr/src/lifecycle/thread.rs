@@ -7,33 +7,31 @@
 //!
 //! The main thread of each process is *not* tracked here — its kernel
 //! objects already live on the Process struct. Auxiliary threads created
-//! via PM_THREAD_CREATE start at tid=1.
+//! via INIT_THREAD_CREATE start at tid=1.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::invoke;
-use trona::ipc;
-use trona::types::core::Cap;
-use trona::types::TronaMsg;
+use trona_kernel::core_types::Cap;
+use trona_kernel::core_types::TronaMsg;
+use trona_kernel::invoke;
 
-use crate::base::proc_table::{
-    find_by_badge, proctab, ThreadEntry, ThreadState, MAX_THREADS_PER_PROC,
-};
-use crate::{
-    ipc_ctx, ALLOCATOR, CAP_SELF_CSPACE, OBJ_SCHED_CONTEXT, OBJ_TCB, TRONA_INVALID_ARGUMENT,
-    TRONA_NOT_FOUND, TRONA_OK, TRONA_OUT_OF_MEMORY,
-};
 use crate::base::alloc;
 use crate::base::cap_helpers as procmgr_caps;
+use crate::base::proc_table::{
+    MAX_THREADS_PER_PROC, ThreadEntry, ThreadState, find_by_badge, proctab,
+};
+use crate::{
+    ALLOCATOR, CAP_SELF_CSPACE, OBJ_SCHED_CONTEXT, OBJ_TCB, TRONA_INVALID_ARGUMENT,
+    TRONA_NOT_FOUND, TRONA_OK, TRONA_OUT_OF_MEMORY, ipc_ctx,
+};
 
-const OBJ_FRAME: u64 = trona::OBJ_FRAME;
-const VSPACE_FLAG_WRITABLE: u64 = trona::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = trona::VSPACE_FLAG_USER;
+const OBJ_FRAME: u64 = uapi::KERNITE_OBJ_FRAME;
+const VSPACE_FLAG_WRITABLE: u64 = uapi::KERNITE_PAGE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = uapi::KERNITE_PAGE_FLAG_USER;
 
 /// Default scheduling parameters for libpthread-spawned threads.
-/// Match libpthread's previous direct-retype values to preserve behavior.
-const DEFAULT_THREAD_BUDGET_US: u64 = 10_000;
-const DEFAULT_THREAD_PERIOD_US: u64 = 100_000;
+const DEFAULT_THREAD_BUDGET_NS: u64 = 10_000_000;
+const DEFAULT_THREAD_PERIOD_NS: u64 = 100_000_000;
 
 /// Bit 0 of attr_flags = detached on creation.
 const PTHREAD_CREATE_DETACHED: u64 = 1;
@@ -104,10 +102,23 @@ unsafe fn reap_thread(proc_idx: usize, slot: usize) {
             let _ = invoke::vspace_unmap(vspace_cap, entry.ipc_buf_vaddr);
         }
 
+        // Collect CPU runtime from the auxiliary TCB before revoking it.
+        // tcb_suspend was already called by handle_thread_exit; if reap_thread
+        // is called from drop_all_threads the TCB may still be running, but
+        // runtime reads are still safe (the kernel returns the current counter).
+        if entry.tcb_cap != 0 {
+            if let Some((ut, st)) =
+                invoke::tcb_get_cpu_times_ctx(trona_runtime::current_ipc_ctx(), entry.tcb_cap)
+            {
+                p.dead_thread_user_time_ns += ut;
+                p.dead_thread_system_time_ns += st;
+            }
+        }
+
         // Free the kernel objects via rsrcsrv (revokes derived caps too).
         for h in entry.rsrcsrv_handles.iter() {
             if *h != 0 {
-                let _ = alloc::free_handle(trona::caps::rsrcsrv_ep(), owner, *h);
+                let _ = alloc::free_handle(trona_runtime::client::caps::rsrcsrv_ep(), owner, *h);
             }
         }
 
@@ -119,14 +130,9 @@ unsafe fn reap_thread(proc_idx: usize, slot: usize) {
             }
         }
 
-        // If a joiner saved its reply cap but never woke up, drop it now
-        // so we do not leak a procmgr CSpace slot. The joiner is dead by
-        // construction (we only reach here from the same proc's exit
-        // sweep or from a join that already replied).
-        if entry.joiner_reply_cap != 0 {
-            let _ = invoke::cnode_delete(CAP_SELF_CSPACE, entry.joiner_reply_cap);
-            (&mut *(&raw mut ALLOCATOR)).free_single_slot(entry.joiner_reply_cap);
-        }
+        // A parked joiner stores the shared reply endpoint. Dropping the
+        // thread just forgets the deferred reply state.
+        entry.joiner_reply_cap = 0;
 
         let p = proctab(proc_idx);
         p.threads.entries[slot] = ThreadEntry::zeroed();
@@ -137,7 +143,7 @@ unsafe fn reap_thread(proc_idx: usize, slot: usize) {
 }
 
 /// Push a `(slot, handle)` pair onto a temporary rollback record so that an
-/// abort partway through PM_THREAD_CREATE setup can revoke everything that
+/// abort partway through INIT_THREAD_CREATE setup can revoke everything that
 /// was allocated. Used in lieu of the spawn-style Reservation because thread
 /// creation does not need a contiguous slot range.
 struct CreateScratch {
@@ -169,7 +175,8 @@ impl CreateScratch {
             for i in (0..self.filled).rev() {
                 let h = self.handles[i];
                 if h != 0 {
-                    let _ = alloc::free_handle(trona::caps::rsrcsrv_ep(), owner_id, h);
+                    let _ =
+                        alloc::free_handle(trona_runtime::client::caps::rsrcsrv_ep(), owner_id, h);
                 }
                 let s = self.slots[i];
                 if s != 0 {
@@ -182,15 +189,30 @@ impl CreateScratch {
 }
 
 // ===========================================================================
-// PM_THREAD_CREATE
+// INIT_THREAD_CREATE
 // ===========================================================================
 
 /// Inputs:
 ///   regs[0] = entry_pc            (caller-prepared trampoline)
-///   regs[1] = stack_top           (with start_fn / arg already pushed)
+///   regs[1] = entry_rsp           (initial SP, argv / start_fn already pushed)
 ///   regs[2] = tls_base            (architecture thread pointer)
 ///   regs[3] = ipc_buf_vaddr       (where to map the new IPC frame in child vspace)
 ///   regs[4] = attr_flags          (bit 0 = detached)
+///   regs[5] = stack_base          (inclusive reserve lower bound; required
+///                                   for auxiliary threads to satisfy
+///                                   memory-model-audit I21. Zero means
+///                                   "caller declines bounds" — procmgr
+///                                   refuses the create to preserve I24's
+///                                   fail-closed property.)
+///   regs[6] = stack_guard_bottom  (lower bound of the unmapped guard hole;
+///                                   0 = no guard tracked)
+///   regs[7] = reserve_top         (exclusive reserve upper bound; the
+///                                   kernel's TCB_SET_STACK_BOUNDS
+///                                   locates the REGION_STACK VmArea
+///                                   from `reserve_top - PAGE_SIZE`, so
+///                                   this must be exactly
+///                                   `stack_base + reserve_size`, not
+///                                   `entry_rsp`)
 ///
 /// Reply:
 ///   regs[0] = tid (per-process, >= 1)
@@ -198,10 +220,42 @@ impl CreateScratch {
 pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let entry_pc = msg.regs[0];
-        let stack_top = msg.regs[1];
+        let entry_rsp = msg.regs[1];
         let tls_base = msg.regs[2];
         let ipc_buf_vaddr = msg.regs[3];
         let attr_flags = msg.regs[4];
+        let stack_base = if msg.length as usize > 5 {
+            msg.regs[5]
+        } else {
+            0
+        };
+        let stack_guard_bottom = if msg.length as usize > 6 {
+            msg.regs[6]
+        } else {
+            0
+        };
+        let reserve_top = if msg.length as usize > 7 {
+            msg.regs[7]
+        } else {
+            0
+        };
+        // Refuse the create outright when the caller does not publish the
+        // new thread's stack bounds. Running with `user_stack_min == 0`
+        // silently disables notification-frame synthesis (the kernel
+        // fails closed), but a thread that cannot receive notifications
+        // is broken in a surprising way. Better to fail loudly here and
+        // force every caller onto the I21-compliant wire shape.
+        if stack_base == 0
+            || reserve_top == 0
+            || stack_base >= reserve_top
+            || (stack_base & 0xFFF) != 0
+            || (reserve_top & 0xFFF) != 0
+            || entry_rsp <= stack_base
+            || entry_rsp > reserve_top
+        {
+            reply.label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
 
         // 1. Resolve the calling process.
         let Some(proc_idx) = caller_process(badge) else {
@@ -233,11 +287,12 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
         let mut scratch = CreateScratch::new();
 
         let (tcb_slot, tcb_handle) =
-            match alloc::alloc_single(trona::caps::rsrcsrv_ep(), owner, OBJ_TCB, 0) {
+            match alloc::alloc_single(trona_runtime::client::caps::rsrcsrv_ep(), owner, OBJ_TCB, 0)
+            {
                 Ok(v) => v,
                 Err(e) => {
-                    trona::uerror!(|_lb| {
-                        _lb.str(b"[PROCMGR] PM_THREAD_CREATE alloc TCB failed err=");
+                    trona_runtime::uerror!(|_lb| {
+                        _lb.str(b"[PROCMGR] INIT_THREAD_CREATE alloc TCB failed err=");
                         _lb.hex(e as u64);
                         _lb.str(b"\n");
                     });
@@ -247,48 +302,58 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
             };
         scratch.push(tcb_slot, tcb_handle);
 
-        let (sc_slot, sc_handle) =
-            match alloc::alloc_single(trona::caps::rsrcsrv_ep(), owner, OBJ_SCHED_CONTEXT, 0) {
-                Ok(v) => v,
-                Err(e) => {
-                    trona::uerror!(|_lb| {
-                        _lb.str(b"[PROCMGR] PM_THREAD_CREATE alloc SC failed err=");
-                        _lb.hex(e as u64);
-                        _lb.str(b"\n");
-                    });
-                    scratch.rollback(owner);
-                    reply.label = TRONA_OUT_OF_MEMORY;
-                    return;
-                }
-            };
+        let (sc_slot, sc_handle) = match alloc::alloc_single(
+            trona_runtime::client::caps::rsrcsrv_ep(),
+            owner,
+            OBJ_SCHED_CONTEXT,
+            0,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] INIT_THREAD_CREATE alloc SC failed err=");
+                    _lb.hex(e as u64);
+                    _lb.str(b"\n");
+                });
+                scratch.rollback(owner);
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return;
+            }
+        };
         scratch.push(sc_slot, sc_handle);
 
-        let (frame_slot, frame_handle) =
-            match alloc::alloc_single(trona::caps::rsrcsrv_ep(), owner, OBJ_FRAME, 12) {
-                Ok(v) => v,
-                Err(e) => {
-                    trona::uerror!(|_lb| {
-                        _lb.str(b"[PROCMGR] PM_THREAD_CREATE alloc Frame failed err=");
-                        _lb.hex(e as u64);
-                        _lb.str(b"\n");
-                    });
-                    scratch.rollback(owner);
-                    reply.label = TRONA_OUT_OF_MEMORY;
-                    return;
-                }
-            };
+        let (frame_slot, frame_handle) = match alloc::alloc_single(
+            trona_runtime::client::caps::rsrcsrv_ep(),
+            owner,
+            OBJ_FRAME,
+            12,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] INIT_THREAD_CREATE alloc Frame failed err=");
+                    _lb.hex(e as u64);
+                    _lb.str(b"\n");
+                });
+                scratch.rollback(owner);
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return;
+            }
+        };
         scratch.push(frame_slot, frame_handle);
 
         // 4. Configure the TCB to share the caller's CSpace + VSpace.
-        let depth = invoke::tcb_get_space_info(crate::CAP_SELF_TCB).unwrap_or(0);
+        let depth =
+            invoke::tcb_get_space_info_ctx(trona_runtime::current_ipc_ctx(), crate::CAP_SELF_TCB)
+                .unwrap_or(0);
         let err = if depth > 0 {
             invoke::tcb_set_space_with_depth(tcb_slot, child_cnode, child_vspace, depth as u64)
         } else {
             invoke::tcb_set_space(tcb_slot, child_cnode, child_vspace)
         };
         if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] PM_THREAD_CREATE tcb_set_space failed err=");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] INIT_THREAD_CREATE tcb_set_space failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
             });
@@ -318,8 +383,8 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
         );
         if fault_ep_err != 0 {
             (&mut *(&raw mut ALLOCATOR)).free_single_slot(fault_ep_slot);
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] PM_THREAD_CREATE fault EP mint failed err=");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] INIT_THREAD_CREATE fault EP mint failed err=");
                 _lb.hex(fault_ep_err as u64);
                 _lb.str(b"\n");
             });
@@ -331,8 +396,8 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
         let _ = invoke::cnode_delete(CAP_SELF_CSPACE, fault_ep_slot);
         (&mut *(&raw mut ALLOCATOR)).free_single_slot(fault_ep_slot);
         if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] PM_THREAD_CREATE tcb_set_fault_handler failed err=");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] INIT_THREAD_CREATE tcb_set_fault_handler failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
             });
@@ -350,8 +415,8 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] PM_THREAD_CREATE vspace_map ipc failed err=");
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] INIT_THREAD_CREATE vspace_map ipc failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
             });
@@ -377,7 +442,7 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
             return;
         }
 
-        let err = invoke::tcb_configure(tcb_slot, entry_pc, stack_top, ipc_buf_vaddr);
+        let err = invoke::tcb_configure(tcb_slot, entry_pc, entry_rsp, ipc_buf_vaddr);
         if err != 0 {
             let _ = invoke::vspace_unmap(child_vspace, ipc_buf_vaddr);
             scratch.rollback(owner);
@@ -385,8 +450,29 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
             return;
         }
 
+        // Publish the per-thread stack bounds using the explicit reserve
+        // top the caller supplied — `entry_rsp` lives inside the reserve
+        // but does not identify the VmArea boundary, so we cannot round it
+        // up and call it the upper bound. The kernel's
+        // `TCB_SET_STACK_BOUNDS` check looks up the VmArea at
+        // `reserve_top - PAGE_SIZE`, which must land on the last reserved
+        // page.
+        let err =
+            invoke::tcb_set_stack_bounds(tcb_slot, reserve_top, stack_base, stack_guard_bottom);
+        if err != 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] INIT_THREAD_CREATE tcb_set_stack_bounds failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
+            let _ = invoke::vspace_unmap(child_vspace, ipc_buf_vaddr);
+            scratch.rollback(owner);
+            reply.label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
         // 8. Configure the SchedContext and bind it to the new TCB.
-        let err = invoke::sc_configure(sc_slot, DEFAULT_THREAD_BUDGET_US, DEFAULT_THREAD_PERIOD_US);
+        let err = invoke::sc_configure(sc_slot, DEFAULT_THREAD_BUDGET_NS, DEFAULT_THREAD_PERIOD_NS);
         if err != 0 {
             let _ = invoke::vspace_unmap(child_vspace, ipc_buf_vaddr);
             scratch.rollback(owner);
@@ -417,14 +503,15 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
             retval: 0,
             joiner_reply_cap: 0,
             ipc_buf_vaddr,
+            stack_base,
         };
         p.threads.count += 1;
 
         // 10. Resume the thread only after the create reply path has had a
         //     chance to publish the assigned thread metadata in userland.
         if !crate::server::enqueue_post_reply_resume(tcb_slot) {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[PROCMGR] WARN: post-reply resume queue full for PM_THREAD_CREATE, resuming immediately\n");
+            trona_runtime::uwarn!(|_lb| {
+                _lb.str(b"[PROCMGR] WARN: post-reply resume queue full for INIT_THREAD_CREATE, resuming immediately\n");
             });
             let err = invoke::tcb_resume(tcb_slot);
             if err != 0 {
@@ -444,7 +531,7 @@ pub(crate) unsafe fn handle_thread_create(msg: &TronaMsg, reply: &mut TronaMsg, 
 }
 
 // ===========================================================================
-// PM_THREAD_EXIT
+// INIT_THREAD_EXIT
 // ===========================================================================
 
 /// Inputs:
@@ -484,28 +571,56 @@ pub(crate) unsafe fn handle_thread_exit(msg: &TronaMsg, badge: u64) {
         let detached = entry.detached;
         let joiner_reply = entry.joiner_reply_cap;
         entry.joiner_reply_cap = 0;
+        let stack_base = entry.stack_base;
+        let child_pid = p.pid;
 
         // Wake any pending joiner first — they need the retval before we
-        // tear the thread down.
+        // tear the thread down. Joinable threads' stacks are reclaimed
+        // on the join side (`posix_munmap` in libtrona `pthread_join`);
+        // detached threads never have a joiner, so procmgr is
+        // responsible for tearing the stack region down on their behalf.
         if joiner_reply != 0 {
-            let mut wake = TronaMsg::zeroed();
-            wake.label = TRONA_OK;
-            wake.length = 1;
-            wake.regs[0] = retval;
-            let _ = ipc::send_ctx(ipc_ctx(), joiner_reply, &raw const wake);
-            let _ = invoke::cnode_delete(CAP_SELF_CSPACE, joiner_reply);
-            (&mut *(&raw mut ALLOCATOR)).free_single_slot(joiner_reply);
+            let mut reply = TronaMsg::zeroed();
+            reply.label = TRONA_OK;
+            reply.length = 1;
+            reply.regs[0] = retval;
+            let _ =
+                trona_kernel::ipc::mp_write_reply_ctx(ipc_ctx(), joiner_reply, &raw const reply);
             // The join wake doubles as a reap acknowledgement: once the
             // joiner has the retval, the kernel objects can go.
             reap_thread(proc_idx, slot);
         } else if detached {
             reap_thread(proc_idx, slot);
+            if stack_base != 0 {
+                // Detached-thread stack reclaim. mmsrv's
+                // `MM_FREE_STACK_REGION` accepts the registrant
+                // (procmgr) as a fallback allocator for
+                // `posix_mmap(MAP_STACK)`-origin regions whose
+                // `stack_allocator_badge` is 0, so this tears the
+                // MAP_STACK VmArea + MO down without leaking the
+                // mapping until process exit.
+                if let Err((ipc_err, reply_label)) =
+                    crate::base::mmsrv_ipc::free_stack_region_in_mmsrv(child_pid, stack_base)
+                {
+                    trona_runtime::uwarn!(|_lb| {
+                        _lb.str(b"[PROCMGR] WARN: detached stack reclaim failed pid=");
+                        _lb.hex(child_pid as u64);
+                        _lb.str(b" stack_base=");
+                        _lb.hex(stack_base);
+                        _lb.str(b" ipc=");
+                        _lb.hex(ipc_err as u64);
+                        _lb.str(b" label=");
+                        _lb.hex(reply_label);
+                        _lb.str(b"\n");
+                    });
+                }
+            }
         }
     }
 }
 
 // ===========================================================================
-// PM_THREAD_JOIN
+// INIT_THREAD_JOIN
 // ===========================================================================
 
 /// Inputs:
@@ -516,7 +631,7 @@ pub(crate) unsafe fn handle_thread_exit(msg: &TronaMsg, badge: u64) {
 ///
 /// If the target is still running, returns true so the main loop skips
 /// the standard reply path; the joiner is woken later from
-/// `handle_thread_exit` via the saved reply cap.
+/// `handle_thread_exit` via the saved reply endpoint.
 pub(crate) unsafe fn handle_thread_join(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) -> bool {
     unsafe {
         let tid = msg.regs[0] as u32;
@@ -560,19 +675,11 @@ pub(crate) unsafe fn handle_thread_join(msg: &TronaMsg, reply: &mut TronaMsg, ba
             return false;
         }
 
-        // Slow path: park the joiner. Save its reply cap and let the main
-        // loop continue receiving — `handle_thread_exit` will deliver the
-        // reply when the target eventually exits.
-        let reply_slot = match (&mut *(&raw mut ALLOCATOR)).alloc_single_slot() {
-            Some(s) => s,
-            None => {
-                reply.label = TRONA_OUT_OF_MEMORY;
-                return false;
-            }
-        };
-        let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_slot);
-        if err != 0 {
-            (&mut *(&raw mut ALLOCATOR)).free_single_slot(reply_slot);
+        // Slow path: park the joiner. Save the reply endpoint and let
+        // the main loop continue receiving; `handle_thread_exit`
+        // delivers the reply when the target eventually exits.
+        let reply_slot = trona_runtime::client::caps::service_recv_ep();
+        if reply_slot == 0 {
             reply.label = TRONA_OUT_OF_MEMORY;
             return false;
         }
@@ -582,7 +689,7 @@ pub(crate) unsafe fn handle_thread_join(msg: &TronaMsg, reply: &mut TronaMsg, ba
 }
 
 // ===========================================================================
-// PM_THREAD_DETACH
+// INIT_THREAD_DETACH
 // ===========================================================================
 
 /// Inputs:
@@ -696,6 +803,17 @@ pub(crate) unsafe fn drop_all_threads(proc_idx: usize) {
             if entry.state == ThreadState::Unused {
                 continue;
             }
+            // Collect ticks before the TCB cap is revoked by the bulk
+            // RES_RECLAIM_OWNER call that precedes drop_all_threads.
+            // If the cap is already gone the invoke returns None; that is safe.
+            if entry.tcb_cap != 0 {
+                if let Some((ut, st)) =
+                    invoke::tcb_get_cpu_times_ctx(trona_runtime::current_ipc_ctx(), entry.tcb_cap)
+                {
+                    p.dead_thread_user_time_ns += ut;
+                    p.dead_thread_system_time_ns += st;
+                }
+            }
             for &local_slot in &[entry.tcb_cap, entry.sc_cap, entry.frame_cap] {
                 if local_slot != 0 {
                     let _ = invoke::cnode_delete(CAP_SELF_CSPACE, local_slot);
@@ -703,8 +821,7 @@ pub(crate) unsafe fn drop_all_threads(proc_idx: usize) {
                 }
             }
             if entry.joiner_reply_cap != 0 {
-                let _ = invoke::cnode_delete(CAP_SELF_CSPACE, entry.joiner_reply_cap);
-                (&mut *(&raw mut ALLOCATOR)).free_single_slot(entry.joiner_reply_cap);
+                entry.joiner_reply_cap = 0;
             }
             p.threads.entries[i] = ThreadEntry::zeroed();
         }

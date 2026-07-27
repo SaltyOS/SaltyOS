@@ -11,34 +11,51 @@ Usage:
 """
 
 import argparse
+import hashlib
+import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 
 # Required files: (sysroot destination relative to usr/lib, source relative to build-dir)
 REQUIRED_BUILD_FILES = [
     ("libc.so",              "lib/basalt/c/libc.so"),
+    ("libc.a",               "lib/basalt/c/libc.a"),
     ("libtrona.so",          "lib/trona/libtrona.so"),
+    ("libtrona.a",           "lib/trona/libtrona.a"),
     ("crt_start.o",          "lib/basalt/c/crt_start.o"),
-    ("core.o",               "rust/core.o"),
-    ("compiler_builtins.o",  "rust/compiler_builtins.o"),
-    ("ld-trona.so",          "lib/trona/rtld/elf/ld-trona.so"),
+    ("core.o",               "lib/trona/core-trona.o"),
+    ("compiler_builtins.o",  "lib/trona/compiler_builtins-trona.o"),
+    ("ldtrona-elf.so",       "lib/trona/loader/ldtrona-elf.so"),
 ]
 
 # Optional files: copied if present, warned if missing
 OPTIONAL_BUILD_FILES = [
-    ("ld-trona-pe.so",  "lib/trona/rtld/pe/ld-trona-pe.so"),
+    ("ldtrona-pe.so",   "lib/trona/loader/ldtrona-pe.so"),
     ("trona.rmeta",     "lib/trona/trona.rmeta"),
     ("basaltc.rmeta",   "lib/basalt/c/basaltc.rmeta"),
     ("libc++.so",       "lib/basalt/cpp/libc++.so"),
 ]
 
 
+# Collected list of all file paths mksysroot installs in this run. Used to
+# write __base__ provenance without sweeping the whole sysroot (which would
+# otherwise claim port-overlaid files as base-owned and break subsequent
+# port overlays).
+INSTALLED_PATHS: list = []
+
+
+def _record(dst):
+    INSTALLED_PATHS.append(Path(dst))
+
+
 def copy_file(src, dst, verbose):
     """Copy a single file, creating parent directories as needed."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+    _record(dst)
     if verbose:
         print(f"  {src} -> {dst}")
 
@@ -49,9 +66,11 @@ def copy_if_changed(src, dst, verbose):
         src_stat = src.stat()
         dst_stat = dst.stat()
         if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+            _record(dst)
             return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+    _record(dst)
     if verbose:
         print(f"  {src} -> {dst}")
     return True
@@ -99,6 +118,7 @@ def main():
 
     header_src = repo_root / "lib" / "basalt" / "c" / "include"
     pie_linker_script = repo_root / "lib" / "trona" / "trona-pie.ld"
+    static_pie_linker_script = repo_root / "lib" / "trona" / "trona-static-pie.ld"
     cxx_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxx" / "include"
     cxxabi_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxxabi" / "include"
     cxx_config_site = repo_root / "lib" / "basalt" / "cpp" / "__config_site"
@@ -131,21 +151,39 @@ def main():
     skipped = 0
     warnings = 0
 
-    # Copy C headers (preserve directory structure)
+    # Copy C headers (preserve directory structure). We enumerate source
+    # files so we only record the headers basaltc actually provides; a plain
+    # `include_dir.rglob` after copytree would also sweep up headers that
+    # ports previously overlaid into the same tree (e.g. ncurses's curses.h)
+    # and mis-claim them as base-owned.
     if args.verbose:
         print(f"Copying C headers from {header_src}")
     shutil.copytree(header_src, include_dir, dirs_exist_ok=True)
-    header_count = sum(1 for _ in include_dir.rglob("*.h"))
+    header_count = 0
+    for src_h in header_src.rglob("*"):
+        if src_h.is_file():
+            rel = src_h.relative_to(header_src)
+            _record(include_dir / rel)
+            if src_h.suffix == ".h":
+                header_count += 1
     copied += header_count
 
-    # Copy C++ headers (libcxx + libcxxabi) into usr/include/c++/v1/ when available
+    # Copy C++ headers (libcxx + libcxxabi) into usr/include/c++/v1/ when available.
+    # Same caveat as the C header pass: enumerate the sources (not the destination
+    # tree) when recording provenance so we don't reclaim port-overlaid files.
     cxx_inc_dst = output_dir / "usr" / "include" / "c++" / "v1"
     if cxx_inc_src.is_dir():
         if args.verbose:
             print(f"Copying C++ headers from {cxx_inc_src}")
         shutil.copytree(cxx_inc_src, cxx_inc_dst, dirs_exist_ok=True)
+        for src_h in cxx_inc_src.rglob("*"):
+            if src_h.is_file():
+                _record(cxx_inc_dst / src_h.relative_to(cxx_inc_src))
         if cxxabi_inc_src.is_dir():
             shutil.copytree(cxxabi_inc_src, cxx_inc_dst, dirs_exist_ok=True)
+            for src_h in cxxabi_inc_src.rglob("*"):
+                if src_h.is_file():
+                    _record(cxx_inc_dst / src_h.relative_to(cxxabi_inc_src))
         if cxx_config_site.exists():
             copy_file(cxx_config_site, cxx_inc_dst / "__config_site", args.verbose)
         if cxx_assertion_handler.exists():
@@ -180,6 +218,16 @@ def main():
         copied += 1
     else:
         skipped += 1
+    if not static_pie_linker_script.exists():
+        print(
+            f"Error: static PIE linker script not found: {static_pie_linker_script}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if do_copy(static_pie_linker_script, lib_dir / "trona-static-pie.ld", args.verbose) is not False:
+        copied += 1
+    else:
+        skipped += 1
 
     # Copy optional files
     for dest_name, src_rel in OPTIONAL_BUILD_FILES:
@@ -204,9 +252,58 @@ def main():
         path = lib_dir / name
         with open(path, "wb") as f:
             f.write(b"!<arch>\n")
+        _record(path)
         if args.verbose:
             print(f"Created stub archive: {path}")
         copied += 1
+
+    # Record __base__ provenance so port overlay can detect collisions
+    # against mksysroot-owned files. Format matches tools/port/overlay.rs:
+    #   F\tmode(oct)\tsha256\tpath
+    #   L\tmode(oct)\t-\tpath\ttarget
+    provenance_dir = output_dir / ".port-provenance"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    base_files = provenance_dir / "__base__.files"
+    base_meta = provenance_dir / "__base__.meta"
+
+    def sha256_hex(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    lines = [
+        "# SaltyOS port provenance — do not edit by hand",
+        "# format: F\\tmode(oct)\\tsha256\\tpath  |  L\\tmode(oct)\\t-\\tpath\\ttarget",
+    ]
+    # Record only the files this mksysroot run actually installed. Do NOT
+    # rglob the whole sysroot — that would re-claim files previously overlaid
+    # by ports as __base__, causing subsequent port overlays to fail with
+    # "file X also owned by __base__".
+    seen_rels = set()
+    for p in sorted(INSTALLED_PATHS):
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        try:
+            rel = p.resolve().relative_to(output_dir.resolve()).as_posix()
+        except ValueError:
+            continue
+        if rel in seen_rels:
+            continue
+        seen_rels.add(rel)
+        mode_oct = oct(st.st_mode & 0o7777)[2:]
+        if p.is_symlink():
+            target = os.readlink(p)
+            lines.append(f"L\t{mode_oct}\t-\t{rel}\t{target}")
+        elif p.is_file():
+            lines.append(f"F\t{mode_oct}\t{sha256_hex(p)}\t{rel}")
+    base_files.write_text("\n".join(lines) + "\n")
+    base_meta.write_text(
+        f"name = base\nversion = \nstamp = \noverlaid_at = {int(time.time())}\n"
+    )
 
     # Summary
     parts = [f"{copied} files copied", f"{header_count} headers"]

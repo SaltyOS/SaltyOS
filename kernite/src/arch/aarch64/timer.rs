@@ -12,6 +12,15 @@
 
 use core::ptr;
 
+unsafe extern "C" {
+    fn aarch64_timer_read_cntfrq_el0() -> u64;
+    fn aarch64_timer_read_cntvct_el0() -> u64;
+    fn aarch64_timer_write_cntv_cval_el0(cval: u64);
+    fn aarch64_timer_write_cntv_ctl_el0(ctl: u64);
+    fn aarch64_timer_read_cntkctl_el1() -> u64;
+    fn aarch64_timer_write_cntkctl_el1(value: u64);
+}
+
 /// EL1 virtual timer PPI interrupt ID.
 const VIRT_TIMER_PPI_INTID: u32 = 27;
 /// Timer control bit: enable timer output/comparison.
@@ -32,23 +41,15 @@ static mut COUNTER_FREQ: u64 = 0;
 /// Read the counter frequency from CNTFRQ_EL0.
 #[inline(always)]
 fn read_cntfrq() -> u64 {
-    let val: u64;
     // SAFETY: Reading CNTFRQ_EL0 is always safe.
-    unsafe {
-        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_timer_read_cntfrq_el0() }
 }
 
 /// Read the active counter value used by the virtual timer.
 #[inline(always)]
 fn read_timer_count() -> u64 {
-    let val: u64;
     // SAFETY: Reading CNTVCT_EL0 is always safe from EL1 kernel context.
-    unsafe {
-        core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_timer_read_cntvct_el0() }
 }
 
 /// Write the virtual timer compare value.
@@ -56,7 +57,7 @@ fn read_timer_count() -> u64 {
 fn write_timer_cval(cval: u64) {
     // SAFETY: Writing CNTV_CVAL_EL0 is safe from EL1 kernel context.
     unsafe {
-        core::arch::asm!("msr CNTV_CVAL_EL0, {}", in(reg) cval, options(nomem, nostack));
+        aarch64_timer_write_cntv_cval_el0(cval);
     }
 }
 
@@ -65,7 +66,7 @@ fn write_timer_cval(cval: u64) {
 fn write_timer_ctl(ctl: u64) {
     // SAFETY: Writing CNTV_CTL_EL0 is safe from EL1 kernel context.
     unsafe {
-        core::arch::asm!("msr CNTV_CTL_EL0, {}", in(reg) ctl, options(nomem, nostack));
+        aarch64_timer_write_cntv_ctl_el0(ctl);
     }
 }
 
@@ -80,7 +81,9 @@ fn write_timer_ctl(ctl: u64) {
 pub fn init() {
     let freq = read_cntfrq();
     if freq == 0 {
-        crate::serial_puts("[TIMER] WARNING: CNTFRQ_EL0 is 0 — timer will not function\n");
+        crate::kernel::printk::serial_puts(
+            "[TIMER] WARNING: CNTFRQ_EL0 is 0 — timer will not function\n",
+        );
         return;
     }
 
@@ -93,7 +96,7 @@ pub fn init() {
     // Disable the timer while we configure.
     write_timer_ctl(0);
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[TIMER] Counter frequency: ");
         _g.hex(freq);
         _g.puts(" Hz\n");
@@ -113,13 +116,11 @@ pub fn start() {
     }
 
     // Per-CPU: allow EL0 to read CNTVCT_EL0 (virtual counter).
-    // SAFETY: Writing CNTKCTL_EL1 is safe from EL1.
+    let mut cntkctl = unsafe { aarch64_timer_read_cntkctl_el1() };
+    cntkctl |= 1 << 1; // EL0VCTEN
+    cntkctl &= !(1 << 0); // clear EL0PCTEN
     unsafe {
-        let mut cntkctl: u64;
-        core::arch::asm!("mrs {}, CNTKCTL_EL1", out(reg) cntkctl, options(nomem, nostack));
-        cntkctl |= 1 << 1; // EL0VCTEN
-        cntkctl &= !(1 << 0); // clear EL0PCTEN
-        core::arch::asm!("msr CNTKCTL_EL1, {}", in(reg) cntkctl, options(nomem, nostack));
+        aarch64_timer_write_cntkctl_el1(cntkctl);
     }
 
     let ticks = freq / TICK_HZ;
@@ -141,7 +142,7 @@ pub fn start() {
     // Finally unmask timer interrupt delivery.
     write_timer_ctl(TIMER_CTL_ENABLE);
 
-    crate::serial_puts("[TIMER] Started (1 ms tick)\n");
+    crate::kernel::printk::serial_puts("[TIMER] Started (1 ms tick)\n");
 }
 
 /// Stop the local timer and mask further timer interrupt delivery.

@@ -1,30 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Capability System
 //!
 //! Fat capabilities (32 bytes) with rights management and seL4-style CDT.
-//!
-//! SPDX-License-Identifier: GPL-2.0-only
 
 mod cdt;
 pub(crate) mod cnode;
 pub mod ioport;
 pub mod memory_object;
-mod object;
+pub(crate) mod object;
+mod object_size;
+mod object_size_assert;
+pub mod pager;
 mod refcount;
 mod slot;
+pub mod system;
 mod untyped;
+
+pub use object_size::{ObjectSizeError, object_alloc_bytes};
 
 pub use cdt::CDT;
 pub use cnode::{CNode, CapError, CapRef};
-pub use object::{KernelObject, ObjectType};
-pub use refcount::{increment_refcount, release_object};
-pub(crate) use refcount::destroy_object_deferred;
-pub use slot::{
-    alloc_slot, free_slot, get_cap, get_cap_mut, get_meta, get_meta_mut, nullify_capability,
-    CapSlot, INVALID_SLOT,
-};
 pub use ioport::IoPortRange;
-pub(crate) use untyped::UntypedTracker;
-pub use untyped::{FrameObject, UntypedMemory};
+pub use object::{KernelObject, ObjectType};
+pub(crate) use refcount::destroy_object_final;
+pub use refcount::{increment_refcount, release_object, try_increment_refcount};
+pub use slot::{
+    CapSlot, INVALID_SLOT, alloc_slot, free_slot, get_cap, get_generation, pin_transit,
+    unpin_transit, write_capability,
+};
+pub(crate) use untyped::child_phys_range;
+pub use untyped::{FrameObject, PageTableObject, UntypedMemory};
 
 /// Capability rights bitmap
 ///
@@ -43,44 +48,36 @@ impl CapRights {
     }
 
     /// Read permission
-    pub const READ: CapRights = CapRights(1 << 0);
+    pub const READ: CapRights = CapRights(uapi::KERNITE_RIGHT_READ as u32);
     /// Write permission
-    pub const WRITE: CapRights = CapRights(1 << 1);
+    pub const WRITE: CapRights = CapRights(uapi::KERNITE_RIGHT_WRITE as u32);
     /// Execute permission (for code mappings)
-    pub const EXECUTE: CapRights = CapRights(1 << 2);
+    pub const EXECUTE: CapRights = CapRights(uapi::KERNITE_RIGHT_EXECUTE as u32);
     /// Grant right (can copy to others)
-    pub const GRANT: CapRights = CapRights(1 << 3);
-    /// Revoke right (can revoke derived caps)
-    pub const REVOKE: CapRights = CapRights(1 << 4);
+    pub const GRANT: CapRights = CapRights(uapi::KERNITE_RIGHT_GRANT as u32);
+    /// Map pages into a VSpace (covers both map and unmap directions —
+    /// once a holder can map a frame, they can unmap it too).
+    pub const MAP: CapRights = CapRights(uapi::KERNITE_RIGHT_MAP as u32);
+    /// Configure object state (TCB stop/start, Untyped retype,
+    /// MessagePipe pair, MemoryObject layout). Replaces the legacy
+    /// SUSPEND / RETYPE / REVOKE bits.
+    pub const CONFIGURE: CapRights = CapRights(uapi::KERNITE_RIGHT_CONFIGURE as u32);
+    /// Resume / start a suspended TCB.
+    pub const RESUME: CapRights = CapRights(uapi::KERNITE_RIGHT_RESUME as u32);
+    /// Duplicate the capability into another slot without granting
+    /// the rights to delegate further.
+    pub const DUPLICATE: CapRights = CapRights(uapi::KERNITE_RIGHT_DUPLICATE as u32);
+    /// Signal / produce events into an EventQueue or assert state on
+    /// a watchable source (`Watch` / `Timer` / `IrqHandler`).
+    pub const SIGNAL: CapRights = CapRights(uapi::KERNITE_RIGHT_SIGNAL as u32);
+    /// Wait / consume events from an EventQueue / Watch / Timer.
+    pub const WAIT: CapRights = CapRights(uapi::KERNITE_RIGHT_WAIT as u32);
+    /// Transfer the capability over an IPC primitive (MessagePipe
+    /// cap-carrier transfer).
+    pub const TRANSFER: CapRights = CapRights(uapi::KERNITE_RIGHT_TRANSFER as u32);
 
-    // IPC rights
-    /// Send to endpoint
-    pub const SEND: CapRights = CapRights(1 << 5);
-    /// Receive from endpoint
-    pub const RECV: CapRights = CapRights(1 << 6);
-    /// Send + receive atomically
-    pub const CALL: CapRights = CapRights(1 << 7);
-    /// Reply capability
-    pub const REPLY: CapRights = CapRights(1 << 8);
-
-    // Thread management
-    /// Configure thread
-    pub const CONFIGURE: CapRights = CapRights(1 << 9);
-    /// Suspend thread
-    pub const SUSPEND: CapRights = CapRights(1 << 10);
-    /// Resume thread
-    pub const RESUME: CapRights = CapRights(1 << 11);
-
-    // Memory management
-    /// Map pages
-    pub const MAP: CapRights = CapRights(1 << 12);
-    /// Unmap pages
-    pub const UNMAP: CapRights = CapRights(1 << 13);
-    /// Retype untyped
-    pub const RETYPE: CapRights = CapRights(1 << 14);
-
-    /// All rights
-    pub const ALL: CapRights = CapRights(0xFFFFFFFF);
+    /// All ABI-defined rights (the low 11 bits).
+    pub const ALL: CapRights = CapRights(uapi::KERNITE_RIGHT_ALL as u32);
 
     /// Create an empty CapRights (no rights)
     #[inline]
@@ -99,6 +96,20 @@ impl CapRights {
     pub fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+
+    /// Bitwise AND of two CapRights — the rights common to both.
+    #[inline]
+    pub fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// This right-set with `other`'s bits cleared. Used at cap egress to
+    /// strip a specific right (notably EXECUTE) from a broader set:
+    /// `CapRights::ALL.without(CapRights::EXECUTE)`.
+    #[inline]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
 }
 
 impl core::ops::BitOr for CapRights {
@@ -112,6 +123,14 @@ impl core::ops::BitOr for CapRights {
 impl core::ops::BitOrAssign for CapRights {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
+    }
+}
+
+impl core::ops::BitAnd for CapRights {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
     }
 }
 
@@ -189,7 +208,6 @@ impl Capability {
     ///
     /// # Errors
     /// - InsufficientRights: Source cap must have Grant right
-    /// - RightsNotSubset: New rights must be subset of source rights
     /// - DepthExceeded: Maximum derivation depth reached
     pub fn copy(
         &self,
@@ -202,21 +220,19 @@ impl Capability {
             return Err(CapError::InsufficientRights);
         }
 
-        // New rights must be subset of current rights
-        if !self.rights.contains(new_rights) {
-            return Err(CapError::RightsNotSubset);
-        }
-
         // Check derivation depth
         if self.depth >= slot::MAX_DERIVATION_DEPTH {
             return Err(CapError::DepthExceeded);
         }
 
-        // Copy to destination slot
-        let dest_cap = get_cap_mut(dest_slot);
-        *dest_cap = *self;
-        dest_cap.rights = new_rights;
+        // Copy to destination slot. Mask the requested rights down to
+        // the source's rights — a derived cap can never gain a right
+        // the source lacks, so a RIGHT_ALL request resolves to exactly
+        // the rights the source currently holds.
+        let mut dest_cap = *self;
+        dest_cap.rights = self.rights & new_rights;
         dest_cap.depth = self.depth + 1;
+        write_capability(dest_slot, dest_cap);
 
         // Insert into CDT as child of source
         CDT::insert_child(source_slot, dest_slot);
@@ -231,13 +247,47 @@ impl Capability {
         Ok(())
     }
 
+    /// Confer EXECUTE on a code MemoryObject: derive a new
+    /// `READ|EXECUTE|GRANT|TRANSFER` capability to the same object as a CDT
+    /// child of `self`. Unlike `copy`, the rights are a fixed set the source
+    /// need not hold (this is the one operation that introduces EXECUTE), and
+    /// the GRANT gate is replaced by the caller's exec-authority check. The
+    /// source cap is never mutated; revoking it cascades to the conferred cap.
+    pub fn confer_exec(&self, source_slot: CapSlot, dest_slot: CapSlot) -> Result<(), CapError> {
+        // Check derivation depth (same bound as `copy`).
+        if self.depth >= slot::MAX_DERIVATION_DEPTH {
+            return Err(CapError::DepthExceeded);
+        }
+
+        let mut dest_cap = *self;
+        dest_cap.rights =
+            CapRights::READ | CapRights::EXECUTE | CapRights::GRANT | CapRights::TRANSFER;
+        dest_cap.depth = self.depth + 1;
+        write_capability(dest_slot, dest_cap);
+
+        // Insert into CDT as child of source, so source revocation cascades.
+        CDT::insert_child(source_slot, dest_slot);
+
+        // Increment object refcount.
+        unsafe {
+            if !self.object.is_null() {
+                increment_refcount(self.object);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Mint badged capability
     ///
-    /// Creates a new capability with a badge value. Only endpoints can be minted.
-    /// Minted capabilities cannot have Grant right (cannot be further delegated).
+    /// Creates a new capability with a badge value. Only types that
+    /// carry a meaningful badge in the new ABI (`MessagePipe`,
+    /// `DataPipe`, `EventQueue`, `Watch`, `Timer`, `IrqHandler`) can
+    /// be minted. Minted capabilities cannot have Grant right (cannot
+    /// be further delegated).
     ///
     /// # Errors
-    /// - InvalidOperation: Object type is not Endpoint
+    /// - InvalidOperation: Object type does not carry a badge slot
     /// - InsufficientRights: Source must have Grant right
     /// - InvalidBadge: Attempting to grant with badge (badged caps can't grant)
     pub fn mint(
@@ -247,9 +297,17 @@ impl Capability {
         new_rights: CapRights,
         dest_slot: CapSlot,
     ) -> Result<(), CapError> {
-        // Only endpoints and notifications can be badged
-        if self.obj_type != ObjectType::Endpoint && self.obj_type != ObjectType::Notification {
-            return Err(CapError::InvalidOperation);
+        // Only MessagePipe / DataPipe / EventQueue / Watch / Timer caps
+        // carry meaningful badge values in the new ABI; reject minting on
+        // types whose badge slot is unused.
+        match self.obj_type {
+            ObjectType::MessagePipe
+            | ObjectType::DataPipe
+            | ObjectType::EventQueue
+            | ObjectType::Watch
+            | ObjectType::Timer
+            | ObjectType::IrqHandler => {}
+            _ => return Err(CapError::InvalidOperation),
         }
 
         // Source must have Grant right
@@ -267,12 +325,15 @@ impl Capability {
             return Err(CapError::DepthExceeded);
         }
 
-        // Create minted capability
-        let dest_cap = get_cap_mut(dest_slot);
-        *dest_cap = *self;
-        dest_cap.rights = new_rights;
+        // Create minted capability. Mask the requested rights to the
+        // source's rights so a mint can never amplify beyond what the
+        // source holds (the badge-excludes-GRANT rule above still
+        // applies to the requested mask).
+        let mut dest_cap = *self;
+        dest_cap.rights = self.rights & new_rights;
         dest_cap.badge = badge;
         dest_cap.depth = self.depth + 1;
+        write_capability(dest_slot, dest_cap);
 
         // Insert into CDT
         CDT::insert_child(source_slot, dest_slot);
@@ -301,7 +362,7 @@ pub fn init() {
     const MIN_CAP_SLOTS: usize = 768;
     let num_slots = (free / 4).clamp(MIN_CAP_SLOTS, 131_072);
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[CAP] Dynamic slot count: ");
         _g.dec(num_slots as u64);
         _g.puts(" (");
@@ -346,35 +407,37 @@ mod tests {
     fn test_mint_badge() {
         use core::sync::atomic::Ordering;
 
-        // Create a fake Endpoint object on the stack
-        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        // Create a fake MessagePipe object on the stack to exercise
+        // the badged-mint path.
+        let obj = KernelObject::new(ObjectType::MessagePipe, 0);
         let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
 
         // Set up source capability in a slot
         let src_slot = alloc_slot().unwrap();
         let dest_slot = alloc_slot().unwrap();
 
-        let src_cap = get_cap_mut(src_slot);
+        let mut src_cap = Capability::null();
         src_cap.object = obj_ptr;
-        src_cap.obj_type = ObjectType::Endpoint;
-        src_cap.rights = CapRights::SEND | CapRights::RECV | CapRights::GRANT;
+        src_cap.obj_type = ObjectType::MessagePipe;
+        src_cap.rights = CapRights::WRITE | CapRights::READ | CapRights::GRANT;
         src_cap.badge = 0;
         src_cap.depth = 0;
+        write_capability(src_slot, src_cap);
 
         CDT::insert_root(src_slot);
 
-        // Mint with badge=42, rights=SEND only (no GRANT, required for badged caps)
+        // Mint with badge=42, rights=WRITE only (no GRANT, required for badged caps)
         let badge: u64 = 42;
-        let new_rights = CapRights::SEND;
+        let new_rights = CapRights::WRITE;
         let result = get_cap(src_slot).mint(src_slot, badge, new_rights, dest_slot);
         assert!(result.is_ok());
 
         // Verify minted capability
         let minted = get_cap(dest_slot);
         assert_eq!(minted.badge, 42);
-        assert_eq!(minted.obj_type, ObjectType::Endpoint);
-        assert!(minted.has_right(CapRights::SEND));
-        assert!(!minted.has_right(CapRights::RECV));
+        assert_eq!(minted.obj_type, ObjectType::MessagePipe);
+        assert!(minted.has_right(CapRights::WRITE));
+        assert!(!minted.has_right(CapRights::READ));
         assert!(!minted.has_right(CapRights::GRANT));
         assert_eq!(minted.depth, 1);
         assert_eq!(minted.object, obj_ptr);
@@ -396,14 +459,15 @@ mod tests {
     }
 
     #[test]
-    fn test_mint_rejects_non_endpoint() {
-        // Mint should fail for non-Endpoint types
+    fn test_mint_rejects_unbadged_type() {
+        // Mint should fail for cap types whose badge slot is unused.
         let src_slot = alloc_slot().unwrap();
         let dest_slot = alloc_slot().unwrap();
 
-        let src_cap = get_cap_mut(src_slot);
-        src_cap.obj_type = ObjectType::Frame; // Not an endpoint
+        let mut src_cap = Capability::null();
+        src_cap.obj_type = ObjectType::Frame; // Frame caps carry no badge.
         src_cap.rights = CapRights::GRANT;
+        write_capability(src_slot, src_cap);
 
         CDT::insert_root(src_slot);
 
@@ -419,23 +483,24 @@ mod tests {
     #[test]
     fn test_mint_rejects_grant_in_badge() {
         // Badged caps must not have Grant right
-        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        let obj = KernelObject::new(ObjectType::MessagePipe, 0);
         let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
 
         let src_slot = alloc_slot().unwrap();
         let dest_slot = alloc_slot().unwrap();
 
-        let src_cap = get_cap_mut(src_slot);
+        let mut src_cap = Capability::null();
         src_cap.object = obj_ptr;
-        src_cap.obj_type = ObjectType::Endpoint;
-        src_cap.rights = CapRights::SEND | CapRights::GRANT;
+        src_cap.obj_type = ObjectType::MessagePipe;
+        src_cap.rights = CapRights::WRITE | CapRights::GRANT;
+        write_capability(src_slot, src_cap);
 
         CDT::insert_root(src_slot);
 
         let result = get_cap(src_slot).mint(
             src_slot,
             99,
-            CapRights::SEND | CapRights::GRANT, // Grant not allowed in minted cap
+            CapRights::WRITE | CapRights::GRANT, // Grant not allowed in minted cap
             dest_slot,
         );
         assert!(matches!(result, Err(CapError::InvalidBadge)));
@@ -448,27 +513,28 @@ mod tests {
 
     #[test]
     fn test_copy_reduced_rights() {
-        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        let obj = KernelObject::new(ObjectType::MessagePipe, 0);
         let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
 
         let src_slot = alloc_slot().unwrap();
         let dest_slot = alloc_slot().unwrap();
 
-        let src_cap = get_cap_mut(src_slot);
+        let mut src_cap = Capability::null();
         src_cap.object = obj_ptr;
-        src_cap.obj_type = ObjectType::Endpoint;
-        src_cap.rights = CapRights::SEND | CapRights::RECV | CapRights::GRANT;
+        src_cap.obj_type = ObjectType::MessagePipe;
+        src_cap.rights = CapRights::WRITE | CapRights::READ | CapRights::GRANT;
         src_cap.depth = 0;
+        write_capability(src_slot, src_cap);
 
         CDT::insert_root(src_slot);
 
-        // Copy with reduced rights (SEND only)
-        let result = get_cap(src_slot).copy(src_slot, CapRights::SEND, dest_slot);
+        // Copy with reduced rights (WRITE only)
+        let result = get_cap(src_slot).copy(src_slot, CapRights::WRITE, dest_slot);
         assert!(result.is_ok());
 
         let copied = get_cap(dest_slot);
-        assert!(copied.has_right(CapRights::SEND));
-        assert!(!copied.has_right(CapRights::RECV));
+        assert!(copied.has_right(CapRights::WRITE));
+        assert!(!copied.has_right(CapRights::READ));
         assert!(!copied.has_right(CapRights::GRANT));
         assert_eq!(copied.depth, 1);
         assert_eq!(CDT::parent(dest_slot), src_slot);
@@ -486,13 +552,14 @@ mod tests {
         let src_slot = alloc_slot().unwrap();
         let dest_slot = alloc_slot().unwrap();
 
-        let src_cap = get_cap_mut(src_slot);
-        src_cap.obj_type = ObjectType::Endpoint;
-        src_cap.rights = CapRights::SEND | CapRights::RECV; // No GRANT
+        let mut src_cap = Capability::null();
+        src_cap.obj_type = ObjectType::MessagePipe;
+        src_cap.rights = CapRights::WRITE | CapRights::READ; // No GRANT
+        write_capability(src_slot, src_cap);
 
         CDT::insert_root(src_slot);
 
-        let result = get_cap(src_slot).copy(src_slot, CapRights::SEND, dest_slot);
+        let result = get_cap(src_slot).copy(src_slot, CapRights::WRITE, dest_slot);
         assert!(matches!(result, Err(CapError::InsufficientRights)));
 
         CDT::remove(src_slot);

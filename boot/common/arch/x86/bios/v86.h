@@ -22,12 +22,12 @@
 #include "../../../types.h"
 
 /* V86 control flags */
-#define V86_ADDR    0x0001      /* Segment:offset address valid */
-#define V86_FLAGS   0x0002      /* Return flags */
+#define V86_ADDR 0x0001  /* Segment:offset address valid */
+#define V86_FLAGS 0x0002 /* Return flags */
 
 /* V86 flag helpers */
-#define V86_CY(flags)   ((flags) & 0x0001)  /* Carry flag */
-#define V86_ZR(flags)   ((flags) & 0x0040)  /* Zero flag */
+#define V86_CY(flags) ((flags) & 0x0001) /* Carry flag */
+#define V86_ZR(flags) ((flags) & 0x0040) /* Zero flag */
 
 /*
  * V86 register structure
@@ -36,28 +36,28 @@
  * It mirrors the CPU register layout for easy access.
  */
 struct V86Regs {
-    /* Control */
-    uint32_t ctl;       /* Control flags (V86_*) */
-    uint32_t addr;      /* Interrupt number or address */
+  /* Control */
+  uint32_t ctl;  /* Control flags (V86_*) */
+  uint32_t addr; /* Interrupt number or address */
 
-    /* General purpose registers */
-    uint32_t eax;
-    uint32_t ecx;
-    uint32_t edx;
-    uint32_t ebx;
-    uint32_t esp;       /* Not used for V86 calls */
-    uint32_t ebp;
-    uint32_t esi;
-    uint32_t edi;
+  /* General purpose registers */
+  uint32_t eax;
+  uint32_t ecx;
+  uint32_t edx;
+  uint32_t ebx;
+  uint32_t esp; /* Not used for V86 calls */
+  uint32_t ebp;
+  uint32_t esi;
+  uint32_t edi;
 
-    /* Segment registers */
-    uint32_t ds;
-    uint32_t es;
-    uint32_t fs;
-    uint32_t gs;
+  /* Segment registers */
+  uint32_t ds;
+  uint32_t es;
+  uint32_t fs;
+  uint32_t gs;
 
-    /* Flags (output) */
-    uint32_t efl;
+  /* Flags (output) */
+  uint32_t efl;
 } PACKED;
 
 /* Global V86 register structure */
@@ -80,8 +80,8 @@ void v86int(void);
  * - paragraph-aligned (16 bytes)
  * - at least V86_WORKSPACE_SIZE bytes
  */
-#define V86_WORKSPACE_ALIGN  16U
-#define V86_WORKSPACE_SIZE   0x1000U
+#define V86_WORKSPACE_ALIGN 16U
+#define V86_WORKSPACE_SIZE 0x1000U
 
 /*
  * Initialize V86/BTX subsystem.
@@ -100,13 +100,13 @@ int v86_init(uint32_t workspace_base, uint32_t workspace_size);
 /*
  * Convert linear address to segment:offset
  */
-#define VTOPSEG(addr)   (((uint32_t)(addr) >> 4) & 0xFFFF)
-#define VTOPOFF(addr)   ((uint32_t)(addr) & 0xF)
+#define VTOPSEG(addr) (((uint32_t)(addr) >> 4) & 0xFFFF)
+#define VTOPOFF(addr) ((uint32_t)(addr) & 0xF)
 
 /*
  * Convert segment:offset to linear address
  */
-#define SEGOFF_TO_LINEAR(seg, off)  (((uint32_t)(seg) << 4) + (uint32_t)(off))
+#define SEGOFF_TO_LINEAR(seg, off) (((uint32_t)(seg) << 4) + (uint32_t)(off))
 
 /* ========================================================================= */
 /* High-level BIOS service wrappers                                          */
@@ -118,12 +118,12 @@ int v86_init(uint32_t workspace_base, uint32_t workspace_size);
 
 /* Disk Address Packet for extended read/write */
 struct DiskAddressPacket {
-    uint8_t  size;          /* Size of packet (16 or 24) */
-    uint8_t  reserved;      /* Reserved (0) */
-    uint16_t count;         /* Number of sectors */
-    uint16_t offset;        /* Buffer offset */
-    uint16_t segment;       /* Buffer segment */
-    uint64_t lba;           /* Starting LBA */
+  uint8_t size;     /* Size of packet (16 or 24) */
+  uint8_t reserved; /* Reserved (0) */
+  uint16_t count;   /* Number of sectors */
+  uint16_t offset;  /* Buffer offset */
+  uint16_t segment; /* Buffer segment */
+  uint64_t lba;     /* Starting LBA */
 } PACKED;
 
 /*
@@ -147,7 +147,8 @@ int bios_disk_read(uint8_t drive, uint64_t lba, uint16_t count, void *buffer);
  *
  * Returns: 0 on success, -1 on error
  */
-int bios_disk_get_params(uint8_t drive, uint64_t *sectors, uint16_t *sector_size);
+int bios_disk_get_params(uint8_t drive, uint64_t *sectors,
+                         uint16_t *sector_size);
 
 /*
  * INT 15h - System Services
@@ -155,18 +156,18 @@ int bios_disk_get_params(uint8_t drive, uint64_t *sectors, uint16_t *sector_size
 
 /* E820 memory map entry */
 struct E820MemoryMap {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t acpi_attr;
+  uint64_t base;
+  uint64_t length;
+  uint32_t type;
+  uint32_t acpi_attr;
 } PACKED;
 
 /* E820 memory types */
-#define E820_USABLE         1
-#define E820_RESERVED       2
-#define E820_ACPI_RECLAIM   3
-#define E820_ACPI_NVS       4
-#define E820_BAD            5
+#define E820_USABLE 1
+#define E820_RESERVED 2
+#define E820_ACPI_RECLAIM 3
+#define E820_ACPI_NVS 4
+#define E820_BAD 5
 
 /*
  * Get memory map entry (INT 15h, EAX=E820h)

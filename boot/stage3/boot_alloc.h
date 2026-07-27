@@ -20,34 +20,34 @@
 
 /* Allocation purpose tags - mapped to BootInfo memmap types by handoff */
 enum BootAllocTag {
-    BOOT_ALLOC_PAGE_TABLES = 0,  /* -> MEMMAP_BOOTLOADER */
-    BOOT_ALLOC_KERNEL      = 1,  /* -> MEMMAP_KERNEL */
-    BOOT_ALLOC_INITRD      = 2,  /* -> MEMMAP_INITRD */
-    BOOT_ALLOC_BOOTINFO    = 3,  /* -> MEMMAP_BOOTINFO */
-    BOOT_ALLOC_STACK       = 4,  /* -> MEMMAP_BOOTLOADER */
-    BOOT_ALLOC_GENERIC     = 5,  /* -> MEMMAP_BOOTLOADER */
+  BOOT_ALLOC_PAGE_TABLES = 0, /* -> MEMMAP_BOOTLOADER */
+  BOOT_ALLOC_KERNEL = 1,      /* -> MEMMAP_KERNEL */
+  BOOT_ALLOC_INITRD = 2,      /* -> MEMMAP_INITRD */
+  BOOT_ALLOC_BOOTINFO = 3,    /* -> MEMMAP_BOOTINFO */
+  BOOT_ALLOC_STACK = 4,       /* -> MEMMAP_BOOTLOADER */
+  BOOT_ALLOC_GENERIC = 5,     /* -> MEMMAP_BOOTLOADER */
 };
 
 struct BootAllocRecord {
-    uint64_t phys_addr;
-    uint64_t size;
-    uint32_t tag;     /* enum BootAllocTag */
-    uint32_t _pad;
+  uint64_t phys_addr;
+  uint64_t size;
+  uint32_t tag; /* enum BootAllocTag */
+  uint32_t _pad;
 };
 
 struct BootAlloc {
-    struct BootAllocRecord records[BOOT_ALLOC_MAX_RECORDS];
-    uint32_t record_count;
-    uint32_t mode;    /* BOOT_MODE_BIOS or BOOT_MODE_UEFI */
+  struct BootAllocRecord records[BOOT_ALLOC_MAX_RECORDS];
+  uint32_t record_count;
+  uint32_t mode; /* BOOT_MODE_BIOS or BOOT_MODE_UEFI */
 
-    /* BIOS bump allocator state */
-    uint64_t watermark;          /* Next allocation address */
-    uint64_t e820_addr;          /* Address of E820Entry array */
-    uint32_t e820_count;
-    uint32_t _pad;
+  /* BIOS bump allocator state */
+  uint64_t watermark; /* Next allocation address */
+  uint64_t e820_addr; /* Address of E820Entry array */
+  uint32_t e820_count;
+  uint32_t _pad;
 
-    /* UEFI boot services pointer (NULL after ExitBootServices) */
-    uint64_t uefi_bs;
+  /* UEFI boot services pointer (NULL after ExitBootServices) */
+  uint64_t uefi_bs;
 };
 
 /*
@@ -61,9 +61,8 @@ struct BootAlloc {
  * @param e820_count: Number of E820 entries
  * @param min_addr: Minimum allocation address (typically MB(2))
  */
-void boot_alloc_init_bios(struct BootAlloc *ba,
-                           uint64_t e820_addr, uint32_t e820_count,
-                           uint64_t min_addr);
+void boot_alloc_init_bios(struct BootAlloc *ba, uint64_t e820_addr,
+                          uint32_t e820_count, uint64_t min_addr);
 
 /*
  * Initialize UEFI allocator wrapper.
@@ -86,8 +85,8 @@ void boot_alloc_init_uefi(struct BootAlloc *ba, uint64_t bs);
  *
  * Returns: Physical address of allocation, or 0 on failure.
  */
-uint64_t boot_alloc(struct BootAlloc *ba, uint64_t size,
-                     uint64_t align, uint32_t tag);
+uint64_t boot_alloc(struct BootAlloc *ba, uint64_t size, uint64_t align,
+                    uint32_t tag);
 
 /*
  * Retroactively register an external allocation.
@@ -100,8 +99,8 @@ uint64_t boot_alloc(struct BootAlloc *ba, uint64_t size,
  * @param size: Size of allocation
  * @param tag: Purpose tag
  */
-void boot_alloc_register(struct BootAlloc *ba, uint64_t addr,
-                          uint64_t size, uint32_t tag);
+void boot_alloc_register(struct BootAlloc *ba, uint64_t addr, uint64_t size,
+                         uint32_t tag);
 
 /*
  * Finalize UEFI allocator.

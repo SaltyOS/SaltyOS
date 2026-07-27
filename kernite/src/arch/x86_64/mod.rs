@@ -3,8 +3,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 pub mod acpi;
-mod apic;
 pub mod ap_boot;
+mod apic;
 mod boot;
 mod context;
 mod cpu;
@@ -14,14 +14,38 @@ mod gdt;
 mod idt;
 pub mod paging;
 mod pit;
+pub mod random;
+pub mod stacktrace;
 pub mod uaccess;
 
-pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_unmask_level, ioapic_mask};
-pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, generate_stack_canary, set_per_cpu_canary, MAX_CPUS};
+pub use apic::{IpiKind, ioapic_mask, ioapic_unmask_level, send_ipi, set_tlb_shootdown_addr};
+pub use cpu::{
+    MAX_CPUS, current_cpu, current_invoke_seq, diagnostic_current_cpu, generate_stack_canary,
+    get_kernel_stack, next_invoke_seq, per_cpu_ready, read_fs_base, set_kernel_stack,
+    set_per_cpu_canary, write_abi_tp_base, write_fs_base,
+};
 pub use gdt::set_tss_rsp0;
 
-use crate::kdebug;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+unsafe extern "C" {
+    fn x86_mod_read_cr0() -> u64;
+    fn x86_mod_read_cr2() -> u64;
+    fn x86_mod_read_cr4() -> u64;
+    fn x86_mod_read_rflags() -> u64;
+    fn x86_mod_hlt();
+    fn x86_mod_cli();
+    fn x86_mod_sti();
+    fn x86_mod_outb(port: u16, value: u8);
+    fn x86_mod_inb(port: u16) -> u8;
+    fn x86_mod_outw(port: u16, value: u16);
+    fn x86_mod_inw(port: u16) -> u16;
+    fn x86_mod_outl(port: u16, value: u32);
+    fn x86_mod_inl(port: u16) -> u32;
+    fn x86_mod_rdmsr(msr: u32) -> u64;
+    fn x86_mod_wrmsr(msr: u32, value: u64);
+    fn x86_mod_ud2() -> !;
+}
 
 /// True = APIC mode, False = PIC+PIT fallback
 static APIC_MODE: AtomicBool = AtomicBool::new(false);
@@ -49,8 +73,77 @@ pub fn now_ns() -> u64 {
     }
 }
 
+/// Print x86_64 detail for a generic panic without an exception frame.
+pub fn dump_panic_detail() {
+    use crate::kernel::printk::{serial_dec_raw, serial_hex_raw, serial_putc_hw, serial_puts_raw};
+
+    let cr0 = unsafe { x86_mod_read_cr0() };
+    let cr2 = unsafe { x86_mod_read_cr2() };
+    let cr3 = paging::read_cr3();
+    let cr4 = unsafe { x86_mod_read_cr4() };
+    let rflags = unsafe { x86_mod_read_rflags() };
+
+    serial_puts_raw("arch: x86_64 generic\n");
+    serial_puts_raw("cpu: ");
+    serial_dec_raw(cpu::diagnostic_current_cpu() as u64);
+    serial_puts_raw(" per_cpu_ready=");
+    serial_dec_raw(cpu::per_cpu_ready() as u64);
+    serial_puts_raw(" apic_mode=");
+    serial_dec_raw(has_apic() as u64);
+    serial_puts_raw(" ticks=");
+    serial_dec_raw(get_ticks());
+    serial_putc_hw(b'\n');
+    serial_puts_raw("CR0: ");
+    serial_hex_raw(cr0);
+    serial_puts_raw(" CR2: ");
+    serial_hex_raw(cr2);
+    serial_puts_raw(" CR3: ");
+    serial_hex_raw(cr3);
+    serial_puts_raw(" CR4: ");
+    serial_hex_raw(cr4);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("RFLAGS: ");
+    serial_hex_raw(rflags);
+    serial_putc_hw(b'\n');
+}
+
 // Re-export architecture-specific implementations for generic arch interface
 pub use context::{context_switch, usermode_trampoline};
+
+pub(crate) use stacktrace::capture_current_panic_context;
+
+/// Save interrupt state and disable interrupts.
+#[inline(always)]
+pub fn save_irq_disable() -> u64 {
+    // SAFETY: Reading RFLAGS is side-effect free in kernel context.
+    let rflags = unsafe { x86_mod_read_rflags() };
+    // SAFETY: Masking IRQs is valid in kernel context.
+    unsafe {
+        x86_mod_cli();
+    }
+    rflags
+}
+
+/// Restore interrupt state from a value returned by `save_irq_disable()`.
+///
+/// # Safety
+/// `saved` must be a value previously returned by `save_irq_disable()`.
+#[inline(always)]
+pub unsafe fn restore_irq(saved: u64) {
+    if saved & (1 << 9) != 0 {
+        // SAFETY: Caller supplied an interrupt-state snapshot from save_irq_disable().
+        unsafe {
+            x86_mod_sti();
+        }
+    }
+}
+
+/// Return true when maskable IRQs are disabled.
+#[inline(always)]
+pub fn irqs_disabled() -> bool {
+    // SAFETY: Reading RFLAGS is side-effect free in kernel context.
+    unsafe { x86_mod_read_rflags() & (1 << 9) == 0 }
+}
 
 /// Initialize x86_64 architecture
 ///
@@ -64,8 +157,10 @@ pub use context::{context_switch, usermode_trampoline};
 /// 7. Paging (kernel page tables + direct mapping)
 ///
 /// Timer is started later via start_timer() after scheduler is ready.
-pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
-    crate::kdebug!(arch, |_g| { _g.puts("\n[ARCH] init() called\n"); });
+pub fn init(boot_info: Option<&crate::init::bootinfo::ParsedBootInfo>) {
+    crate::kernel::printk::kdebug!(arch, |_g| {
+        _g.puts("\n[ARCH] init() called\n");
+    });
 
     // Initialize GDT (required before IDT)
     gdt::init();
@@ -74,7 +169,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // MUST be after gdt::init() because reload_segments() clobbers GS base
     cpu::init_bsp();
 
-    crate::kdebug!(arch, |_g| { _g.puts("[ARCH] About to call idt::init()\n"); });
+    crate::kernel::printk::kdebug!(arch, |_g| {
+        _g.puts("[ARCH] About to call idt::init()\n");
+    });
 
     // Initialize IDT BEFORE APIC timer starts
     // This prevents triple fault when timer fires
@@ -90,10 +187,14 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
         // Initialize PIC with remapped vectors (IRQ0→vector 32)
         // All IRQs masked; start_timer() will unmask IRQ0
         pit::init_pic_mode();
-        crate::kdebug!(arch, |_g| { _g.puts("[ARCH] No APIC, using PIC+PIT fallback\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[ARCH] No APIC, using PIC+PIT fallback\n");
+        });
     }
 
-    crate::kdebug!(arch, |_g| { _g.puts("[ARCH] idt::init() returned successfully\n"); });
+    crate::kernel::printk::kdebug!(arch, |_g| {
+        _g.puts("[ARCH] idt::init() returned successfully\n");
+    });
 
     // Detect CPU features (SSE, XSAVE, etc.) — needed by FPU init
     cpuid::init();
@@ -150,9 +251,9 @@ pub fn start_timer() {
 ///
 /// Parses ACPI MADT to discover APs, then sends INIT+SIPI to start them.
 /// Must be called after scheduler is initialized and timer is running.
-pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+pub fn init_smp(boot_info: Option<&crate::init::bootinfo::ParsedBootInfo>) {
     if !has_apic() {
-        crate::serial_puts("[SMP] No APIC available, running single-CPU\n");
+        crate::kernel::printk::serial_puts("[SMP] No APIC available, running single-CPU\n");
         return;
     }
 
@@ -163,7 +264,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
             // Fall back to scanning standard BIOS locations for RSDP
             let scanned = unsafe { acpi::scan_for_rsdp() };
             if scanned == 0 {
-                crate::serial_puts("[SMP] No RSDP found, skipping SMP init\n");
+                crate::kernel::printk::serial_puts("[SMP] No RSDP found, skipping SMP init\n");
                 return;
             }
             scanned
@@ -171,13 +272,15 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     };
 
     // Parse ACPI FADT for shutdown support (before MADT — reuses same RSDP)
-    unsafe { acpi::parse_fadt(rsdp_addr); }
+    unsafe {
+        acpi::parse_fadt(rsdp_addr);
+    }
 
     // Parse ACPI MADT
     let madt_info = match unsafe { acpi::parse_madt(rsdp_addr) } {
         Some(info) => info,
         None => {
-            crate::serial_puts("[SMP] MADT parsing failed, running single-CPU\n");
+            crate::kernel::printk::serial_puts("[SMP] MADT parsing failed, running single-CPU\n");
             return;
         }
     };
@@ -197,7 +300,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     }
 
     if madt_info.cpu_count <= 1 {
-        crate::serial_puts("[SMP] Only 1 CPU found, no APs to start\n");
+        crate::kernel::printk::serial_puts("[SMP] Only 1 CPU found, no APs to start\n");
         return;
     }
 
@@ -212,7 +315,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
 pub fn halt() {
     // SAFETY: hlt is always safe, just waits for interrupt
     unsafe {
-        core::arch::asm!("hlt", options(nomem, nostack));
+        x86_mod_hlt();
     }
 }
 
@@ -221,7 +324,7 @@ pub fn halt() {
 pub fn cli() {
     // SAFETY: Disabling interrupts is safe in kernel context
     unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
+        x86_mod_cli();
     }
 }
 
@@ -230,7 +333,7 @@ pub fn cli() {
 pub fn sti() {
     // SAFETY: Enabling interrupts is safe when IDT is set up
     unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
+        x86_mod_sti();
     }
 }
 
@@ -239,29 +342,15 @@ pub fn sti() {
 pub unsafe fn outb(port: u16, value: u8) {
     // SAFETY: Caller ensures port access is valid
     unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nomem, nostack)
-        );
+        x86_mod_outb(port, value);
     }
 }
 
 /// Input byte from port
 #[inline(always)]
 pub unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
     // SAFETY: Caller ensures port access is valid
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            in("dx") port,
-            out("al") value,
-            options(nomem, nostack)
-        );
-    }
-    value
+    unsafe { x86_mod_inb(port) }
 }
 
 /// Output 16-bit word to port
@@ -269,13 +358,31 @@ pub unsafe fn inb(port: u16) -> u8 {
 pub unsafe fn outw(port: u16, value: u16) {
     // SAFETY: Caller ensures port access is valid
     unsafe {
-        core::arch::asm!(
-            "out dx, ax",
-            in("dx") port,
-            in("ax") value,
-            options(nomem, nostack)
-        );
+        x86_mod_outw(port, value);
     }
+}
+
+/// Input 16-bit word from port
+#[inline(always)]
+pub unsafe fn inw(port: u16) -> u16 {
+    // SAFETY: Caller ensures port access is valid
+    unsafe { x86_mod_inw(port) }
+}
+
+/// Output 32-bit dword to port
+#[inline(always)]
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: Caller ensures port access is valid
+    unsafe {
+        x86_mod_outl(port, value);
+    }
+}
+
+/// Input 32-bit dword from port
+#[inline(always)]
+pub unsafe fn inl(port: u16) -> u32 {
+    // SAFETY: Caller ensures port access is valid
+    unsafe { x86_mod_inl(port) }
 }
 
 /// Perform ACPI S5 shutdown (power off).
@@ -284,23 +391,47 @@ pub unsafe fn outw(port: u16, value: u16) {
 /// port 0x604 if FADT was not parsed.
 pub fn shutdown() -> ! {
     let power = acpi::get_power_info();
-    let port = if power.valid { power.pm1a_cnt_blk } else { 0x604 };
+    let port = if power.valid {
+        power.pm1a_cnt_blk
+    } else {
+        0x604
+    };
     // SLP_EN (bit 13) | SLP_TYPa (bits 12:10)
     let val: u16 = (power.slp_typ_s5 << 10) | (1 << 13);
 
-    crate::serial_puts("[SHUTDOWN] Powering off via ACPI S5\n");
+    crate::kernel::printk::serial_puts("[SHUTDOWN] Powering off via ACPI S5\n");
     cli();
     // SAFETY: Writing to PM1a_CNT_BLK with SLP_EN triggers hardware power off.
-    unsafe { outw(port, val); }
+    unsafe {
+        outw(port, val);
+    }
 
     // If PM1b is also present, write to it as well
     if power.pm1b_cnt_blk != 0 {
-        unsafe { outw(power.pm1b_cnt_blk, val); }
+        unsafe {
+            outw(power.pm1b_cnt_blk, val);
+        }
     }
 
     // Should not reach here; loop halt as fallback
     loop {
         halt();
+    }
+}
+
+/// Trigger a warm reboot via the PCI reset register (port 0xCF9). The
+/// 0x0E bit pattern (SYS_RST | RST_CPU) drives a full hardware reset
+/// on every chipset that implements the legacy reset I/O — including
+/// QEMU's i440fx and q35 fakes. Falls back to `ud2` to force a triple
+/// fault if the reset port is somehow unhandled.
+pub fn reboot() -> ! {
+    crate::kernel::printk::serial_puts("[REBOOT] Triggering reset via PCI reset register\n");
+    cli();
+    unsafe {
+        outb(0xCF9, 0x0E);
+    }
+    unsafe {
+        x86_mod_ud2();
     }
 }
 
@@ -311,7 +442,8 @@ pub fn shutdown() -> ! {
 fn init_exception_stacks() {
     let stack_phys = crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate {
         subkind: crate::mm::frame::KernelMetaKind::KernelStack,
-    }).expect("IST stack allocation failed");
+    })
+    .expect("IST stack allocation failed");
     let stack_virt = crate::mm::phys_to_virt(stack_phys);
     let stack_top = stack_virt + 4096;
 
@@ -320,7 +452,7 @@ fn init_exception_stacks() {
     }
     idt::set_double_fault_ist(1);
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[ARCH] Double fault IST1 stack: ");
         _g.hex(stack_top);
         _g.putc(b'\n');
@@ -343,21 +475,29 @@ unsafe extern "C" {
 /// Also allocates and sets up kernel stacks for syscall handling.
 pub fn init_syscalls() {
     unsafe {
-        crate::kdebug!(arch, |_g| { _g.puts("\n[SYSCALL] Initializing syscall MSRs\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("\n[SYSCALL] Initializing syscall MSRs\n");
+        });
 
         // Allocate kernel stack for syscall (16KB = 4 contiguous pages of 4KB each)
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_bottom_phys = match crate::mm::pmm_alloc_contiguous(STACK_PAGES) {
-            Some(addr) => addr,
-            None => {
-                crate::serial_puts("[SYSCALL] Failed to allocate contiguous kernel stack!\n");
-                loop {
-                    core::arch::asm!("hlt");
-                }
-            }
+        let stack_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+            subkind: crate::mm::frame::KernelMetaKind::KernelStack,
         };
+        let stack_bottom_phys =
+            match crate::mm::pmm_alloc_contiguous_owned(STACK_PAGES, &stack_owner) {
+                Some(addr) => addr,
+                None => {
+                    crate::kernel::printk::serial_puts(
+                        "[SYSCALL] Failed to allocate contiguous kernel stack!\n",
+                    );
+                    loop {
+                        halt();
+                    }
+                }
+            };
         let stack_top = crate::mm::phys_to_virt(stack_bottom_phys) + STACK_SIZE;
 
         // Set kernel stack for current CPU (for syscall entry)
@@ -366,7 +506,7 @@ pub fn init_syscalls() {
         // Set TSS rsp0 (for interrupt entry from user mode)
         gdt::set_tss_rsp0(stack_top);
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[SYSCALL] Kernel stack: ");
             _g.hex(stack_top);
             _g.putc(b'\n');
@@ -380,66 +520,28 @@ pub fn init_syscalls() {
         //   syscall: CS = selector, SS = selector+8
         //   With selector=0x08: CS = 0x08, SS = 0x10
         let star = (0x10u64 << 48) | (0x08u64 << 32);
-        let star_low = star as u32;
-        let star_high = (star >> 32) as u32;
 
         // Write IA32_STAR
-        core::arch::asm!(
-            "wrmsr",
-            in("rcx") 0xC0000081u32,  // IA32_STAR
-            in("rax") star_low,
-            in("rdx") star_high,
-            options(nostack)
-        );
+        x86_mod_wrmsr(0xC0000081u32, star);
 
         // Write IA32_LSTAR (syscall_entry address)
         let lstar = syscall_entry as *const () as u64;
-        let lstar_low = lstar as u32;
-        let lstar_high = (lstar >> 32) as u32;
 
-        core::arch::asm!(
-            "wrmsr",
-            in("rcx") 0xC0000082u32,  // IA32_LSTAR
-            in("rax") lstar_low,
-            in("rdx") lstar_high,
-            options(nostack)
-        );
+        x86_mod_wrmsr(0xC0000082u32, lstar);
 
         // Write IA32_FMASK: clear IF (bit 9) and AC (bit 18) on syscall.
         // IF=0 disables interrupts; AC=0 re-enables SMAP protection so
         // user-set AC cannot bypass SMAP in the kernel syscall path.
-        core::arch::asm!(
-            "wrmsr",
-            in("rcx") 0xC0000084u32,  // IA32_FMASK
-            in("rax") (0x200u32 | 0x40000u32),  // Clear IF + AC
-            in("rdx") 0u32,
-            options(nostack)
-        );
+        x86_mod_wrmsr(0xC0000084u32, 0x200u64 | 0x40000u64);
 
         // Enable syscall in IA32_EFER
-        let mut efer: u64;
-        core::arch::asm!(
-            "rdmsr",
-            in("rcx") 0xC0000080u32,  // IA32_EFER
-            lateout("rax") efer,
-            out("rdx") _,
-            options(nostack)
-        );
-        efer |= 1;        // Set SCE (SysCall Enable) bit
-        efer |= 1 << 11;  // Set NXE (No-Execute Enable) bit
-        
-        let efer_low = efer as u32;
-        let efer_high = (efer >> 32) as u32;
+        let mut efer = x86_mod_rdmsr(0xC0000080u32);
+        efer |= 1; // Set SCE (SysCall Enable) bit
+        efer |= 1 << 11; // Set NXE (No-Execute Enable) bit
 
-        core::arch::asm!(
-            "wrmsr",
-            in("rcx") 0xC0000080u32,
-            in("rax") efer_low,
-            in("rdx") efer_high,
-            options(nostack)
-        );
+        x86_mod_wrmsr(0xC0000080u32, efer);
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[SYSCALL] MSRs configured successfully\n");
             _g.puts("[SYSCALL]   STAR=");
             _g.hex(star);

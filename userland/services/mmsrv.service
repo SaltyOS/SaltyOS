@@ -1,15 +1,35 @@
 [Service]
 Name=mmsrv
 Binary=/bin/mmsrv
-Type=notify
+Type=broker
 Restart=always
-PreProcmgr=yes
 Role=pager
 CNodeBits=16
 
 [Dependencies]
-After=rsrcsrv console namesrv
-Before=vfs procmgr
+After=rsrcsrv namesrv
+Before=vfs
+Requires=namesrv.socket
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
 
 [Capabilities]
-NeedEP=namesrv:64
+ProvidesInterface=process-client fault-handler-source
+InterfaceRole=process-client:ROLE_MMSRV_CLIENT
+InterfaceRole=fault-handler-source:ROLE_MMSRV_AUTHORITY_RAW
+InterfaceFlags=process-client:needs-vspace,clone,exec-recreate,drop
+
+[Quotas]
+TCB=512
+SchedContext=512
+Endpoint=512
+Notification=512
+CNode=128
+VSpace=512
+Frame=131072
+IrqHandler=16
+IoPort=32
+MemoryObject=8192

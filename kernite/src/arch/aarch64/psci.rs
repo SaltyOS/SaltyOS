@@ -1,16 +1,19 @@
 //! Power State Coordination Interface (PSCI) for SMP and power management
 //!
-//! Uses SMC for PSCI calls.
+//! Uses the HVC conduit for PSCI calls. The host kernel runs at EL1 with no
+//! EL3 secure monitor (QEMU `virt` default), so the HVC conduit — serviced by
+//! QEMU's emulated EL2 trap — is the correct transport. An SMC from EL1 with
+//! no EL3 is UNDEFINED and raises a synchronous exception (EC=0x00).
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-/// PSCI function IDs (SMC32 convention for 32-bit functions)
+/// PSCI function IDs (32-bit calling convention).
 pub const PSCI_VERSION: u32 = 0x8400_0000;
 pub const PSCI_CPU_OFF: u32 = 0x8400_0002;
 pub const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
 
-/// PSCI function IDs (SMC64 convention for 64-bit functions)
+/// PSCI function IDs (64-bit calling convention).
 pub const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 
 /// PSCI return values
@@ -22,37 +25,11 @@ pub const PSCI_ALREADY_ON: i64 = -4;
 pub const PSCI_ON_PENDING: i64 = -5;
 pub const PSCI_INTERNAL_FAILURE: i64 = -6;
 
-/// Issue a PSCI call with 0 extra arguments (x0 = function ID).
-macro_rules! psci_call0 {
-    ($fn_id:expr) => {{
-        let result: i64;
-        // SAFETY: PSCI SMC call — standard firmware interface.
-        unsafe {
-            core::arch::asm!(
-                ".inst 0xD4000003", // smc #0
-                inlateout("x0") $fn_id as u64 => result,
-                options(nomem, nostack),
-            );
-        }
-        result
-    }};
-}
-
-/// Issue a PSCI call with 3 extra arguments (x0-x3).
-macro_rules! psci_call3 {
-    ($fn_id:expr, $x1:expr, $x2:expr, $x3:expr) => {{
-        let result: i64;
-        // SAFETY: PSCI SMC call with arguments in x0-x3.
-        unsafe {
-            core::arch::asm!(
-                ".inst 0xD4000003", // smc #0
-                inlateout("x0") $fn_id as u64 => result,
-                in("x1") $x1, in("x2") $x2, in("x3") $x3,
-                options(nomem, nostack),
-            );
-        }
-        result
-    }};
+unsafe extern "C" {
+    fn aarch64_psci_call0(fn_id: u64) -> i64;
+    fn aarch64_psci_call3(fn_id: u64, x1: u64, x2: u64, x3: u64) -> i64;
+    fn aarch64_psci_system_off() -> !;
+    fn aarch64_psci_system_reset() -> !;
 }
 
 /// Query PSCI version.
@@ -60,10 +37,10 @@ macro_rules! psci_call3 {
 /// Returns the version as a 32-bit value (major in bits 31:16, minor in 15:0),
 /// or a negative error code.
 pub fn version() -> i64 {
-    psci_call0!(PSCI_VERSION)
+    unsafe { aarch64_psci_call0(PSCI_VERSION as u64) }
 }
 
-/// Start an application processor via PSCI CPU_ON (SMC64).
+/// Start an application processor via PSCI CPU_ON.
 ///
 /// `target_cpu` is the MPIDR affinity value of the target core.
 /// `entry_point` is the physical address where the core begins execution.
@@ -71,25 +48,21 @@ pub fn version() -> i64 {
 ///
 /// Returns `PSCI_SUCCESS` (0) on success, or a negative error code.
 pub fn cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
-    psci_call3!(PSCI_CPU_ON_64, target_cpu, entry_point, context_id)
+    unsafe { aarch64_psci_call3(PSCI_CPU_ON_64, target_cpu, entry_point, context_id) }
 }
 
 /// Turn off the calling CPU. Does not return on success.
 ///
 /// Returns a negative error code only on failure.
 pub fn cpu_off() -> i64 {
-    psci_call0!(PSCI_CPU_OFF)
+    unsafe { aarch64_psci_call0(PSCI_CPU_OFF as u64) }
 }
 
 /// Shut down the entire system. Does not return.
 pub fn system_off() -> ! {
     // SAFETY: PSCI SYSTEM_OFF powers down the entire system and never returns.
     unsafe {
-        core::arch::asm!(
-            ".inst 0xD4000003", // smc #0
-            in("x0") PSCI_SYSTEM_OFF as u64,
-            options(noreturn, nomem, nostack),
-        );
+        aarch64_psci_system_off();
     }
 }
 
@@ -97,11 +70,7 @@ pub fn system_off() -> ! {
 pub fn system_reset() -> ! {
     // SAFETY: PSCI SYSTEM_RESET resets the system and never returns.
     unsafe {
-        core::arch::asm!(
-            ".inst 0xD4000003", // smc #0
-            in("x0") PSCI_SYSTEM_RESET as u64,
-            options(noreturn, nomem, nostack),
-        );
+        aarch64_psci_system_reset();
     }
 }
 

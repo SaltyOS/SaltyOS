@@ -61,12 +61,7 @@ pub(crate) fn build(
     }
 
     // Compute UDP checksum over pseudo-header + segment
-    let cksum = checksum::transport_checksum(
-        src_ip,
-        dst_ip,
-        super::ipv4::PROTO_UDP,
-        &buf[..total],
-    );
+    let cksum = checksum::transport_checksum(src_ip, dst_ip, super::ipv4::PROTO_UDP, &buf[..total]);
     buf[6] = (cksum >> 8) as u8;
     buf[7] = cksum as u8;
 

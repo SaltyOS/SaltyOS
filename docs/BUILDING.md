@@ -178,6 +178,7 @@ Available options:
 | `debug_symbols` | bool | true | Include debug symbols |
 | `kernel_log_level` | combo | info | Kernel log verbosity (`error`, `warn`, `info`, `debug`, `trace`) |
 | `userland_log_level` | combo | info | Userland log verbosity (`error`, `warn`, `info`, `debug`, `trace`) |
+| `userland_aslr` | bool | true | Randomize userland virtual-address layouts |
 | `kernel_debug_modules` | string | (empty) | Comma-separated kernel modules for debug logging (e.g., `mm,ipc,syscall,arch,cap,sched,console`) |
 | `userland_debug_programs` | string | (empty) | Comma-separated userland programs for debug logging (e.g., `procmgr,mmsrv,vfs,netsrv`) |
 | `max_cpus` | int | 16 | Maximum supported CPUs (1-256) |
@@ -194,6 +195,9 @@ just reconfigure -Dkernel_log_level=debug -Dkernel_debug_modules=mm,ipc,syscall
 
 # Set userland debug level with per-program granularity
 just reconfigure -Duserland_log_level=debug -Duserland_debug_programs=procmgr,mmsrv,vfs
+
+# Temporarily disable userland ASLR for debugger-friendly fixed addresses
+just reconfigure -Duserland_aslr=false
 
 # Combined example for aarch64
 just arch=aarch64 reconfigure -Dkernel_log_level=debug -Duserland_log_level=debug

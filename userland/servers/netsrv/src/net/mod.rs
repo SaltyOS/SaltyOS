@@ -5,13 +5,13 @@
 //! management in `socket/`. Shared utilities (`checksum`, `ethernet`)
 //! and the DNS engine remain at this level.
 
-pub(crate) mod proto;
-pub(crate) mod socket;
 pub(crate) mod checksum;
-pub(crate) mod ethernet;
 pub(crate) mod config;
 pub(crate) mod dhcp;
 pub(crate) mod dns;
+pub(crate) mod ethernet;
+pub(crate) mod proto;
+pub(crate) mod socket;
 
 const MAX_PENDING_IP_PACKETS: usize = 16;
 const MAX_PENDING_IP_PAYLOAD: usize = 1480;
@@ -90,7 +90,13 @@ fn send_ip_packet_now(
     false
 }
 
-fn queue_pending_ip_packet(src_ip: u32, dst_ip: u32, protocol: u8, ttl: u8, payload: &[u8]) -> bool {
+fn queue_pending_ip_packet(
+    src_ip: u32,
+    dst_ip: u32,
+    protocol: u8,
+    ttl: u8,
+    payload: &[u8],
+) -> bool {
     if payload.len() > MAX_PENDING_IP_PAYLOAD {
         return false;
     }

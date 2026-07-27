@@ -26,7 +26,11 @@ pub(crate) fn parse(data: &[u8]) -> Option<(EthHeader, &[u8])> {
     let ethertype = ((data[12] as u16) << 8) | (data[13] as u16);
 
     Some((
-        EthHeader { dst, src, ethertype },
+        EthHeader {
+            dst,
+            src,
+            ethertype,
+        },
         &data[ETH_HEADER_LEN..],
     ))
 }

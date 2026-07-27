@@ -2,13 +2,9 @@
 //! Ported from userland/fstest/main.c (12 tests)
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
-use trona::types::core::*;
-use trona_posix::mm as posix_mm;
-use trona_posix::proc as posix;
+use trona_posix::consts::*;
 use trona_posix::*;
+use trona_runtime::debug::serial;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -93,7 +89,7 @@ fn readdir_makes_progress(path: &[u8], must_find: &[&[u8]], limit: usize) -> boo
 pub fn run() -> bool {
     puts(b"[TEST_FS] Starting filesystem tests\n");
 
-    // posix_mm reads mmsrv via trona::caps::mmsrv_ep() now — no explicit
+    // posix_mm reads mmsrv via trona_runtime::client::caps::mmsrv_ep() now — no explicit
     // init call needed here.
 
     // Test 1: stat /dev/console
@@ -110,42 +106,29 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_FS] PASS: /dev/console is a char device\n");
 
-    // Test 2: stat /initramfs (old boot root, persists after pivot_root)
-    puts(b"[TEST_FS] Test 2: stat /initramfs\n");
-    let ret = unsafe { trona_posix::posix_stat(b"/initramfs\0".as_ptr(), &raw mut st) };
+    // Test 2: stat the active VFS root. The boot initrd root is an
+    // implementation detail after the real root is mounted; VFS only
+    // guarantees that the active namespace root remains a directory.
+    puts(b"[TEST_FS] Test 2: stat /\n");
+    let ret = unsafe { trona_posix::posix_stat(b"/\0".as_ptr(), &raw mut st) };
     if ret != 0 {
-        puts(b"[TEST_FS] FAIL: stat /initramfs returned error\n");
+        puts(b"[TEST_FS] FAIL: stat / returned error\n");
         return false;
     }
     if (st.st_mode & S_IFMT) != S_IFDIR {
-        puts(b"[TEST_FS] FAIL: /initramfs is not a directory\n");
+        puts(b"[TEST_FS] FAIL: / is not a directory\n");
         return false;
     }
-    puts(b"[TEST_FS] PASS: /initramfs is a directory\n");
+    puts(b"[TEST_FS] PASS: / is a directory\n");
 
-    // Test 3: opendir /initramfs + readdir (old boot root, still mounted after pivot_root)
-    puts(b"[TEST_FS] Test 3: opendir/readdir /initramfs\n");
-    let dir_fd = unsafe { trona_posix::posix_opendir(b"/initramfs\0".as_ptr()) };
-    if dir_fd < 0 {
-        puts(b"[TEST_FS] FAIL: opendir /initramfs failed\n");
+    // Test 3: root readdir must expose the stable VFS namespace
+    // mountpoints migrated across root replacement.
+    puts(b"[TEST_FS] Test 3: readdir /\n");
+    if !readdir_makes_progress(b"/\0", &[b"dev", b"tmp", b"proc"], 128) {
+        puts(b"[TEST_FS] FAIL: readdir / did not expose core mountpoints\n");
         return false;
     }
-
-    let mut dent = TronaDirent::zeroed();
-    let mut file_count = 0;
-    while unsafe { trona_posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
-        puts(b"[TEST_FS]   ");
-        serial::serial_puts(&dent.d_name[..dent.d_namlen as usize]);
-        puts(b"\n");
-        file_count += 1;
-    }
-    unsafe { trona_posix::posix_closedir(dir_fd) };
-
-    if file_count == 0 {
-        puts(b"[TEST_FS] FAIL: /initramfs is empty\n");
-        return false;
-    }
-    puts(b"[TEST_FS] PASS: listed initramfs entries\n");
+    puts(b"[TEST_FS] PASS: / exposes core mountpoints\n");
 
     // Test 4: access
     puts(b"[TEST_FS] Test 4: access checks\n");
@@ -290,7 +273,7 @@ pub fn run() -> bool {
     puts(b"[TEST_FS] PASS: mountpoint rmdir rejected with EBUSY\n");
 
     puts(b"[TEST_FS] Test 10a: readdir / makes progress\n");
-    if !readdir_makes_progress(b"/\0", &[b"dev", b"tmp", b"usr"], 128) {
+    if !readdir_makes_progress(b"/\0", &[b"dev", b"tmp", b"proc"], 128) {
         puts(b"[TEST_FS] FAIL: readdir / did not make progress\n");
         return false;
     }
@@ -675,6 +658,111 @@ pub fn run() -> bool {
         return false;
     }
     puts(b"[TEST_FS] PASS: /proc/self/exe OK\n");
+
+    // Test 20: /proc/stat — system-wide CPU stats. Exercises the async
+    // SysStat read path (CPU from the kernel SystemInfo cap).
+    puts(b"[TEST_FS] Test 20: /proc/stat\n");
+    let fd = unsafe { trona_posix::posix_open(b"/proc/stat\0".as_ptr(), O_RDONLY as i32, 0) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open /proc/stat failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { trona_posix::posix_close(fd) };
+    if rd <= 0 || buf[0] != b'c' {
+        puts(b"[TEST_FS] FAIL: /proc/stat did not start with 'cpu'\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: /proc/stat OK\n");
+
+    // Test 21: /proc/<pid>/stat — per-process stat. Exercises the async
+    // controlling-tty join: the read prefetches the posix_ttysrv binding
+    // dump, pages init for identity/times, then renders field 7 (tty_nr).
+    puts(b"[TEST_FS] Test 21: /proc/self/stat\n");
+    let fd = unsafe { trona_posix::posix_open(b"/proc/self/stat\0".as_ptr(), O_RDONLY as i32, 0) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open /proc/self/stat failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { trona_posix::posix_close(fd) };
+    if rd <= 0 {
+        puts(b"[TEST_FS] FAIL: read /proc/self/stat empty\n");
+        return false;
+    }
+    // Linux layout: "<pid> (<comm>) <state> ...". The comm open-paren must
+    // appear in the prefix.
+    let mut has_paren = false;
+    let mut i = 0usize;
+    while i < rd as usize && i < 64 {
+        if buf[i] == b'(' {
+            has_paren = true;
+            break;
+        }
+        i += 1;
+    }
+    if !has_paren {
+        puts(b"[TEST_FS] FAIL: /proc/self/stat missing comm field\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: /proc/self/stat OK\n");
+
+    // Test 22: readdir /proc — exercises the async pid enumeration (init
+    // LIST_PIDS). The P1 property under test is that the async readdir
+    // completes without hang or infinite loop; assert progress only, not a
+    // specific entry (the pid set is dynamic).
+    puts(b"[TEST_FS] Test 22: readdir /proc\n");
+    if !readdir_makes_progress(b"/proc\0", &[], 128) {
+        puts(b"[TEST_FS] FAIL: readdir /proc did not make progress\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: readdir /proc OK\n");
+
+    // Test 23: kern.proc.pathname.1 via /proc/sys. sysctl() is stubbed, so
+    // the FreeBSD MIB is reached through procfs's /proc/sys delegation.
+    // Exercises the async ExePath sysctl provider for init (pid 1).
+    puts(b"[TEST_FS] Test 23: /proc/sys/kern/proc/pathname/1\n");
+    let fd = unsafe {
+        trona_posix::posix_open(
+            b"/proc/sys/kern/proc/pathname/1\0".as_ptr(),
+            O_RDONLY as i32,
+            0,
+        )
+    };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open kern.proc.pathname.1 failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { trona_posix::posix_close(fd) };
+    if rd <= 0 {
+        puts(b"[TEST_FS] FAIL: kern.proc.pathname.1 empty\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: kern.proc.pathname.1 OK\n");
+
+    // Test 24: kern.proc.pid.1 — one KinfoProc record. Exercises the async
+    // controlling-tty dump-first join on the sysctl SysValue path (the
+    // record's tty_dev is joined from the prefetched binding dump).
+    puts(b"[TEST_FS] Test 24: /proc/sys/kern/proc/pid/1\n");
+    let fd = unsafe {
+        trona_posix::posix_open(b"/proc/sys/kern/proc/pid/1\0".as_ptr(), O_RDONLY as i32, 0)
+    };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open kern.proc.pid.1 failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { trona_posix::posix_close(fd) };
+    if rd <= 0 {
+        puts(b"[TEST_FS] FAIL: kern.proc.pid.1 empty\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: kern.proc.pid.1 OK\n");
 
     // Cleanup /tmp
     unsafe { trona_posix::posix_rmdir(b"/tmp\0".as_ptr()) };

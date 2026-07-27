@@ -2,9 +2,9 @@
 //! Moved from crate root module for POSIX subsystem separation.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::*;
 
-use crate::base::proc_table::{find_by_badge, find_by_pid, proctab, ProcessState};
+use crate::base::proc_table::{ProcessState, find_by_badge, find_by_pid, proctab};
 
 unsafe fn for_each_process_in_session_mut(
     sid: u32,
@@ -79,7 +79,9 @@ pub(crate) unsafe fn handle_setpgid(msg: &TronaMsg, reply: &mut TronaMsg, badge:
             let mut pg_exists = false;
             for i in 0..crate::base::proc_table::proctab_cap() {
                 let p = proctab(i);
-                if p.state != crate::base::proc_table::ProcessState::Free && p.pgid == pgid && p.sid == target_sid
+                if p.state != crate::base::proc_table::ProcessState::Free
+                    && p.pgid == pgid
+                    && p.sid == target_sid
                 {
                     pg_exists = true;
                     break;
@@ -198,9 +200,13 @@ pub(crate) unsafe fn handle_getsid_badge(msg: &TronaMsg, reply: &mut TronaMsg) {
     }
 }
 
-pub(crate) unsafe fn handle_get_session_tty_badge(msg: &TronaMsg, reply: &mut TronaMsg) {
+pub(crate) unsafe fn handle_get_session_tty_badge(
+    msg: &TronaMsg,
+    reply: &mut TronaMsg,
+    badge: u64,
+) {
     unsafe {
-        let target_badge = msg.regs[0];
+        let target_badge = if msg.regs[0] == 0 { badge } else { msg.regs[0] };
         let Some(ti) = find_by_badge(target_badge) else {
             reply.label = crate::TRONA_NOT_FOUND;
             return;

@@ -3,10 +3,9 @@
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
+use trona_posix::consts::*;
 use trona_posix::pthread;
+use trona_runtime::debug::serial;
 
 const OPEN_THREADS: usize = 6;
 const OPEN_ITERS: usize = 96;
@@ -211,11 +210,8 @@ unsafe fn open_read_close_stress_path() -> OpenReadCloseResult {
             if remaining <= 0 {
                 break total;
             }
-            let n = trona_posix::posix_read(
-                fd,
-                buf.as_mut_ptr().add(total as usize),
-                remaining as u64,
-            );
+            let n =
+                trona_posix::posix_read(fd, buf.as_mut_ptr().add(total as usize), remaining as u64);
             if n < 0 {
                 break n;
             }
@@ -271,7 +267,7 @@ unsafe fn run_open_read_close_iters(iters: usize) {
             {
                 record_open_read_close_failure(result);
             }
-            trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            trona_kernel::syscall::yield_now();
         }
     }
 }

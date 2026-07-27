@@ -13,14 +13,14 @@ use core::ptr;
 pub const PL011_PHYS_BASE: u64 = 0x0900_0000;
 
 /// PL011 register offsets
-const UARTDR: usize = 0x000;   // Data Register
-const UARTFR: usize = 0x018;   // Flag Register
-const UARTCR: usize = 0x030;   // Control Register
+const UARTDR: usize = 0x000; // Data Register
+const UARTFR: usize = 0x018; // Flag Register
+const UARTCR: usize = 0x030; // Control Register
 const UARTIMSC: usize = 0x038; // Interrupt Mask Set/Clear
 
 /// Flag Register bits
-const FR_TXFF: u32 = 1 << 5;   // Transmit FIFO full
-const FR_RXFE: u32 = 1 << 4;   // Receive FIFO empty
+const FR_TXFF: u32 = 1 << 5; // Transmit FIFO full
+const FR_RXFE: u32 = 1 << 4; // Receive FIFO empty
 
 /// Base address (may be updated after paging init to use direct map)
 static mut UART_BASE: usize = PL011_PHYS_BASE as usize;
@@ -60,7 +60,9 @@ pub fn init() {
 /// Update UART base address for direct physical map
 pub fn set_base(new_base: usize) {
     // SAFETY: Called once during paging init, single-threaded at that point
-    unsafe { core::ptr::addr_of_mut!(UART_BASE).write_volatile(new_base); }
+    unsafe {
+        core::ptr::addr_of_mut!(UART_BASE).write_volatile(new_base);
+    }
 }
 
 /// Remap the UART into the kernel MMIO window after paging comes up.

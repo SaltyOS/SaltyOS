@@ -1,13 +1,12 @@
 //! Pthreads test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use trona::consts::kernel::*;
-use trona::consts::server::TRONA_TIMED_OUT;
-use trona::serial;
-use trona::sync;
+use core::sync::atomic::{AtomicU32, Ordering};
 use trona_posix::pthread;
 use trona_posix::tls;
+use trona_protocol::common::{TRONA_DEADLOCK, TRONA_OK, TRONA_TIMED_OUT};
+use trona_runtime::debug::serial;
+use trona_runtime::thread::sync;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -17,7 +16,7 @@ fn puts(s: &[u8]) {
 // Test 1: Thread create and join with return value
 // =========================================================================
 
-unsafe extern "C" fn thread_return_42(arg: *mut u8) -> *mut u8 {
+unsafe extern "C" fn thread_return_42(_arg: *mut u8) -> *mut u8 {
     42usize as *mut u8
 }
 
@@ -164,7 +163,7 @@ fn test_mutex_normal() -> bool {
 // =========================================================================
 
 fn test_mutex_recursive() -> bool {
-    let mut mtx = sync::TypedMutex::new(sync::MUTEX_RECURSIVE);
+    let mtx = sync::TypedMutex::new(sync::MUTEX_RECURSIVE);
 
     let ret = mtx.lock();
     if ret != TRONA_OK {
@@ -359,7 +358,7 @@ fn test_condvar_broadcast() -> bool {
     // released the mutex via BC_COND.wait — a deterministic rendezvous
     // that does not depend on fixed yield counts.
     while BC_WAITERS_ENTERED.load(Ordering::Acquire) < 3 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona_kernel::syscall::yield_now();
     }
 
     BC_MUTEX.lock();
@@ -439,7 +438,7 @@ unsafe extern "C" fn thread_reader(_arg: *mut u8) -> *mut u8 {
     }
     // Hold the lock briefly
     for _ in 0..20 {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona_kernel::syscall::yield_now();
     }
     RW_READERS.fetch_sub(1, Ordering::Relaxed);
     RW_LOCK.read_unlock();
@@ -572,16 +571,20 @@ unsafe extern "C" fn thread_cancellable(_arg: *mut u8) -> *mut u8 {
         arg: core::ptr::null_mut(),
         next: core::ptr::null_mut(),
     };
-    pthread::pthread_cleanup_push_impl(
-        cancel_cleanup_handler,
-        core::ptr::null_mut(),
-        &raw mut handler,
-    );
+    unsafe {
+        pthread::pthread_cleanup_push_impl(
+            cancel_cleanup_handler,
+            core::ptr::null_mut(),
+            &raw mut handler,
+        );
+    }
 
     // Loop with cancellation points
     loop {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        pthread::pthread_testcancel();
+        trona_kernel::syscall::yield_now();
+        unsafe {
+            pthread::pthread_testcancel();
+        }
     }
 }
 

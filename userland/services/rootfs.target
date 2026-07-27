@@ -1,6 +1,5 @@
 [Service]
 Name=rootfs.target
-Type=target
 Activation=event
 Restart=no
 

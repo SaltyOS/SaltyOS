@@ -1,327 +1,442 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Ramfs VopVector implementation — vnode-level operations.
+//
+//! Ramfs `VopVector` — vnode-level operations.
+//!
+//! Synthetic in-memory filesystem; every entry returns `Ready(...)`
+//! immediately (no parked path). Mutators reject on `readonly`-
+//! flagged vdata (initrd-projected vnodes) by COW-promoting the
+//! payload into a fresh writable chain before applying the change.
 
-use crate::personality::posix::consts::*;
-use crate::server::consts::*;
-use crate::vfs_core::cred::VfsCred;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::{VAttr, VStatfs};
-use crate::vfs_core::vnode::{Vnode, VnodeHandle, VT_CHR, VT_DIR, VT_LNK, VT_REG};
-use crate::vfs_core::vop::ReaddirEmit;
-use crate::vfs_core::vop_context::{VopContext, VopDataContext};
+use crate::core::cred::VfsCred;
+use crate::core::error::VfsError;
+use crate::core::file::{MODE_TYPE_DIR, MODE_TYPE_LNK, MODE_TYPE_REG};
+use crate::core::file::{VAttr, VStatfs};
+use crate::core::identity::{BackendNodeId, VnodeKey};
+use crate::core::outcome::{Parked, Ready, VopOutcome};
+use crate::core::vnode::{VT_CHR, VT_DIR, VT_LNK, VT_REG, Vnode, VnodeHandle, vtype_to_kind};
+use crate::core::vop::ReaddirEmit;
+use crate::core::vop_context::{OwnerVopCtx, VopDataCtx};
+use crate::server::alloc::vfs_alloc_array;
+use crate::server::consts::{INITIAL_DIRENTS, INVALID_WRITABLE_SLOT, MAX_NAME_LEN, WRITABLE_SIZE};
 
 use super::pool;
-use super::types::RamfsMountData;
-
-use trona::types::core::TronaMsg;
+use super::types::{Dirent, RamfsMountData, RamfsVnodeData};
 
 // =========================================================================
 // Helpers
 // =========================================================================
 
-/// Get the `RamfsMountData` from a VopContext's mount_data pointer.
 #[inline]
-unsafe fn mdata(ctx: &VopContext) -> *mut RamfsMountData {
+unsafe fn mdata(ctx: &OwnerVopCtx<'_>) -> *mut RamfsMountData {
     ctx.mount_data as *mut RamfsMountData
 }
 
-/// Get the `RamfsMountData` from a VopDataContext's mount_data pointer.
 #[inline]
-unsafe fn mdata_d(ctx: &VopDataContext) -> *mut RamfsMountData {
+unsafe fn mdata_d(ctx: &VopDataCtx) -> *mut RamfsMountData {
     ctx.mount_data as *mut RamfsMountData
 }
 
-/// Get the `super::types::RamfsVnodeData` from a VopContext's data pointer.
 #[inline]
-unsafe fn vdata(ctx: &VopContext) -> *mut super::types::RamfsVnodeData {
-    ctx.data as *mut super::types::RamfsVnodeData
+unsafe fn vdata(ctx: &OwnerVopCtx<'_>) -> *mut RamfsVnodeData {
+    ctx.data as *mut RamfsVnodeData
 }
 
-/// Get the `super::types::RamfsVnodeData` from a VopDataContext's data pointer.
-#[inline]
-unsafe fn vdata_d(ctx: &VopDataContext) -> *mut super::types::RamfsVnodeData {
-    ctx.data as *mut super::types::RamfsVnodeData
-}
-
-/// Map VT_* vnode type to DT_* dirent type for readdir.
-#[inline]
-fn vtype_to_dtype(vtype: u8) -> u8 {
-    match vtype {
-        VT_REG => 8,  // DT_REG
-        VT_DIR => 4,  // DT_DIR
-        VT_LNK => 10, // DT_LNK
-        VT_CHR => 2,  // DT_CHR
-        _ => 0,       // DT_UNKNOWN
+/// Cached file size in bytes for the ramfs vnode (`(*vdata).size`).
+/// Owner-thread synchronous; the value is updated by `ramfs_create`,
+/// `ramfs_truncate`, `ramfs_write`, and `ramfs_setattr`. A null
+/// vdata returns 0 — sentinel for "not mappable".
+pub(crate) unsafe fn ramfs_data_size(ctx: &mut OwnerVopCtx<'_>) -> u64 {
+    let vd = unsafe { vdata(&*ctx) };
+    if vd.is_null() {
+        0
+    } else {
+        unsafe { (*vd).size }
     }
 }
 
-/// Create a new vnode + vdata pair, add to parent directory, and return
-/// a VnodeHandle to the new vnode (allocated via ctx.alloc).
+#[inline]
+unsafe fn vdata_d(ctx: &VopDataCtx) -> *mut RamfsVnodeData {
+    ctx.data as *mut RamfsVnodeData
+}
+
+#[inline]
+fn vtype_to_dtype_local(vtype: u8) -> u8 {
+    match vtype {
+        x if x == VT_REG => 8,
+        x if x == VT_DIR => 4,
+        x if x == VT_LNK => 10,
+        x if x == VT_CHR => 2,
+        _ => 0,
+    }
+}
+
+#[inline]
+fn mode_type_for_vtype(vtype: u8) -> u32 {
+    match vtype {
+        x if x == VT_REG => MODE_TYPE_REG,
+        x if x == VT_DIR => MODE_TYPE_DIR,
+        x if x == VT_LNK => MODE_TYPE_LNK,
+        _ => 0,
+    }
+}
+
+/// Allocate a fresh vnode + vdata pair, register the dirent on the
+/// parent, and return the live `VnodeHandle`. Used by `create`,
+/// `mkdir`, and `symlink`.
 unsafe fn create_child(
-    ctx: &VopContext,
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     ftype: u8,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
         let md = mdata(ctx);
         let parent_vd = vdata(ctx);
-        let parent_id = (*ctx.vnode).id;
+        let parent_id = (*ctx.vnode).id();
 
-        // Allocate vnode data
-        let vd = pool::alloc_vdata(md);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = pool::alloc_vdata(md);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
         let id = pool::next_id(md);
-        (*vd).id = id;
-        (*vd).parent_id = parent_id;
-        (*vd).ftype = ftype;
-        (*vd).mode = mode;
-        (*vd).nlink = if ftype == VT_DIR { 2 } else { 1 };
-        (*vd).size = 0;
+        (*vdata).id = id;
+        (*vdata).parent_id = parent_id;
+        (*vdata).ftype = ftype;
+        (*vdata).mode = mode_type_for_vtype(ftype) | (mode & 0o7777);
+        (*vdata).nlink = if ftype == VT_DIR { 2 } else { 1 };
+        (*vdata).size = 0;
         if !cred.is_null() {
-            (*vd).uid = (*cred).euid;
-            (*vd).gid = (*cred).egid;
+            (*vdata).uid = (*cred).euid;
+            (*vdata).gid = (*cred).egid;
         }
 
-        // Allocate dirents for directories
         if ftype == VT_DIR {
-            let dirents = crate::vfs_alloc_array::<super::types::Dirent>(INITIAL_DIRENTS);
+            let dirents = vfs_alloc_array::<Dirent>(INITIAL_DIRENTS);
             if dirents.is_null() {
-                (*vd).active = 0;
-                return Err(VfsError::NoSpace);
+                (*vdata).active = 0;
+                return Err(VfsError::NoMem);
             }
-            (*vd).dirents = dirents;
-            (*vd).dirents_cap = INITIAL_DIRENTS as u16;
+            (*vdata).dirents = dirents;
+            (*vdata).dirents_cap = INITIAL_DIRENTS as u16;
         }
 
-        // Allocate vnode via arena callback
-        let (child_vh, child_vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*child_vp).id = id;
-        (*child_vp).vtype = ftype;
-        (*child_vp).data = vd as *mut u8;
-        (*child_vp).nlink = (*vd).nlink;
+        let (child_vh, child_vp) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*child_vp).kind = vtype_to_kind(ftype);
+        (*child_vp).key = VnodeKey {
+            fs_instance_id: fs_id,
+            backend_id: BackendNodeId::new(id, 0),
+        };
+        (*child_vp).backend_seq = 0;
+        (*child_vp).data = vdata as *mut u8;
+        (*child_vp).nlink = (*vdata).nlink;
         (*child_vp).mount = ctx.mount_handle;
+        (*child_vp).fs_instance_id = fs_id;
         (*child_vp).ops = (*ctx.vnode).ops;
-        (*vd).vnode_handle = child_vh;
+        (*vdata).vnode_handle = child_vh;
 
-        // Add dirent to parent
         if pool::dir_add_entry(parent_vd, name, name_len, id) != 0 {
-            (*vd).active = 0;
-            return Err(VfsError::NoSpace);
+            (*vdata).active = 0;
+            return Err(VfsError::NoMem);
         }
 
-        // Bump parent nlink for subdirectory ".."
         if ftype == VT_DIR {
             (*parent_vd).nlink += 1;
             (*ctx.vnode).nlink = (*parent_vd).nlink;
         }
 
-        Ok(child_vh)
+        Ok(Ready(child_vh))
     }
 }
 
-// =========================================================================
-// MetaOps function implementations
-// =========================================================================
-
-pub(super) unsafe fn ramfs_lookup(
-    ctx: &VopContext,
-    name: *const u8,
-    name_len: u8,
-) -> VfsResult<VnodeHandle> {
+/// True when the directory's dirent array has no active entries.
+unsafe fn dir_is_empty(vdata: *mut RamfsVnodeData) -> bool {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
-            return Err(VfsError::NotDir);
-        }
-
-        // Handle "."
-        if name_len == 1 && *name == b'.' {
-            return Ok(ctx.handle);
-        }
-
-        // Handle ".."
-        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
-            let parent_id = (*dvd).parent_id;
-            if parent_id == 0 {
-                // Root — ".." is self
-                return Ok(ctx.handle);
+        for i in 0..(*vdata).dirents_cap as usize {
+            if (*(*vdata).dirents.add(i)).active != 0 {
+                return false;
             }
-            let md = mdata(ctx);
-            let parent_vd = pool::find_vdata(md, parent_id);
-            if parent_vd.is_null() {
-                return Ok(VnodeHandle::INVALID);
-            }
-            if (*parent_vd).vnode_handle.is_valid()
-                && (ctx.resolve_vnode)((*parent_vd).vnode_handle).is_some()
-            {
-                return Ok((*parent_vd).vnode_handle);
-            }
-            // The parent vnode must be found via the arena — we search by id.
-            // The dispatch layer maps VnodeHandle back to the vnode; we need
-            // to find the handle for parent_id. Use vget-style allocation.
-            let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-            (*vp).id = parent_id;
-            (*vp).vtype = (*parent_vd).ftype;
-            (*vp).data = parent_vd as *mut u8;
-            (*vp).nlink = (*parent_vd).nlink;
-            (*vp).mount = ctx.mount_handle;
-            (*vp).ops = (*ctx.vnode).ops;
-            (*parent_vd).vnode_handle = vh;
-            return Ok(vh);
+        }
+        true
+    }
+}
+
+/// Free per-vnode backing storage (writable chain or symlink slot)
+/// and mark the vdata slot as inactive. Caller has already cleared
+/// the vnode's place in the parent dirent.
+unsafe fn free_vdata_storage(md: *mut RamfsMountData, vdata: *mut RamfsVnodeData) {
+    unsafe {
+        if (*vdata).ftype == VT_LNK {
+            pool::free_symlink(md, (*vdata).symlink_data);
+            (*vdata).symlink_data = ::core::ptr::null_mut();
+        } else {
+            pool::free_chain(md, (*vdata).writable_head);
+            (*vdata).writable_head = INVALID_WRITABLE_SLOT;
+        }
+        (*vdata).ro_data = ::core::ptr::null();
+        (*vdata).ro_len = 0;
+        (*vdata).active = 0;
+    }
+}
+
+/// Promote a `readonly` (initrd-projected) vnode to a writable
+/// chain by copying the read-only image into freshly allocated
+/// blocks. `Ready(true)` after a successful promotion (or when no
+/// promotion was needed); `Ready(false)` when the writable pool
+/// was exhausted (caller maps to `NoMem`).
+unsafe fn cow_promote(md: *mut RamfsMountData, vdata: *mut RamfsVnodeData) -> VopOutcome<bool> {
+    unsafe {
+        if (*vdata).readonly == 0 {
+            return Ok(Ready(true));
         }
 
-        // Normal component lookup
-        let ent = pool::dir_find_entry(dvd, name, name_len);
-        if ent.is_null() {
-            return Ok(VnodeHandle::INVALID);
+        (*vdata).readonly = 0;
+
+        if (*vdata).ro_data.is_null() || (*vdata).ro_len == 0 {
+            (*vdata).ro_data = ::core::ptr::null();
+            (*vdata).ro_len = 0;
+            return Ok(Ready(true));
         }
 
-        let child_id = (*ent).ino as u64;
+        let first_slot = pool::alloc_writable(md);
+        if first_slot == INVALID_WRITABLE_SLOT {
+            (*vdata).readonly = 1;
+            return Ok(Ready(false));
+        }
+        (*vdata).writable_head = first_slot;
+
+        let written = pool::chain_write(md, first_slot, 0, (*vdata).ro_data, (*vdata).ro_len);
+        if written < (*vdata).ro_len {
+            (*vdata).size = written;
+        }
+        (*vdata).ro_data = ::core::ptr::null();
+        (*vdata).ro_len = 0;
+        Ok(Ready(true))
+    }
+}
+
+/// Resolve `(child_id)` to a live `VnodeHandle`, allocating a fresh
+/// arena slot when the cached handle is stale. Used by `lookup`
+/// and the `..` walk.
+unsafe fn intern_vnode(ctx: &mut OwnerVopCtx<'_>, child_id: u64) -> Result<VnodeHandle, VfsError> {
+    unsafe {
         let md = mdata(ctx);
-
-        // Find the vnode data
         let child_vd = pool::find_vdata(md, child_id);
         if child_vd.is_null() {
             return Ok(VnodeHandle::INVALID);
         }
-
         if (*child_vd).vnode_handle.is_valid()
-            && (ctx.resolve_vnode)((*child_vd).vnode_handle).is_some()
+            && ctx.resolve_vnode((*child_vd).vnode_handle).is_some()
         {
             return Ok((*child_vd).vnode_handle);
         }
 
-        // Allocate a vnode from the arena
-        let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*vp).id = child_id;
-        (*vp).vtype = (*child_vd).ftype;
-        (*vp).data = child_vd as *mut u8;
-        (*vp).nlink = (*child_vd).nlink;
-        (*vp).mount = ctx.mount_handle;
-        (*vp).ops = (*ctx.vnode).ops;
-        (*child_vd).vnode_handle = vh;
-        Ok(vh)
+        let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*vnode_ptr).kind = vtype_to_kind((*child_vd).ftype);
+        (*vnode_ptr).key = VnodeKey {
+            fs_instance_id: fs_id,
+            backend_id: BackendNodeId::new(child_id, 0),
+        };
+        (*vnode_ptr).backend_seq = 0;
+        (*vnode_ptr).data = child_vd as *mut u8;
+        (*vnode_ptr).nlink = (*child_vd).nlink;
+        (*vnode_ptr).mount = ctx.mount_handle;
+        (*vnode_ptr).fs_instance_id = fs_id;
+        (*vnode_ptr).ops = (*ctx.vnode).ops;
+        // Re-derive VN_COVERED: a covered vnode reclaimed and then
+        // re-materialized must regain its mount-cover marker, or
+        // mountpoint detection (rmdir EBUSY, mount crossing) silently
+        // breaks — the flag lives on the vnode object. FreeBSD holds the
+        // covered vnode so its `v_mountedhere` never lapses; we restamp
+        // on materialization instead.
+        let covering_fs =
+            crate::core::mount_ctl::covering_mount_fs_for_key(ctx.state, (*vnode_ptr).key);
+        if let Some(fs) = covering_fs {
+            (*vnode_ptr).set_covered_by(fs);
+        }
+        (*child_vd).vnode_handle = vnode_h;
+        Ok(vnode_h)
     }
 }
 
-pub(super) unsafe fn ramfs_create(
-    ctx: &VopContext,
+// =========================================================================
+// MetaOps
+// =========================================================================
+
+pub(crate) unsafe fn ramfs_lookup(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<VnodeHandle> {
+    unsafe {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
+            return Err(VfsError::NotDir);
+        }
+
+        if name_len == 1 && *name == b'.' {
+            return Ok(Ready(ctx.handle));
+        }
+
+        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
+            let parent_id = (*dir_vdata).parent_id;
+            if parent_id == 0 {
+                return Ok(Ready(ctx.handle));
+            }
+            return Ok(Ready(intern_vnode(ctx, parent_id)?));
+        }
+
+        let ent = pool::dir_find_entry(dir_vdata, name, name_len);
+        if ent.is_null() {
+            return Ok(Ready(VnodeHandle::INVALID));
+        }
+        let child_id = (*ent).ino as u64;
+        Ok(Ready(intern_vnode(ctx, child_id)?))
+    }
+}
+
+pub(crate) unsafe fn ramfs_lookup_ci(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<VnodeHandle> {
+    unsafe {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
+            return Err(VfsError::NotDir);
+        }
+
+        if name_len == 1 && *name == b'.' {
+            return Ok(Ready(ctx.handle));
+        }
+
+        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
+            let parent_id = (*dir_vdata).parent_id;
+            if parent_id == 0 {
+                return Ok(Ready(ctx.handle));
+            }
+            return Ok(Ready(intern_vnode(ctx, parent_id)?));
+        }
+
+        let ent = pool::dir_find_entry_ci(dir_vdata, name, name_len);
+        if ent.is_null() {
+            return Ok(Ready(VnodeHandle::INVALID));
+        }
+        let child_id = (*ent).ino as u64;
+        Ok(Ready(intern_vnode(ctx, child_id)?))
+    }
+}
+
+pub(crate) unsafe fn ramfs_create(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-        // Check for existing entry
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !pool::dir_find_entry(dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
         create_child(ctx, name, name_len, mode, VT_REG, cred)
     }
 }
 
-pub(super) unsafe fn ramfs_mkdir(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_mkdir(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !pool::dir_find_entry(dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
         create_child(ctx, name, name_len, mode, VT_DIR, cred)
     }
 }
 
-pub(super) unsafe fn ramfs_symlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_symlink(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     target: *const u8,
     target_len: u8,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !pool::dir_find_entry(dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
-        let mode = S_IFLNK_L | 0o777;
-        let child_vh = create_child(ctx, name, name_len, mode, VT_LNK, cred)?;
+        let mode = MODE_TYPE_LNK | 0o777;
+        let child_outcome = create_child(ctx, name, name_len, mode, VT_LNK, cred)?;
+        let child_vh = match child_outcome {
+            Ready(h) => h,
+            Parked(p) => return Ok(Parked(p)),
+        };
 
-        // Resolve the child's vdata to store the symlink target.
-        // create_child incremented next_id, so the child's id is next_id - 1.
         let md = mdata(ctx);
         let child_id = (*md).next_id - 1;
         let child_vd = pool::find_vdata(md, child_id);
         if child_vd.is_null() {
             return Err(VfsError::Io);
         }
-
         let sym_ptr = pool::alloc_symlink(md, target, target_len);
         if sym_ptr.is_null() {
-            // Roll back
             (*child_vd).active = 0;
-            pool::dir_remove_entry(dvd, name, name_len);
-            return Err(VfsError::NoSpace);
+            pool::dir_remove_entry(dir_vdata, name, name_len);
+            return Err(VfsError::NoMem);
         }
         (*child_vd).symlink_data = sym_ptr;
         (*child_vd).size = target_len as u64;
-        Ok(child_vh)
+        Ok(Ready(child_vh))
     }
 }
 
-pub(super) unsafe fn ramfs_unlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_unlink(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-        let ent = pool::dir_find_entry(dvd, name, name_len);
+        let ent = pool::dir_find_entry(dir_vdata, name, name_len);
         if ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*ent).ino as u64;
         let md = mdata(ctx);
-
-        // Find child vdata to check type and decrement nlink
         let child_vd = pool::find_vdata(md, child_id);
         if !child_vd.is_null() {
             if (*child_vd).ftype == VT_DIR {
@@ -334,74 +449,70 @@ pub(super) unsafe fn ramfs_unlink(
                 free_vdata_storage(md, child_vd);
             }
         }
-
-        pool::dir_remove_entry(dvd, name, name_len);
-        Ok(())
+        pool::dir_remove_entry(dir_vdata, name, name_len);
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_rmdir(ctx: &VopContext, name: *const u8, name_len: u8) -> VfsResult<()> {
+pub(crate) unsafe fn ramfs_rmdir(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-        let ent = pool::dir_find_entry(dvd, name, name_len);
+        let ent = pool::dir_find_entry(dir_vdata, name, name_len);
         if ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*ent).ino as u64;
         let md = mdata(ctx);
         let child_vd = pool::find_vdata(md, child_id);
         if child_vd.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         if (*child_vd).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        // Check directory is empty
         if !dir_is_empty(child_vd) {
-            return Err(VfsError::Busy);
+            return Err(VfsError::NotEmpty);
         }
 
-        pool::dir_remove_entry(dvd, name, name_len);
+        pool::dir_remove_entry(dir_vdata, name, name_len);
 
-        // Decrement parent nlink
-        let parent_vd = vdata(ctx);
-        if (*parent_vd).nlink > 0 {
-            (*parent_vd).nlink -= 1;
-            (*ctx.vnode).nlink = (*parent_vd).nlink;
+        if (*dir_vdata).nlink > 0 {
+            (*dir_vdata).nlink -= 1;
+            (*ctx.vnode).nlink = (*dir_vdata).nlink;
         }
 
-        // Free the child directory
         (*child_vd).nlink = 0;
         free_vdata_storage(md, child_vd);
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_link(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_link(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     target: VnodeHandle,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        if (*dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+        if (*dir_vdata).readonly != 0 {
+            return Err(VfsError::RoFs);
         }
-
-        // Resolve target vnode via the context's resolve callback.
-        let target_vp = (ctx.resolve_vnode)(target).ok_or(VfsError::Inval)? as *mut Vnode;
-        let target_id = (*target_vp).id;
-
+        let target_vp = ctx.resolve_vnode(target).ok_or(VfsError::Inval)? as *mut Vnode;
+        let target_id = (*target_vp).id();
         let md = mdata(ctx);
         let tvd = pool::find_vdata(md, target_id);
         if tvd.is_null() {
@@ -410,53 +521,53 @@ pub(super) unsafe fn ramfs_link(
         if (*tvd).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !pool::dir_find_entry(dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
-        if pool::dir_add_entry(dvd, name, name_len, target_id) != 0 {
-            return Err(VfsError::NoSpace);
+        if pool::dir_add_entry(dir_vdata, name, name_len, target_id) != 0 {
+            return Err(VfsError::NoMem);
         }
         (*tvd).nlink += 1;
         (*target_vp).nlink = (*tvd).nlink;
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_rename(
-    old_ctx: &VopContext,
+pub(crate) unsafe fn ramfs_rename(
+    ctx: &mut OwnerVopCtx<'_>,
     old_name: *const u8,
     old_len: u8,
-    new_ctx: &VopContext,
+    new_dir: VnodeHandle,
     new_name: *const u8,
     new_len: u8,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let old_dvd = vdata(old_ctx);
-        let new_dvd = vdata(new_ctx);
+        // Cross-mount rename is rejected by the dispatcher before
+        // reaching this entry, so the new parent shares this mount.
+        let new_vnode = ctx.resolve_vnode(new_dir).ok_or(VfsError::Inval)? as *mut Vnode;
+        let new_dvd = (*new_vnode).data as *mut RamfsVnodeData;
+        let old_dvd = vdata(ctx);
         if old_dvd.is_null() || new_dvd.is_null() {
             return Err(VfsError::Inval);
         }
         if (*old_dvd).readonly != 0 || (*new_dvd).readonly != 0 {
-            return Err(VfsError::ReadOnly);
+            return Err(VfsError::RoFs);
         }
 
-        // Find source entry
         let src_ent = pool::dir_find_entry(old_dvd, old_name, old_len);
         if src_ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*src_ent).ino as u64;
+        let md = mdata(ctx);
 
-        // Check if target name already exists — remove it
         let dst_ent = pool::dir_find_entry(new_dvd, new_name, new_len);
         if !dst_ent.is_null() {
-            let md = mdata(old_ctx);
             let dst_id = (*dst_ent).ino as u64;
             let dst_vd = pool::find_vdata(md, dst_id);
             if !dst_vd.is_null() {
                 if (*dst_vd).ftype == VT_DIR && !dir_is_empty(dst_vd) {
-                    return Err(VfsError::Busy);
+                    return Err(VfsError::NotEmpty);
                 }
                 if (*dst_vd).nlink > 0 {
                     (*dst_vd).nlink -= 1;
@@ -468,363 +579,344 @@ pub(super) unsafe fn ramfs_rename(
             pool::dir_remove_entry(new_dvd, new_name, new_len);
         }
 
-        // Remove from old parent
         pool::dir_remove_entry(old_dvd, old_name, old_len);
 
-        // Add to new parent
         if pool::dir_add_entry(new_dvd, new_name, new_len, child_id) != 0 {
-            // Try to restore — best effort
+            // Roll back — restore the old dirent.
             let _ = pool::dir_add_entry(old_dvd, old_name, old_len, child_id);
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
 
-        // Update parent_id if moved to a different directory
-        let md = mdata(old_ctx);
-        let old_id = (*old_ctx.vnode).id;
-        let new_id = (*new_ctx.vnode).id;
+        let old_id = (*ctx.vnode).id();
+        let new_id = (*new_vnode).id();
         let child_vd = pool::find_vdata(md, child_id);
         if !child_vd.is_null() && old_id != new_id {
             (*child_vd).parent_id = new_id;
-            // Adjust nlink for directory moves
             if (*child_vd).ftype == VT_DIR {
                 if (*old_dvd).nlink > 0 {
                     (*old_dvd).nlink -= 1;
-                    (*old_ctx.vnode).nlink = (*old_dvd).nlink;
+                    (*ctx.vnode).nlink = (*old_dvd).nlink;
                 }
                 (*new_dvd).nlink += 1;
-                (*new_ctx.vnode).nlink = (*new_dvd).nlink;
+                (*new_vnode).nlink = (*new_dvd).nlink;
             }
         }
-
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_open(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+pub(crate) unsafe fn ramfs_open(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn ramfs_close(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+pub(crate) unsafe fn ramfs_close(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn ramfs_getattr(ctx: &VopContext, attr: *mut VAttr) -> VfsResult<()> {
+pub(crate) unsafe fn ramfs_getattr(ctx: &mut OwnerVopCtx<'_>, attr: *mut VAttr) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        (*attr).size = (*vd).size;
-        (*attr).blocks = ((*vd).size + 511) / 512;
-        (*attr).mode = (*vd).mode;
-        (*attr).uid = (*vd).uid;
-        (*attr).gid = (*vd).gid;
-        (*attr).nlink = (*vd).nlink;
-        (*attr).atime = (*vd).atime;
-        (*attr).mtime = (*vd).mtime;
-        (*attr).ctime = (*vd).ctime;
-        (*attr).btime = (*vd).btime;
-        (*attr).dev_id = 0;
-        (*attr).rdev = 0;
-        Ok(())
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*attr).fs_instance_id = fs_id;
+        (*attr).backend_node_id = (*vdata).id;
+        (*attr).backend_seq = 0;
+        (*attr).kind = vtype_to_kind((*vdata).ftype);
+        (*attr).mode = (*vdata).mode;
+        (*attr).uid = (*vdata).uid;
+        (*attr).gid = (*vdata).gid;
+        (*attr).nlink = (*vdata).nlink;
+        (*attr).size = (*vdata).size;
+        (*attr).blocks = ((*vdata).size + 511) / 512;
+        (*attr).atime = (*vdata).atime;
+        (*attr).mtime = (*vdata).mtime;
+        (*attr).ctime = (*vdata).ctime;
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_setattr(ctx: &VopContext, attr: *const VAttr) -> VfsResult<()> {
+pub(crate) unsafe fn ramfs_setattr(
+    ctx: &mut OwnerVopCtx<'_>,
+    attr: *const VAttr,
+) -> VopOutcome<()> {
+    use crate::core::file::{
+        VATTR_ATIME, VATTR_CTIME, VATTR_GID, VATTR_MODE, VATTR_MTIME, VATTR_UID,
+    };
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        // Only update non-zero fields (sparse update pattern)
-        if (*attr).mode != 0 {
-            (*vd).mode = (*attr).mode;
+        // Sparse update — `valid` discriminates "apply this field"
+        // from "leave unchanged". Size changes go through
+        // `truncate` so VATTR_SIZE is not honoured here.
+        let valid = (*attr).valid;
+        if (valid & VATTR_MODE) != 0 {
+            (*vdata).mode = (*attr).mode;
         }
-        if (*attr).uid != u32::MAX {
-            (*vd).uid = (*attr).uid;
+        if (valid & VATTR_UID) != 0 {
+            (*vdata).uid = (*attr).uid;
         }
-        if (*attr).gid != u32::MAX {
-            (*vd).gid = (*attr).gid;
+        if (valid & VATTR_GID) != 0 {
+            (*vdata).gid = (*attr).gid;
         }
-        if (*attr).atime != 0 {
-            (*vd).atime = (*attr).atime;
+        if (valid & VATTR_ATIME) != 0 {
+            (*vdata).atime = (*attr).atime;
         }
-        if (*attr).mtime != 0 {
-            (*vd).mtime = (*attr).mtime;
+        if (valid & VATTR_MTIME) != 0 {
+            (*vdata).mtime = (*attr).mtime;
         }
-        if (*attr).ctime != 0 {
-            (*vd).ctime = (*attr).ctime;
+        if (valid & VATTR_CTIME) != 0 {
+            (*vdata).ctime = (*attr).ctime;
         }
-        // Size changes go through truncate, not setattr
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_access(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_access(
+    ctx: &mut OwnerVopCtx<'_>,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
         if cred.is_null() {
-            return Ok(());
+            return Ok(Ready(()));
         }
-        // Root bypasses permission checks
-        if (*cred).euid == 0 {
-            return Ok(());
+        if (*cred).is_root() {
+            return Ok(Ready(()));
         }
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-
-        let file_mode = (*vd).mode;
-        let uid = (*vd).uid;
-        let gid = (*vd).gid;
-
-        // Determine which permission bits to check (owner/group/other)
+        let file_mode = (*vdata).mode;
+        let uid = (*vdata).uid;
+        let gid = (*vdata).gid;
         let shift = if (*cred).euid == uid {
-            6 // owner
+            6
         } else if (*cred).in_group(gid) {
-            3 // group
+            3
         } else {
-            0 // other
+            0
         };
-
         let perm = (file_mode >> shift) & 0o7;
-
-        // ACCESS_READ = 1, ACCESS_WRITE = 2, ACCESS_EXEC = 4
+        // ACCESS_READ = 1, WRITE = 2, EXEC = 4 (matches POSIX).
         if (mode & 1) != 0 && (perm & 4) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
         if (mode & 2) != 0 && (perm & 2) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
         if (mode & 4) != 0 && (perm & 1) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
-
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_readlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn ramfs_readlink(
+    ctx: &mut OwnerVopCtx<'_>,
     buf: *mut u8,
     buf_len: usize,
     _cred: *const VfsCred,
-) -> VfsResult<usize> {
+) -> VopOutcome<usize> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype != VT_LNK {
+        if (*vdata).ftype != VT_LNK {
             return Err(VfsError::Inval);
         }
-
-        // Try symlink_data first (writable symlinks)
-        if !(*vd).symlink_data.is_null() {
-            let len = (*vd).size as usize;
+        if !(*vdata).symlink_data.is_null() {
+            let len = (*vdata).size as usize;
             let copy_len = if len < buf_len { len } else { buf_len };
-            core::ptr::copy_nonoverlapping((*vd).symlink_data, buf, copy_len);
-            return Ok(copy_len);
+            ::core::ptr::copy_nonoverlapping((*vdata).symlink_data, buf, copy_len);
+            return Ok(Ready(copy_len));
         }
-
-        // Fall back to ro_data (initrd symlinks)
-        if !(*vd).ro_data.is_null() {
-            let len = (*vd).ro_len as usize;
+        if !(*vdata).ro_data.is_null() {
+            let len = (*vdata).ro_len as usize;
             let copy_len = if len < buf_len { len } else { buf_len };
-            core::ptr::copy_nonoverlapping((*vd).ro_data, buf, copy_len);
-            return Ok(copy_len);
+            ::core::ptr::copy_nonoverlapping((*vdata).ro_data, buf, copy_len);
+            return Ok(Ready(copy_len));
         }
-
         Err(VfsError::Io)
     }
 }
 
-pub(super) unsafe fn ramfs_truncate(ctx: &VopContext, new_size: u64) -> VfsResult<()> {
+pub(crate) unsafe fn ramfs_truncate(ctx: &mut OwnerVopCtx<'_>, new_size: u64) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).readonly != 0 {
+        if (*vdata).readonly != 0 {
             let md = mdata(ctx);
-            if !cow_promote(md, vd)? {
-                return Err(VfsError::NoSpace);
+            match cow_promote(md, vdata)? {
+                Ready(true) => {}
+                Ready(false) => return Err(VfsError::NoMem),
+                Parked(h) => return Ok(Parked(h)),
             }
         }
-
         let md = mdata(ctx);
-        if new_size < (*vd).size && (*vd).writable_head != INVALID_WRITABLE_SLOT {
-            pool::chain_truncate(md, (*vd).writable_head, new_size);
-        } else if new_size > (*vd).size {
-            // Extending — ensure chain exists
-            if (*vd).writable_head == INVALID_WRITABLE_SLOT {
-                let slot = pool::alloc_writable(md);
-                if slot == INVALID_WRITABLE_SLOT {
-                    return Err(VfsError::NoSpace);
-                }
-                (*vd).writable_head = slot;
+        if new_size < (*vdata).size && (*vdata).writable_head != INVALID_WRITABLE_SLOT {
+            pool::chain_truncate(md, (*vdata).writable_head, new_size);
+        } else if new_size > (*vdata).size && (*vdata).writable_head == INVALID_WRITABLE_SLOT {
+            let slot = pool::alloc_writable(md);
+            if slot == INVALID_WRITABLE_SLOT {
+                return Err(VfsError::NoMem);
             }
+            (*vdata).writable_head = slot;
         }
-
-        (*vd).size = new_size;
-        Ok(())
+        (*vdata).size = new_size;
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_inactive(ctx: &VopContext) {
+pub(crate) unsafe fn ramfs_inactive(ctx: &mut OwnerVopCtx<'_>) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
-            return;
+        crate::owner::pager_rpc::release_mo_binding_for_vnode(ctx.state, ctx.handle);
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
+            return Ok(Ready(()));
         }
-        // If nlink == 0, free the backing storage
-        if (*vd).nlink == 0 {
+        if (*vdata).nlink == 0 {
             let md = mdata(ctx);
-            free_vdata_storage(md, vd);
+            free_vdata_storage(md, vdata);
         }
-        // Detach data pointer
-        (*ctx.vnode).data = core::ptr::null_mut();
+        (*ctx.vnode).data = ::core::ptr::null_mut();
+        Ok(Ready(()))
     }
 }
 
 // =========================================================================
-// DataOps function implementations
+// DataOps
 // =========================================================================
 
-pub(super) unsafe fn ramfs_read(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn ramfs_read(
+    ctx: &VopDataCtx,
     offset: u64,
     dst: *mut u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype == VT_DIR {
+        if (*vdata).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-
-        let size = (*vd).size;
+        let size = (*vdata).size;
         if offset >= size {
-            return Ok(0);
+            return Ok(Ready(0));
         }
         let avail = size - offset;
         let count = if len < avail { len } else { avail };
 
-        // Read-only data (initrd zero-copy)
-        if !(*vd).ro_data.is_null() && (*vd).writable_head == INVALID_WRITABLE_SLOT {
-            if offset + count > (*vd).ro_len {
-                return Ok(0);
+        if !(*vdata).ro_data.is_null() && (*vdata).writable_head == INVALID_WRITABLE_SLOT {
+            if offset + count > (*vdata).ro_len {
+                return Ok(Ready(0));
             }
-            core::ptr::copy_nonoverlapping((*vd).ro_data.add(offset as usize), dst, count as usize);
-            return Ok(count);
+            ::core::ptr::copy_nonoverlapping(
+                (*vdata).ro_data.add(offset as usize),
+                dst,
+                count as usize,
+            );
+            return Ok(Ready(count));
         }
 
-        // Writable chain
         let md = mdata_d(ctx);
-        let read = pool::chain_read(md, (*vd).writable_head, offset, dst, count);
-        Ok(read)
+        let read = pool::chain_read(md, (*vdata).writable_head, offset, dst, count);
+        Ok(Ready(read))
     }
 }
 
-pub(super) unsafe fn ramfs_write(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn ramfs_write(
+    ctx: &VopDataCtx,
     offset: u64,
     src: *const u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype == VT_DIR {
+        if (*vdata).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-        if (*vd).readonly != 0 {
+        if (*vdata).readonly != 0 {
             let md = mdata_d(ctx);
-            // Copy-on-write: convert from ro_data to writable chain
-            if !cow_promote(md, vd)? {
-                return Err(VfsError::NoSpace);
+            match cow_promote(md, vdata)? {
+                Ready(true) => {}
+                Ready(false) => return Err(VfsError::NoMem),
+                Parked(h) => return Ok(Parked(h)),
             }
         }
-
         let md = mdata_d(ctx);
-        if (*vd).writable_head == INVALID_WRITABLE_SLOT {
+        if (*vdata).writable_head == INVALID_WRITABLE_SLOT {
             let slot = pool::alloc_writable(md);
             if slot == INVALID_WRITABLE_SLOT {
-                return Err(VfsError::NoSpace);
+                return Err(VfsError::NoMem);
             }
-            (*vd).writable_head = slot;
+            (*vdata).writable_head = slot;
         }
-
-        let written = pool::chain_write(md, (*vd).writable_head, offset, src, len);
+        let written = pool::chain_write(md, (*vdata).writable_head, offset, src, len);
         if written == 0 && len > 0 {
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
-
         let end = offset + written;
-        if end > (*vd).size {
-            (*vd).size = end;
+        if end > (*vdata).size {
+            (*vdata).size = end;
         }
-
-        Ok(written)
+        Ok(Ready(written))
     }
 }
 
-pub(super) unsafe fn ramfs_fsync(_ctx: &VopDataContext) -> VfsResult<()> {
-    // In-memory — nothing to sync.
-    Ok(())
+pub(crate) unsafe fn ramfs_fsync(_ctx: &VopDataCtx) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn ramfs_readdir(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn ramfs_readdir(
+    ctx: &VopDataCtx,
     cookie: *mut u64,
     emit: ReaddirEmit<'_>,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() || (*vd).ftype != VT_DIR {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() || (*vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
 
         let start = *cookie as usize;
         let attr = VAttr::zeroed();
         let md = mdata_d(ctx);
-        let mut emitted = 0usize;
 
-        // Emit "." and ".."
         if start == 0 {
-            if !emit((*vd).id, b".".as_ptr(), 1, 4, &attr) {
+            if !emit((*vdata).id, b".".as_ptr(), 1, 4, &attr) {
                 *cookie = 1;
-                return Ok(());
+                return Ok(Ready(()));
             }
-            emitted += 1;
         }
         if start <= 1 {
-            let parent_id = if (*vd).parent_id != 0 {
-                (*vd).parent_id
+            let parent_id = if (*vdata).parent_id != 0 {
+                (*vdata).parent_id
             } else {
-                (*vd).id
+                (*vdata).id
             };
             if !emit(parent_id, b"..".as_ptr(), 2, 4, &attr) {
                 *cookie = 2;
-                return Ok(());
+                return Ok(Ready(()));
             }
-            emitted += 1;
         }
 
-        // Real entries start at cookie index 2
         let real_start = if start > 2 { start - 2 } else { 0 };
         let mut idx = 0usize;
-        for i in 0..(*vd).dirents_cap as usize {
-            let ent = (*vd).dirents.add(i);
+        for i in 0..(*vdata).dirents_cap as usize {
+            let ent = (*vdata).dirents.add(i);
             if (*ent).active == 0 {
                 continue;
             }
@@ -832,11 +924,10 @@ pub(super) unsafe fn ramfs_readdir(
                 idx += 1;
                 continue;
             }
-            // Look up child vdata to get dtype
             let child_id = (*ent).ino as u64;
             let child_vd = pool::find_vdata(md, child_id);
             let dtype = if !child_vd.is_null() {
-                vtype_to_dtype((*child_vd).ftype)
+                vtype_to_dtype_local((*child_vd).ftype)
             } else {
                 0
             };
@@ -848,30 +939,25 @@ pub(super) unsafe fn ramfs_readdir(
                 &attr,
             ) {
                 *cookie = (idx + 3) as u64;
-                return Ok(());
+                return Ok(Ready(()));
             }
             idx += 1;
         }
 
         *cookie = (idx + 2) as u64;
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn ramfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> VfsResult<()> {
+pub(crate) unsafe fn ramfs_statfs(ctx: &VopDataCtx, out: *mut VStatfs) -> VopOutcome<()> {
     unsafe {
-        (*out).bsize = WRITABLE_SIZE as u64;
-        (*out).blocks = 0;
-        (*out).bfree = 0;
-        (*out).bavail = 0;
-        (*out).files = 0;
-        (*out).ffree = 0;
-        let ft = &mut (*out).fs_type;
-        ft[..5].copy_from_slice(b"ramfs");
-        (*out).flags = 0;
-        (*out).name_max = MAX_NAME_LEN as u32;
+        (*out).bsize = WRITABLE_SIZE as u32;
+        (*out).frsize = WRITABLE_SIZE as u32;
+        (*out).flag = 0;
+        (*out).namemax = MAX_NAME_LEN as u32;
+        (*out).fsid = ctx.fs_instance_id.0;
+        (*out).set_fs_name(b"ramfs");
 
-        // Count active vnodes and writable blocks
         let md = mdata_d(ctx);
         let mut files: u64 = 0;
         for i in 0..(*md).vdata_cap {
@@ -886,81 +972,11 @@ pub(super) unsafe fn ramfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> Vf
             }
         }
         (*out).files = files;
+        (*out).ffree = (*md).vdata_cap as u64 - files;
+        (*out).favail = (*out).ffree;
         (*out).blocks = (*md).writable_cap as u64;
         (*out).bfree = (*md).writable_cap as u64 - used_blocks;
         (*out).bavail = (*out).bfree;
-        Ok(())
-    }
-}
-
-// =========================================================================
-// Internal helpers
-// =========================================================================
-
-/// Check whether a directory has any active entries.
-unsafe fn dir_is_empty(vd: *mut super::types::RamfsVnodeData) -> bool {
-    unsafe {
-        for i in 0..(*vd).dirents_cap as usize {
-            if (*(*vd).dirents.add(i)).active != 0 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Free storage associated with a vnode-data entry (chain, symlink, etc.).
-unsafe fn free_vdata_storage(md: *mut RamfsMountData, vd: *mut super::types::RamfsVnodeData) {
-    unsafe {
-        if (*vd).ftype == VT_LNK {
-            pool::free_symlink(md, (*vd).symlink_data);
-            (*vd).symlink_data = core::ptr::null_mut();
-        } else {
-            pool::free_chain(md, (*vd).writable_head);
-            (*vd).writable_head = INVALID_WRITABLE_SLOT;
-        }
-        (*vd).ro_data = core::ptr::null();
-        (*vd).ro_len = 0;
-        (*vd).active = 0;
-    }
-}
-
-/// Copy-on-write promotion: convert a read-only file (ro_data) to a
-/// writable block chain. Returns `Ok(true)` if promotion succeeded or
-/// was unnecessary, `Ok(false)` if allocation failed.
-unsafe fn cow_promote(
-    md: *mut RamfsMountData,
-    vd: *mut super::types::RamfsVnodeData,
-) -> VfsResult<bool> {
-    unsafe {
-        if (*vd).readonly == 0 {
-            return Ok(true);
-        }
-
-        (*vd).readonly = 0;
-
-        if (*vd).ro_data.is_null() || (*vd).ro_len == 0 {
-            (*vd).ro_data = core::ptr::null();
-            (*vd).ro_len = 0;
-            return Ok(true);
-        }
-
-        // Allocate writable chain and copy ro_data
-        let first_slot = pool::alloc_writable(md);
-        if first_slot == INVALID_WRITABLE_SLOT {
-            (*vd).readonly = 1;
-            return Ok(false);
-        }
-        (*vd).writable_head = first_slot;
-
-        let written = pool::chain_write(md, first_slot, 0, (*vd).ro_data, (*vd).ro_len);
-        if written < (*vd).ro_len {
-            // Partial write — keep what we have, update size
-            (*vd).size = written;
-        }
-
-        (*vd).ro_data = core::ptr::null();
-        (*vd).ro_len = 0;
-        Ok(true)
+        Ok(Ready(()))
     }
 }

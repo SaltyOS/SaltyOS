@@ -1,15 +1,25 @@
 [Service]
 Name=blkdrv
 Binary=/bin/blkdrv
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
 After=pcidrv namesrv mmsrv
 Before=saltyfs
+Requires=namesrv.socket pcidrv-ep.socket
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# System roles via trona::caps::*, service-local via generated svc_caps::*.
-Require=namesrv
-Require=mmsrv
-Require=pcidrv:pcidrv_ep
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

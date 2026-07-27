@@ -4,20 +4,19 @@
 //! Discovers modern virtio-net devices (device ID 0x1041) and locates register
 //! regions via PCI vendor-specific capabilities.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::mm::{MM_MMAP, MMAP_KIND_ANON};
+use trona_protocol::pci::{PCI_FIND_DEVICE, PCI_GET_BAR_CAP, PCI_READ_CONFIG32};
 
 use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
 
-// Service-local role `Require=pcidrv:pcidrv_ep` via generated `svc_caps`
-// crate; system role `mmsrv` via substrate `trona::caps::*` getters.
+// Service-local role: `Require=pcidrv-ep.socket` resolved via
+// `trona_runtime::local_cap!` in `main.rs` (see `crate::pcidrv_ep`).
 
 /// Modern virtio-net PCI device ID (non-transitional)
 const VIRTIO_NET_MODERN_DEVICE: u16 = 0x1041;
@@ -36,18 +35,18 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 const BAR_VADDR_BASE: u64 = 0x0000_0000_4000_0000;
 const BAR_VADDR_STRIDE: u64 = 0x0000_0000_0020_0000;
 
-/// Slot allocation for receiving BAR device untyped caps
-const CAP_BAR_SLOT_BASE: u64 = 90;
-
 /// Virtio 1.0 status bits
 const VIRTIO_STATUS_ACK: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+/// Feature bit 32, exposed as bit 0 when DEVICE_FEATURE_SELECT=1.
+const VIRTIO_F_VERSION_1_HI: u32 = 1 << 0;
 
 /// Feature bits
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 // Common config register offsets (virtio 1.0 spec §4.1.4.3)
 const CC_DEVICE_FEATURE_SELECT: u32 = 0x00;
@@ -82,6 +81,8 @@ pub(crate) struct VirtioModernLayout {
 
 /// Mapped BAR virtual addresses (indexed by BAR number 0-5)
 static mut BAR_VADDRS: [u64; 6] = [0; 6];
+/// Persistent BAR-cap slots matched to `BAR_VADDRS`.
+static mut BAR_CAP_SLOTS: [u64; 6] = [0; 6];
 
 /// Stored layout for runtime access from event loop.
 pub(crate) static mut MODERN_LAYOUT: Option<VirtioModernLayout> = None;
@@ -102,8 +103,15 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[3] = offset as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err =
-        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::pcidrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
     }
@@ -123,21 +131,55 @@ pub(crate) fn find_virtio_net_modern() -> Option<(u8, u8, u8)> {
     msg.regs[1] = VIRTIO_NET_MODERN_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err =
-        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::pcidrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
         return None;
     }
 
-    Some((reply.regs[0] as u8, reply.regs[1] as u8, reply.regs[2] as u8))
+    Some((
+        reply.regs[0] as u8,
+        reply.regs[1] as u8,
+        reply.regs[2] as u8,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // BAR mapping
 // ---------------------------------------------------------------------------
 
+fn clear_bar_cap_slot(bar_idx: u8) {
+    unsafe {
+        let slot = *(&raw const BAR_CAP_SLOTS[bar_idx as usize]);
+        if slot == 0 {
+            return;
+        }
+        trona_runtime::core::slot_alloc::delete_and_free(slot);
+        *(&raw mut BAR_CAP_SLOTS[bar_idx as usize]) = 0;
+    }
+}
+
+fn ensure_bar_cap_slot(bar_idx: u8) -> Option<u64> {
+    unsafe {
+        let slot = *(&raw const BAR_CAP_SLOTS[bar_idx as usize]);
+        if slot != 0 {
+            return Some(slot);
+        }
+        let slot = trona_runtime::core::slot_alloc::slot_alloc()?;
+        *(&raw mut BAR_CAP_SLOTS[bar_idx as usize]) = slot;
+        Some(slot)
+    }
+}
+
 fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
-    let recv_slot = CAP_BAR_SLOT_BASE + bar_idx as u64;
+    let recv_slot = ensure_bar_cap_slot(bar_idx)?;
 
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_BAR_CAP;
@@ -148,38 +190,72 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     msg.regs[3] = bar_idx as u64;
 
     unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
+        trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+            ipc_ctx(),
+            CAP_SELF_CSPACE,
+            recv_slot,
+            0,
+        );
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err =
-        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::pcidrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
+        clear_bar_cap_slot(bar_idx);
         return None;
     }
 
     let bar_size = reply.regs[1] as u32;
     let is_io = reply.regs[2] != 0;
     if bar_size == 0 || is_io {
+        clear_bar_cap_slot(bar_idx);
         return None;
     }
 
     let num_pages = ((bar_size as u64) + 4095) / 4096;
     let vaddr = BAR_VADDR_BASE + (bar_idx as u64) * BAR_VADDR_STRIDE;
 
-    let (map_err, _mapped) = invoke::vspace_map_device_range(
-        CAP_SELF_VSPACE,
-        recv_slot,
+    // MMIO must be uncacheable. `KERNITE_PAGE_FLAG_NOCACHE` is bit 5; the old
+    // `0x8` was an undefined bit the kernel silently ignored, so the BAR was
+    // mapped write-back.
+    let map_flags = (uapi::KERNITE_PAGE_FLAG_WRITABLE
+        | uapi::KERNITE_PAGE_FLAG_USER
+        | uapi::KERNITE_PAGE_FLAG_NOCACHE) as u64;
+    let (map_err, mapped) = invoke::vspace_map_device_range(
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_VSPACE),
+        trona_runtime::core::slot_alloc::resolved_cap_ref(recv_slot),
         0,
         vaddr,
         num_pages,
-        0x3 | 0x8, // RW + cache_disable (MMIO must be uncacheable)
+        map_flags,
     );
-    if map_err != 0 {
+    if map_err != 0 || mapped != num_pages {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] vspace_map_device_range failed bar=");
+            _lb.dec(bar_idx as u64);
+            _lb.str(b" err=");
+            _lb.hex(map_err as u64);
+            _lb.str(b" mapped=");
+            _lb.hex(mapped);
+            _lb.putc(b'/');
+            _lb.hex(num_pages);
+            _lb.putc(b'\n');
+        });
+        clear_bar_cap_slot(bar_idx);
         return None;
     }
 
-    unsafe { *(&raw mut BAR_VADDRS[bar_idx as usize]) = vaddr; }
+    unsafe {
+        *(&raw mut BAR_VADDRS[bar_idx as usize]) = vaddr;
+    }
     Some((vaddr, bar_size))
 }
 
@@ -239,7 +315,9 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
     }
 
     if common_bar == 0xFF || notify_bar == 0xFF || device_bar == 0xFF {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Missing required virtio PCI capabilities\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Missing required virtio PCI capabilities\n");
+        });
         return None;
     }
 
@@ -251,7 +329,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
         let vaddr = unsafe { *(&raw const BAR_VADDRS[b as usize]) };
         if vaddr == 0 {
             if map_bar(bus, dev, func, b).is_none() {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[netdrv] Failed to map BAR ");
                     _lb.dec(b as u64);
                     _lb.putc(b'\n');
@@ -294,7 +372,9 @@ impl VirtioModernLayout {
     }
     fn common_write8(&self, off: u32, val: u8) {
         let addr = self.common_cfg_base + self.common_cfg_offset as u64 + off as u64;
-        unsafe { core::ptr::write_volatile(addr as *mut u8, val); }
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u8, val);
+        }
     }
     fn common_read16(&self, off: u32) -> u16 {
         let addr = self.common_cfg_base + self.common_cfg_offset as u64 + off as u64;
@@ -302,7 +382,9 @@ impl VirtioModernLayout {
     }
     fn common_write16(&self, off: u32, val: u16) {
         let addr = self.common_cfg_base + self.common_cfg_offset as u64 + off as u64;
-        unsafe { core::ptr::write_volatile(addr as *mut u16, val); }
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u16, val);
+        }
     }
     fn common_read32(&self, off: u32) -> u32 {
         let addr = self.common_cfg_base + self.common_cfg_offset as u64 + off as u64;
@@ -310,7 +392,9 @@ impl VirtioModernLayout {
     }
     fn common_write32(&self, off: u32, val: u32) {
         let addr = self.common_cfg_base + self.common_cfg_offset as u64 + off as u64;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, val); }
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u32, val);
+        }
     }
     fn device_read8(&self, off: u32) -> u8 {
         let addr = self.device_cfg_base + self.device_cfg_offset as u64 + off as u64;
@@ -320,7 +404,9 @@ impl VirtioModernLayout {
         let addr = self.notify_base
             + self.notify_offset as u64
             + (queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        unsafe { core::ptr::write_volatile(addr as *mut u16, queue_idx); }
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u16, queue_idx);
+        }
     }
     pub(crate) fn isr_read(&self) -> u8 {
         if self.isr_base == 0 {
@@ -344,19 +430,27 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// Sets up the same global state as `virtio::init_virtio` so the legacy
 /// RX/TX ring code in virtio.rs can be reused.
 pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
-    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Probing modern virtio transport\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Probing modern virtio transport\n");
+    });
 
     let layout = match scan_virtio_caps(bus, dev, func) {
         Some(l) => l,
         None => return false,
     };
 
-    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio caps discovered\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Modern virtio caps discovered\n");
+    });
 
     // Reset
     layout.common_write8(CC_DEVICE_STATUS, 0);
     layout.common_write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACK);
     layout.common_write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
+
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Reset complete\n");
+    });
 
     // Feature negotiation
     // Page 0 (bits 0-31): device-specific features
@@ -377,10 +471,13 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     layout.common_write32(CC_DEVICE_FEATURE_SELECT, 1);
     let dev_features1 = layout.common_read32(CC_DEVICE_FEATURE);
     let mut driver_features1: u32 = 0;
-    if (dev_features1 & 1) != 0 {
-        // VIRTIO_F_VERSION_1 = bit 32 = bit 0 of page 1
-        driver_features1 |= 1;
+    if (dev_features1 & VIRTIO_F_VERSION_1_HI) == 0 {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Modern virtio lacks VERSION_1 feature\n");
+        });
+        return false;
     }
+    driver_features1 |= VIRTIO_F_VERSION_1_HI;
     layout.common_write32(CC_DRIVER_FEATURE_SELECT, 1);
     layout.common_write32(CC_DRIVER_FEATURE, driver_features1);
 
@@ -391,7 +488,9 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     );
     let status = layout.common_read8(CC_DEVICE_STATUS);
     if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Device did not accept features\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Device did not accept features\n");
+        });
         return false;
     }
 
@@ -401,12 +500,16 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         for i in 0..6 {
             mac[i] = layout.device_read8(i as u32);
         }
-        unsafe { *(&raw mut crate::virtio::MAC_ADDR) = mac; }
+        unsafe {
+            *(&raw mut crate::virtio::MAC_ADDR) = mac;
+        }
 
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[netdrv] MAC: ");
             for i in 0..6 {
-                if i > 0 { _lb.putc(b':'); }
+                if i > 0 {
+                    _lb.putc(b':');
+                }
                 let hi = b"0123456789abcdef"[(mac[i] >> 4) as usize];
                 let lo = b"0123456789abcdef"[(mac[i] & 0xF) as usize];
                 _lb.putc(hi);
@@ -419,7 +522,9 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     // Set up RX queue (queue 0) and TX queue (queue 1)
     let num_queues = layout.common_read16(CC_NUM_QUEUES);
     if num_queues < 2 {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Device has fewer than 2 queues\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Device has fewer than 2 queues\n");
+        });
         return false;
     }
 
@@ -430,13 +535,14 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         layout.common_write16(CC_QUEUE_SELECT, qi);
         let qsize = layout.common_read16(CC_QUEUE_SIZE);
         if qsize == 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[netdrv] Queue ");
                 _lb.dec(qi as u64);
                 _lb.str(b" unavailable\n");
             });
             return false;
         }
+        layout.common_write16(CC_QUEUE_SIZE, qsize);
 
         // Compute virtqueue layout
         let q = qsize as u64;
@@ -449,20 +555,28 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let vq_pages = (total_bytes + 4095) / 4096;
 
         // Allocate virtqueue memory via mmsrv
-        let hint_vaddr: u64 = if qi == 0 { 0x4100_0000 } else { 0x4180_0000 };
         let mut msg = TronaMsg::zeroed();
         msg.label = MM_MMAP;
-        msg.length = 4;
-        msg.regs[0] = hint_vaddr;
-        msg.regs[1] = vq_pages * 4096;
-        msg.regs[2] = 0x3;
-        msg.regs[3] = 0x22;
+        msg.length = 5;
+        msg.regs[0] = MMAP_KIND_ANON;
+        msg.regs[1] = 0;
+        msg.regs[2] = vq_pages * 4096;
+        msg.regs[3] = 0x3;
+        msg.regs[4] = 0;
         let mut reply = TronaMsg::zeroed();
         let err = unsafe {
-            ipc::call_ctx(ipc_ctx(), trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply)
+            ipc::mp_call_ctx(
+                ipc_ctx(),
+                trona_runtime::client::caps::mmsrv_ep().addr(),
+                &raw const msg,
+                &raw mut reply,
+                trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+            )
         };
         if err != 0 || reply.label != 0 {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate virtqueue memory\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to allocate virtqueue memory\n");
+            });
             return false;
         }
         let vq_base = reply.regs[0];
@@ -480,7 +594,9 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let avail_phys = crate::virtio::vaddr_to_phys(vq_base + avail_off);
         let used_phys = crate::virtio::vaddr_to_phys(vq_base + used_off);
         if desc_phys == 0 || avail_phys == 0 || used_phys == 0 {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n");
+            });
             return false;
         }
 
@@ -493,7 +609,17 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
 
         // Save notify offset
         let queue_notify_off = layout.common_read16(CC_QUEUE_NOTIFY_OFF);
-        unsafe { *(&raw mut QUEUE_NOTIFY_OFFS[qi as usize]) = queue_notify_off; }
+        unsafe {
+            *(&raw mut QUEUE_NOTIFY_OFFS[qi as usize]) = queue_notify_off;
+        }
+
+        // netdrv currently uses timed RX polling and explicit MP TX kicks.
+        // Suppress virtqueue interrupts so the shared PCI line does not keep
+        // firing without an EventQueue-bound IRQ consumer.
+        unsafe {
+            let avail_base = (vq_base + avail_off) as *mut u16;
+            core::ptr::write_volatile(avail_base, VIRTQ_AVAIL_F_NO_INTERRUPT);
+        }
 
         // Enable queue
         layout.common_write16(CC_QUEUE_ENABLE, 1);
@@ -516,7 +642,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
             }
         }
 
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[netdrv] Queue ");
             _lb.dec(qi as u64);
             _lb.str(b" size: ");
@@ -527,7 +653,9 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
 
     // Allocate DMA buffers (reuse legacy allocation logic)
     if !crate::virtio::alloc_dma_buffers() {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to allocate DMA buffers\n");
+        });
         return false;
     }
 
@@ -539,7 +667,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         crate::virtio::set_net_hdr_size(if use_mrg_rxbuf { 12 } else { 10 });
     }
 
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netdrv] modern net hdr size=");
         _lb.dec(if use_mrg_rxbuf { 12 } else { 10 });
         _lb.str(b" mrg_rxbuf=");
@@ -553,7 +681,10 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         if let Some(ref l) = *(&raw const MODERN_LAYOUT) {
             l.common_write8(
                 CC_DEVICE_STATUS,
-                VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK,
+                VIRTIO_STATUS_ACK
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK,
             );
         }
     }
@@ -566,7 +697,9 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         *(&raw mut crate::virtio::VIRTIO_INITIALIZED) = true;
     }
 
-    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio-net initialized OK\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Modern virtio-net initialized OK\n");
+    });
     true
 }
 

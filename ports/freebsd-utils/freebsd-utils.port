@@ -14,15 +14,15 @@ sha256 = SKIP
 type = targets
 
 [depends]
-build = zlib, bzip2, xz, zstd, openssl, ncurses
+build = zlib >= 1.3, bzip2 >= 1.0.8, xz >= 5.6, zstd >= 1.5, openssl >= 3.4, ncurses >= 6.5
 
 [env]
 EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-missing-braces -Wno-gnu-designator -Wno-#warnings -Wno-macro-redefined -D__FreeBSD_version=1402000 -DBOOTSTRAP_CAT -DNO_UDOM_SUPPORT -DWITHOUT_NLS
-EXTRA_LIBS = -L${PORTDIR}/../zlib/${ARCH_STAGE} -L${PORTDIR}/../bzip2/${ARCH_STAGE} -L${PORTDIR}/../xz/${ARCH_STAGE} -L${PORTDIR}/../zstd/${ARCH_STAGE} -L${PORTDIR}/../openssl/${ARCH_STAGE} -lz -lbz2 -llzma -lzstd
+EXTRA_LIBS = -lz -lbz2 -llzma -lzstd
 
 [libs]
-archive = contrib/libarchive/libarchive/*.c :: -Icontrib/libarchive/libarchive -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\" -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib
-fetch = lib/libfetch/common.c lib/libfetch/fetch.c lib/libfetch/file.c lib/libfetch/ftp.c lib/libfetch/http.c :: -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -DINET -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include
+archive = contrib/libarchive/libarchive/*.c :: -Icontrib/libarchive/libarchive -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\"
+fetch = lib/libfetch/common.c lib/libfetch/fetch.c lib/libfetch/file.c lib/libfetch/ftp.c lib/libfetch/http.c :: -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -DINET
 
 [targets.cflags]
 -I${SRCDIR} -I${SRCDIR}/include -I${SRCDIR}/lib/libc/include
@@ -69,11 +69,11 @@ sed      = usr.bin/sed/compile.c usr.bin/sed/main.c usr.bin/sed/misc.c usr.bin/s
 awk      = contrib/one-true-awk/b.c contrib/one-true-awk/lex.c contrib/one-true-awk/lib.c contrib/one-true-awk/main.c contrib/one-true-awk/parse.c contrib/one-true-awk/proctab.c contrib/one-true-awk/run.c contrib/one-true-awk/tran.c contrib/one-true-awk/awkgram.tab.c :: -Icontrib/one-true-awk -DHAS_ISBLANK -DFOPEN_MAX=64
 diff     = usr.bin/diff/diff.c usr.bin/diff/diffdir.c usr.bin/diff/diffreg.c usr.bin/diff/xmalloc.c usr.bin/diff/pr.c :: -Iusr.bin/diff -include unistd.h
 patch    = usr.bin/patch/backupfile.c usr.bin/patch/inp.c usr.bin/patch/mkpath.c usr.bin/patch/patch.c usr.bin/patch/pch.c usr.bin/patch/util.c :: -Iusr.bin/patch
-gzip     = usr.bin/gzip/gzip.c :: -Iusr.bin/gzip -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib
+gzip     = usr.bin/gzip/gzip.c :: -Iusr.bin/gzip
 m4       = usr.bin/m4/eval.c usr.bin/m4/expr.c usr.bin/m4/gnum4.c usr.bin/m4/look.c usr.bin/m4/main.c usr.bin/m4/misc.c usr.bin/m4/trace.c usr.bin/m4/parser.c usr.bin/m4/tokenizer.c lib/libopenbsd/ohash.c :: -Iusr.bin/m4 -Ilib/libopenbsd -DEXTENDED -include stdlib.h -include unistd.h
 tar      = contrib/libarchive/tar/bsdtar.c contrib/libarchive/tar/cmdline.c contrib/libarchive/tar/creation_set.c contrib/libarchive/tar/read.c contrib/libarchive/tar/subst.c contrib/libarchive/tar/util.c contrib/libarchive/tar/write.c contrib/libarchive/libarchive_fe/err.c contrib/libarchive/libarchive_fe/line_reader.c contrib/libarchive/libarchive_fe/passphrase.c :: -Icontrib/libarchive/tar -Icontrib/libarchive/libarchive -Icontrib/libarchive/libarchive_fe -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\" -DBSDTAR_VERSION_STRING=\"3.7.4\" -larchive
 ping     = sbin/ping/main.c sbin/ping/ping.c sbin/ping/utils.c :: -Isbin/ping -DINET -include unistd.h
-fetch    = usr.bin/fetch/fetch.c :: -Iusr.bin/fetch -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include -lfetch -lssl -lcrypto
+fetch    = usr.bin/fetch/fetch.c :: -Iusr.bin/fetch -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -lfetch -lssl -lcrypto
 libutil.so = lib/libutil/auth.c lib/libutil/flopen.c lib/libutil/pw_util.c lib/libutil/stub.c lib/libc/gen/pw_scan.c :: -shared -fPIC -Wl,-soname,libutil.so -Ilib/libutil -Ilib/libc/gen
 libpam.so = contrib/openpam/lib/libpam/openpam_asprintf.c contrib/openpam/lib/libpam/openpam_borrow_cred.c contrib/openpam/lib/libpam/openpam_check_owner_perms.c contrib/openpam/lib/libpam/openpam_configure.c contrib/openpam/lib/libpam/openpam_constants.c contrib/openpam/lib/libpam/openpam_dispatch.c contrib/openpam/lib/libpam/openpam_dynamic.c contrib/openpam/lib/libpam/openpam_features.c contrib/openpam/lib/libpam/openpam_findenv.c contrib/openpam/lib/libpam/openpam_free_data.c contrib/openpam/lib/libpam/openpam_free_envlist.c contrib/openpam/lib/libpam/openpam_get_feature.c contrib/openpam/lib/libpam/openpam_get_option.c contrib/openpam/lib/libpam/openpam_load.c contrib/openpam/lib/libpam/openpam_log.c contrib/openpam/lib/libpam/openpam_nullconv.c contrib/openpam/lib/libpam/openpam_readline.c contrib/openpam/lib/libpam/openpam_readlinev.c contrib/openpam/lib/libpam/openpam_readword.c contrib/openpam/lib/libpam/openpam_restore_cred.c contrib/openpam/lib/libpam/openpam_set_feature.c contrib/openpam/lib/libpam/openpam_set_option.c contrib/openpam/lib/libpam/openpam_straddch.c contrib/openpam/lib/libpam/openpam_strlcat.c contrib/openpam/lib/libpam/openpam_strlcpy.c contrib/openpam/lib/libpam/openpam_strlset.c contrib/openpam/lib/libpam/openpam_subst.c contrib/openpam/lib/libpam/openpam_ttyconv.c contrib/openpam/lib/libpam/openpam_vasprintf.c contrib/openpam/lib/libpam/pam_acct_mgmt.c contrib/openpam/lib/libpam/pam_authenticate.c contrib/openpam/lib/libpam/pam_chauthtok.c contrib/openpam/lib/libpam/pam_close_session.c contrib/openpam/lib/libpam/pam_end.c contrib/openpam/lib/libpam/pam_error.c contrib/openpam/lib/libpam/pam_get_authtok.c contrib/openpam/lib/libpam/pam_get_data.c contrib/openpam/lib/libpam/pam_get_item.c contrib/openpam/lib/libpam/pam_get_user.c contrib/openpam/lib/libpam/pam_getenv.c contrib/openpam/lib/libpam/pam_getenvlist.c contrib/openpam/lib/libpam/pam_info.c contrib/openpam/lib/libpam/pam_open_session.c contrib/openpam/lib/libpam/pam_prompt.c contrib/openpam/lib/libpam/pam_putenv.c contrib/openpam/lib/libpam/pam_set_data.c contrib/openpam/lib/libpam/pam_set_item.c contrib/openpam/lib/libpam/pam_setcred.c contrib/openpam/lib/libpam/pam_setenv.c contrib/openpam/lib/libpam/pam_start.c contrib/openpam/lib/libpam/pam_strerror.c contrib/openpam/lib/libpam/pam_verror.c contrib/openpam/lib/libpam/pam_vinfo.c contrib/openpam/lib/libpam/pam_vprompt.c :: -shared -fPIC -Wl,-soname,libpam.so -DHAVE_CONFIG_H -Icontrib/openpam/include -Icontrib/openpam/lib/libpam -Ilib/libpam/modules -Ilib/libpam/modules/pam_login_access -Ilib/libpam/modules/pam_xdg
 pam/pam_deny.so = lib/libpam/modules/pam_deny/pam_deny.c :: -shared -fPIC -Wl,-soname,pam_deny.so -L${SRCDIR}/_build -lpam -DHAVE_CONFIG_H -Icontrib/openpam/include -Icontrib/openpam/lib/libpam -Ilib/libpam/modules
@@ -90,16 +90,11 @@ pam/pam_self.so = lib/libpam/modules/pam_self/pam_self.c :: -shared -fPIC -Wl,-s
 pam/pam_unix.so = lib/libpam/modules/pam_unix/pam_unix.c :: -shared -fPIC -Wl,-soname,pam_unix.so -L${SRCDIR}/_build -lpam -lutil -DHAVE_CONFIG_H -Icontrib/openpam/include -Icontrib/openpam/lib/libpam -Ilib/libpam/modules -Ilib/libutil -Ilib/libc/gen
 pam/pam_xdg.so = lib/libpam/modules/pam_xdg/pam_xdg.c :: -shared -fPIC -Wl,-soname,pam_xdg.so -L${SRCDIR}/_build -lpam -DHAVE_CONFIG_H -Icontrib/openpam/include -Icontrib/openpam/lib/libpam -Ilib/libpam/modules -Ilib/libpam/modules/pam_xdg
 su       = usr.bin/su/su.c :: -Iusr.bin/su -Ilib/libutil -include unistd.h -L${SRCDIR}/_build -lpam -lutil
-vi       = contrib/nvi/cl/cl_funcs.c contrib/nvi/cl/cl_main.c contrib/nvi/cl/cl_read.c contrib/nvi/cl/cl_screen.c contrib/nvi/cl/cl_term.c contrib/nvi/common/conv.c contrib/nvi/common/cut.c contrib/nvi/common/delete.c contrib/nvi/common/encoding.c contrib/nvi/common/exf.c contrib/nvi/common/key.c contrib/nvi/common/line.c contrib/nvi/common/log.c contrib/nvi/common/main.c contrib/nvi/common/mark.c contrib/nvi/common/msg.c contrib/nvi/common/options.c contrib/nvi/common/options_f.c contrib/nvi/common/put.c contrib/nvi/common/recover.c contrib/nvi/common/screen.c contrib/nvi/common/search.c contrib/nvi/common/seq.c contrib/nvi/common/util.c contrib/nvi/ex/ex.c contrib/nvi/ex/ex_abbrev.c contrib/nvi/ex/ex_append.c contrib/nvi/ex/ex_args.c contrib/nvi/ex/ex_argv.c contrib/nvi/ex/ex_at.c contrib/nvi/ex/ex_bang.c contrib/nvi/ex/ex_cd.c contrib/nvi/ex/ex_cmd.c contrib/nvi/ex/ex_cscope.c contrib/nvi/ex/ex_delete.c contrib/nvi/ex/ex_display.c contrib/nvi/ex/ex_edit.c contrib/nvi/ex/ex_equal.c contrib/nvi/ex/ex_file.c contrib/nvi/ex/ex_filter.c contrib/nvi/ex/ex_global.c contrib/nvi/ex/ex_init.c contrib/nvi/ex/ex_join.c contrib/nvi/ex/ex_map.c contrib/nvi/ex/ex_mark.c contrib/nvi/ex/ex_mkexrc.c contrib/nvi/ex/ex_move.c contrib/nvi/ex/ex_open.c contrib/nvi/ex/ex_preserve.c contrib/nvi/ex/ex_print.c contrib/nvi/ex/ex_put.c contrib/nvi/ex/ex_quit.c contrib/nvi/ex/ex_read.c contrib/nvi/ex/ex_screen.c contrib/nvi/ex/ex_script.c contrib/nvi/ex/ex_set.c contrib/nvi/ex/ex_shell.c contrib/nvi/ex/ex_shift.c contrib/nvi/ex/ex_source.c contrib/nvi/ex/ex_stop.c contrib/nvi/ex/ex_subst.c contrib/nvi/ex/ex_tag.c contrib/nvi/ex/ex_txt.c contrib/nvi/ex/ex_undo.c contrib/nvi/ex/ex_usage.c contrib/nvi/ex/ex_util.c contrib/nvi/ex/ex_version.c contrib/nvi/ex/ex_visual.c contrib/nvi/ex/ex_write.c contrib/nvi/ex/ex_yank.c contrib/nvi/ex/ex_z.c contrib/nvi/vi/getc.c contrib/nvi/vi/v_at.c contrib/nvi/vi/v_ch.c contrib/nvi/vi/v_cmd.c contrib/nvi/vi/v_delete.c contrib/nvi/vi/v_ex.c contrib/nvi/vi/v_increment.c contrib/nvi/vi/v_init.c contrib/nvi/vi/v_itxt.c contrib/nvi/vi/v_left.c contrib/nvi/vi/v_mark.c contrib/nvi/vi/v_match.c contrib/nvi/vi/v_paragraph.c contrib/nvi/vi/v_put.c contrib/nvi/vi/v_redraw.c contrib/nvi/vi/v_replace.c contrib/nvi/vi/v_right.c contrib/nvi/vi/v_screen.c contrib/nvi/vi/v_scroll.c contrib/nvi/vi/v_search.c contrib/nvi/vi/v_section.c contrib/nvi/vi/v_sentence.c contrib/nvi/vi/v_status.c contrib/nvi/vi/v_txt.c contrib/nvi/vi/v_ulcase.c contrib/nvi/vi/v_undo.c contrib/nvi/vi/v_util.c contrib/nvi/vi/v_word.c contrib/nvi/vi/v_xchar.c contrib/nvi/vi/v_yank.c contrib/nvi/vi/v_z.c contrib/nvi/vi/v_zexit.c contrib/nvi/vi/vi.c contrib/nvi/vi/vs_line.c contrib/nvi/vi/vs_msg.c contrib/nvi/vi/vs_refresh.c contrib/nvi/vi/vs_relative.c contrib/nvi/vi/vs_smap.c contrib/nvi/vi/vs_split.c contrib/nvi/regex/regcomp.c contrib/nvi/regex/regerror.c contrib/nvi/regex/regexec.c contrib/nvi/regex/regfree.c :: -Iusr.bin/vi -Icontrib/nvi -Icontrib/nvi/regex -Iusr.bin/vi/ex -D__REGEX_PRIVATE -DUSE_WIDECHAR -DHAVE_NCURSES_H -DHAVE_TERM_H -DHAVE_DIRENT_D_NAMLEN -D_XOPEN_SOURCE_EXTENDED=1 -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include -include unistd.h -L${PORTDIR}/../ncurses/${ARCH_STAGE} -lncursesw
+vi       = contrib/nvi/cl/cl_funcs.c contrib/nvi/cl/cl_main.c contrib/nvi/cl/cl_read.c contrib/nvi/cl/cl_screen.c contrib/nvi/cl/cl_term.c contrib/nvi/common/conv.c contrib/nvi/common/cut.c contrib/nvi/common/delete.c contrib/nvi/common/encoding.c contrib/nvi/common/exf.c contrib/nvi/common/key.c contrib/nvi/common/line.c contrib/nvi/common/log.c contrib/nvi/common/main.c contrib/nvi/common/mark.c contrib/nvi/common/msg.c contrib/nvi/common/options.c contrib/nvi/common/options_f.c contrib/nvi/common/put.c contrib/nvi/common/recover.c contrib/nvi/common/screen.c contrib/nvi/common/search.c contrib/nvi/common/seq.c contrib/nvi/common/util.c contrib/nvi/ex/ex.c contrib/nvi/ex/ex_abbrev.c contrib/nvi/ex/ex_append.c contrib/nvi/ex/ex_args.c contrib/nvi/ex/ex_argv.c contrib/nvi/ex/ex_at.c contrib/nvi/ex/ex_bang.c contrib/nvi/ex/ex_cd.c contrib/nvi/ex/ex_cmd.c contrib/nvi/ex/ex_cscope.c contrib/nvi/ex/ex_delete.c contrib/nvi/ex/ex_display.c contrib/nvi/ex/ex_edit.c contrib/nvi/ex/ex_equal.c contrib/nvi/ex/ex_file.c contrib/nvi/ex/ex_filter.c contrib/nvi/ex/ex_global.c contrib/nvi/ex/ex_init.c contrib/nvi/ex/ex_join.c contrib/nvi/ex/ex_map.c contrib/nvi/ex/ex_mark.c contrib/nvi/ex/ex_mkexrc.c contrib/nvi/ex/ex_move.c contrib/nvi/ex/ex_open.c contrib/nvi/ex/ex_preserve.c contrib/nvi/ex/ex_print.c contrib/nvi/ex/ex_put.c contrib/nvi/ex/ex_quit.c contrib/nvi/ex/ex_read.c contrib/nvi/ex/ex_screen.c contrib/nvi/ex/ex_script.c contrib/nvi/ex/ex_set.c contrib/nvi/ex/ex_shell.c contrib/nvi/ex/ex_shift.c contrib/nvi/ex/ex_source.c contrib/nvi/ex/ex_stop.c contrib/nvi/ex/ex_subst.c contrib/nvi/ex/ex_tag.c contrib/nvi/ex/ex_txt.c contrib/nvi/ex/ex_undo.c contrib/nvi/ex/ex_usage.c contrib/nvi/ex/ex_util.c contrib/nvi/ex/ex_version.c contrib/nvi/ex/ex_visual.c contrib/nvi/ex/ex_write.c contrib/nvi/ex/ex_yank.c contrib/nvi/ex/ex_z.c contrib/nvi/vi/getc.c contrib/nvi/vi/v_at.c contrib/nvi/vi/v_ch.c contrib/nvi/vi/v_cmd.c contrib/nvi/vi/v_delete.c contrib/nvi/vi/v_ex.c contrib/nvi/vi/v_increment.c contrib/nvi/vi/v_init.c contrib/nvi/vi/v_itxt.c contrib/nvi/vi/v_left.c contrib/nvi/vi/v_mark.c contrib/nvi/vi/v_match.c contrib/nvi/vi/v_paragraph.c contrib/nvi/vi/v_put.c contrib/nvi/vi/v_redraw.c contrib/nvi/vi/v_replace.c contrib/nvi/vi/v_right.c contrib/nvi/vi/v_screen.c contrib/nvi/vi/v_scroll.c contrib/nvi/vi/v_search.c contrib/nvi/vi/v_section.c contrib/nvi/vi/v_sentence.c contrib/nvi/vi/v_status.c contrib/nvi/vi/v_txt.c contrib/nvi/vi/v_ulcase.c contrib/nvi/vi/v_undo.c contrib/nvi/vi/v_util.c contrib/nvi/vi/v_word.c contrib/nvi/vi/v_xchar.c contrib/nvi/vi/v_yank.c contrib/nvi/vi/v_z.c contrib/nvi/vi/v_zexit.c contrib/nvi/vi/vi.c contrib/nvi/vi/vs_line.c contrib/nvi/vi/vs_msg.c contrib/nvi/vi/vs_refresh.c contrib/nvi/vi/vs_relative.c contrib/nvi/vi/vs_smap.c contrib/nvi/vi/vs_split.c contrib/nvi/regex/regcomp.c contrib/nvi/regex/regerror.c contrib/nvi/regex/regexec.c contrib/nvi/regex/regfree.c :: -Iusr.bin/vi -Icontrib/nvi -Icontrib/nvi/regex -Iusr.bin/vi/ex -D__REGEX_PRIVATE -DUSE_WIDECHAR -DHAVE_NCURSES_H -DHAVE_TERM_H -DHAVE_DIRENT_D_NAMLEN -D_XOPEN_SOURCE_EXTENDED=1 -include unistd.h -lncursesw
 
 [prepare]
 ln -sfn ${MACHINE}/include ${SRCDIR}/sys/machine
 ln -sfn sys/x86/include ${SRCDIR}/x86
-# Create ncurses.h symlink for nvi (ncurses builds curses.h, not ncurses.h)
-NCURSES_INC=${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include
-if [ -f "$NCURSES_INC/curses.h" ] && [ ! -f "$NCURSES_INC/ncurses.h" ]; then
-    ln -sfn curses.h "$NCURSES_INC/ncurses.h"
-fi
 # Generate awk grammar and proctab on host
 cd ${SRCDIR}/contrib/one-true-awk
 yacc -d awkgram.y
@@ -128,59 +123,40 @@ cp ${PORTDIR}/files/openpam/pam.d/system ${SRCDIR}/saltyos-files/etc/pam.d/syste
 cp ${PORTDIR}/files/openpam/pam.d/other ${SRCDIR}/saltyos-files/etc/pam.d/other
 cp ${PORTDIR}/files/openpam/ttys ${SRCDIR}/saltyos-files/etc/ttys
 
-[install]
-bin/echo = _build/echo
-bin/cat = _build/cat
-bin/ls = _build/ls
-bin/cp = _build/cp
-bin/mv = _build/mv
-bin/rm = _build/rm
-bin/mkdir = _build/mkdir
-bin/rmdir = _build/rmdir
-bin/ln = _build/ln
-bin/chmod = _build/chmod
-bin/test = _build/test
-bin/sleep = _build/sleep
-bin/pwd = _build/pwd
-usr/bin/head = _build/head
-usr/bin/tail = _build/tail
-usr/bin/wc = _build/wc
-usr/bin/sort = _build/sort
-usr/bin/uniq = _build/uniq
-usr/bin/basename = _build/basename
-usr/bin/dirname = _build/dirname
-usr/bin/env = _build/env
-usr/bin/tee = _build/tee
-usr/bin/id = _build/id
-usr/bin/uname = _build/uname
-usr/bin/true = _build/true
-usr/bin/false = _build/false
-usr/bin/grep = _build/grep
-usr/bin/find = _build/find
-usr/bin/xargs = _build/xargs
-bin/kill = _build/kill
-bin/date = _build/date
-usr/bin/touch = _build/touch
-usr/bin/tr = _build/tr
-usr/bin/cut = _build/cut
-usr/bin/stat = _build/stat
-# stat dispatches on argv[0]: behaves as readlink when called as readlink
-usr/bin/readlink = _build/stat
-usr/bin/sed = _build/sed
-usr/bin/awk = _build/awk
-usr/bin/diff = _build/diff
-usr/bin/patch = _build/patch
-usr/bin/gzip = _build/gzip
-usr/bin/gunzip = _build/gzip
-usr/bin/zcat = _build/gzip
-usr/bin/m4 = _build/m4
-usr/bin/tar = _build/tar
-sbin/ping = _build/ping
-usr/bin/fetch = _build/fetch
-usr/lib/libutil.so = _build/libutil.so
-usr/lib/libpam.so = _build/libpam.so
-usr/lib/pam = _build/pam
-etc/pam.d = saltyos-files/etc/pam.d
-etc/ttys = saltyos-files/etc/ttys
-usr/bin/su = _build/su
-usr/bin/vi = _build/vi
+[stage]
+mode = script
+commands =
+    SRC=${SRCDIR}
+    B=${SRCDIR}/_build
+    S=${STAGE}
+    install -d ${S}/bin ${S}/sbin ${S}/usr/bin ${S}/usr/lib ${S}/usr/lib/pam ${S}/etc/pam.d
+    # /bin core utilities
+    for t in echo cat ls cp mv rm mkdir rmdir ln chmod test sleep pwd kill date; do
+        install -m 0755 $B/$t ${S}/bin/$t
+    done
+    # /usr/bin utilities
+    for t in head tail wc sort uniq basename dirname env tee id uname true false grep xargs \
+             stat tr cut touch find sed awk diff patch gzip m4 tar fetch su vi; do
+        install -m 0755 $B/$t ${S}/usr/bin/$t
+    done
+    # /sbin utilities
+    install -m 0755 $B/ping ${S}/sbin/ping
+    # stat dispatches on argv[0]: behaves as readlink when called as readlink
+    ln -sf stat ${S}/usr/bin/readlink
+    # gzip aliases
+    ln -sf gzip ${S}/usr/bin/gunzip
+    ln -sf gzip ${S}/usr/bin/zcat
+    # Shared libraries and PAM modules
+    install -m 0755 $B/libutil.so ${S}/usr/lib/libutil.so
+    install -m 0755 $B/libpam.so ${S}/usr/lib/libpam.so
+    for m in pam_deny pam_echo pam_ftpusers pam_group pam_guest pam_login_access \
+             pam_nologin pam_permit pam_rootok pam_securetty pam_self pam_unix pam_xdg; do
+        install -m 0755 $B/pam/$m.so ${S}/usr/lib/pam/$m.so
+    done
+    # PAM config + ttys
+    install -m 0644 $SRC/saltyos-files/etc/pam.d/login ${S}/etc/pam.d/login
+    install -m 0644 $SRC/saltyos-files/etc/pam.d/su ${S}/etc/pam.d/su
+    install -m 0644 $SRC/saltyos-files/etc/pam.d/sudo ${S}/etc/pam.d/sudo
+    install -m 0644 $SRC/saltyos-files/etc/pam.d/system ${S}/etc/pam.d/system
+    install -m 0644 $SRC/saltyos-files/etc/pam.d/other ${S}/etc/pam.d/other
+    install -m 0644 $SRC/saltyos-files/etc/ttys ${S}/etc/ttys

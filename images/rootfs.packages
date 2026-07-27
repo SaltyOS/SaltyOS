@@ -2,6 +2,7 @@ bash
 freebsd-utils
 ncurses
 nano
+htop
 nasm
 make
 zlib

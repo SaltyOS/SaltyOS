@@ -2,15 +2,16 @@
 //! Moved from crate root module for POSIX subsystem separation.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::*;
 
 use crate::base::proc_table::{
-    find_by_badge, find_by_pid, proctab, proctab_cap, NSIG, ProcessState,
-    SIG_DISP_CATCH, SIG_DISP_DFL, SIG_DISP_IGN,
+    COMPLETION_EVENT_CONTINUED, COMPLETION_EVENT_NONE, COMPLETION_EVENT_STOPPED, NSIG,
+    ProcessState, SIG_DISP_CATCH, SIG_DISP_DFL, SIG_DISP_IGN, find_by_badge, find_by_pid, proctab,
+    proctab_cap,
 };
 
 fn signal_ntfn(ntfn: Cap, bits: u64) {
-    trona::syscall::syscall(trona::SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
+    trona_kernel::syscall::syscall(uapi::KERNITE_SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
 }
 
 fn sig_default_is_terminate(sig: usize) -> bool {
@@ -38,13 +39,20 @@ unsafe fn sig_stop_proc(idx: usize, sig: usize) {
             return;
         }
 
-        let _ = trona::invoke::tcb_suspend(proctab(idx).tcb_cap);
+        let _ = trona_kernel::invoke::tcb_suspend(proctab(idx).tcb_cap);
         proctab(idx).state = ProcessState::Stopped;
         proctab(idx).stop_status = ((sig as i32) << 8) | 0x7f;
+        proctab(idx).completion_event_kind = COMPLETION_EVENT_STOPPED;
+        proctab(idx).completion_event_status = proctab(idx).stop_status;
+        if !crate::lifecycle::exit::publish_completion_event(idx) {
+            proctab(idx).completion_event_kind = COMPLETION_EVENT_NONE;
+            proctab(idx).completion_event_status = 0;
+        }
 
         let ppid = proctab(idx).ppid;
         if let Some(pi) = find_by_pid(ppid) {
-            if (proctab(pi).state == ProcessState::Running || proctab(pi).state == ProcessState::Stopped)
+            if (proctab(pi).state == ProcessState::Running
+                || proctab(pi).state == ProcessState::Stopped)
                 && proctab(pi).is_posix()
                 && proctab(pi).signal_ntfn != 0
                 && proctab(pi).posix().sig_disposition[super::PM_SIGCHLD] == SIG_DISP_CATCH
@@ -67,7 +75,8 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
 /// Returns true if the signal was delivered (or ignored), false if target invalid.
 pub(crate) unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
     unsafe {
-        if proctab(ti).state != ProcessState::Running && proctab(ti).state != ProcessState::Stopped {
+        if proctab(ti).state != ProcessState::Running && proctab(ti).state != ProcessState::Stopped
+        {
             return false;
         }
 
@@ -87,13 +96,42 @@ pub(crate) unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
         // SIGCONT: resume stopped
         if sig == super::PM_SIGCONT {
             if proctab(ti).state == ProcessState::Stopped {
-                trona::invoke::invoke(proctab(ti).tcb_cap, trona::TCB_RESUME, 0, 0, 0, 0);
+                trona_kernel::invoke::invoke(
+                    proctab(ti).tcb_cap,
+                    uapi::KERNITE_TCB_RESUME,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
                 proctab(ti).state = ProcessState::Running;
-                proctab(ti).stop_status = 0;
+                let preserve_queued_stop = find_by_pid(proctab(ti).completion_observer_pid)
+                    .is_some_and(|observer_idx| {
+                        crate::lifecycle::wait::observer_has_pending_event(
+                            observer_idx,
+                            proctab(ti).pid,
+                            COMPLETION_EVENT_STOPPED,
+                        )
+                    });
+                if preserve_queued_stop {
+                    // Preserve a pending STOPPED completion until an
+                    // observer consumes it. The later CONTINUED event
+                    // is dropped rather than overwriting the earlier
+                    // published state.
+                } else {
+                    proctab(ti).stop_status = 0;
+                    proctab(ti).completion_event_kind = COMPLETION_EVENT_CONTINUED;
+                    proctab(ti).completion_event_status = 0;
+                    if !crate::lifecycle::exit::publish_completion_event(ti) {
+                        proctab(ti).completion_event_kind = COMPLETION_EVENT_NONE;
+                        proctab(ti).completion_event_status = 0;
+                    }
+                }
 
                 let ppid = proctab(ti).ppid;
                 if let Some(pi) = find_by_pid(ppid) {
-                    if (proctab(pi).state == ProcessState::Running || proctab(pi).state == ProcessState::Stopped)
+                    if (proctab(pi).state == ProcessState::Running
+                        || proctab(pi).state == ProcessState::Stopped)
                         && proctab(pi).is_posix()
                         && proctab(pi).signal_ntfn != 0
                         && proctab(pi).posix().sig_disposition[super::PM_SIGCHLD] == SIG_DISP_CATCH
@@ -182,7 +220,7 @@ pub(crate) unsafe fn handle_kill(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         };
 
         if !deliver_signal_to(ti, sig) {
-            reply.label = trona::TRONA_BUSY;
+            reply.label = trona_protocol::posix::TRONA_BUSY;
             return;
         }
 
@@ -191,7 +229,7 @@ pub(crate) unsafe fn handle_kill(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
     }
 }
 
-/// PM_KILL_PGID: send signal to an explicit process group.
+/// INIT_KILL_PGID: send signal to an explicit process group.
 /// Called by posix_ttysrv when ISIG chars arrive (e.g., Ctrl-C -> SIGINT to fg_pgrp).
 /// msg.regs[0] = target_pgid, msg.regs[1] = sig
 pub(crate) unsafe fn handle_kill_pgid(msg: &TronaMsg, reply: &mut TronaMsg) {
@@ -222,7 +260,7 @@ pub(crate) unsafe fn handle_kill_pgid(msg: &TronaMsg, reply: &mut TronaMsg) {
 }
 
 /// PM_INJECT_CAP: inject a capability into a child's CSpace.
-/// Called by init after pm_spawn to deliver NeedEP/CopyCap caps.
+/// Called by init after pm_spawn to deliver provider/source-slot attachments.
 ///   msg.regs[0] = target PID
 ///   msg.regs[1] = dst_slot in child's CSpace
 ///   msg.regs[2] = badge to apply (0 = plain move/copy)
@@ -251,21 +289,22 @@ pub(crate) unsafe fn handle_inject_cap(msg: &TronaMsg, reply: &mut TronaMsg) {
         // Plain injection moves the cap into the child slot. Badged injection
         // mints a derived endpoint into the child and clears the scratch slot.
         let err = if badge == 0 {
-            trona::invoke::cnode_move(
+            trona_kernel::invoke::cnode_move(
                 child_cn,
                 dst_slot,
                 crate::CAP_SELF_CSPACE,
                 crate::CAP_RECV_SCRATCH,
             )
         } else {
-            let mint_err = trona::invoke::cnode_mint(
+            let mint_err = trona_kernel::invoke::cnode_mint(
                 crate::CAP_SELF_CSPACE,
                 crate::CAP_RECV_SCRATCH,
                 child_cn,
                 dst_slot,
                 badge,
             );
-            let _ = trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, crate::CAP_RECV_SCRATCH);
+            let _ =
+                trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, crate::CAP_RECV_SCRATCH);
             mint_err
         };
         reply.label = if err == 0 {
@@ -289,7 +328,7 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
             }
         };
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] pm_resume enter pid=");
             _lb.hex(pid as u64);
             _lb.str(b" state=");
@@ -315,15 +354,47 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
         }
 
         proctab(idx).state = ProcessState::Running;
-        proctab(idx).stop_status = 0;
+        let preserve_stop =
+            find_by_pid(proctab(idx).completion_observer_pid).is_some_and(|observer_idx| {
+                crate::lifecycle::wait::observer_has_pending_event(
+                    observer_idx,
+                    proctab(idx).pid,
+                    COMPLETION_EVENT_STOPPED,
+                )
+            });
+        if !preserve_stop {
+            proctab(idx).completion_event_kind = COMPLETION_EVENT_NONE;
+            proctab(idx).completion_event_status = 0;
+            proctab(idx).stop_status = 0;
+        }
 
         if proctab(idx).wait_ready_on_resume {
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[PROCMGR] pm_resume immediate-resume-for-readiness pid=");
                 _lb.hex(pid as u64);
                 _lb.str(b"\n");
             });
-            let err = trona::invoke::tcb_resume(proctab(idx).tcb_cap);
+            if crate::base::readiness::defer_readiness(idx) {
+                let err = trona_kernel::invoke::tcb_resume(proctab(idx).tcb_cap);
+                if err != 0 {
+                    proctab(idx).state = ProcessState::Stopped;
+                    let _ = crate::base::readiness::cancel_deferred_readiness(
+                        idx,
+                        crate::TRONA_INVALID_OPERATION,
+                    );
+                    return true;
+                }
+
+                proctab(idx).wait_ready_on_resume = false;
+                trona_runtime::udebug!(|_lb| {
+                    _lb.str(b"[PROCMGR] pm_resume deferred-readiness-reply pid=");
+                    _lb.hex(pid as u64);
+                    _lb.str(b"\n");
+                });
+                return true;
+            }
+
+            let err = trona_kernel::invoke::tcb_resume(proctab(idx).tcb_cap);
             if err != 0 {
                 proctab(idx).state = ProcessState::Stopped;
                 reply.label = crate::TRONA_INVALID_OPERATION;
@@ -331,15 +402,6 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
             }
 
             proctab(idx).wait_ready_on_resume = false;
-            // ready_badge_bit and ready_timeout_ns already set from spawn time
-            if crate::base::readiness::defer_readiness(idx) {
-                trona::udebug!(|_lb| {
-                    _lb.str(b"[PROCMGR] pm_resume deferred-readiness-reply pid=");
-                    _lb.hex(pid as u64);
-                    _lb.str(b"\n");
-                });
-                return true;
-            }
             // Defer failed — release the badge bit, clear fields, reply immediately
             {
                 let p = proctab(idx);
@@ -348,7 +410,7 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
                 p.ready_timeout_ns = 0;
             }
         } else if crate::server::enqueue_post_reply_resume(proctab(idx).tcb_cap) {
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[PROCMGR] pm_resume queued-post-reply pid=");
                 _lb.hex(pid as u64);
                 _lb.str(b" tcb=");
@@ -356,15 +418,15 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
                 _lb.str(b"\n");
             });
         } else {
-            trona::uwarn!(|_lb| {
+            trona_runtime::uwarn!(|_lb| {
                 _lb.str(b"[PROCMGR] WARN: post-reply resume queue full, resuming immediately\n");
             });
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[PROCMGR] pm_resume fallback-immediate pid=");
                 _lb.hex(pid as u64);
                 _lb.str(b"\n");
             });
-            let err = trona::invoke::tcb_resume(proctab(idx).tcb_cap);
+            let err = trona_kernel::invoke::tcb_resume(proctab(idx).tcb_cap);
             if err != 0 {
                 proctab(idx).state = ProcessState::Stopped;
                 reply.label = crate::TRONA_INVALID_OPERATION;
@@ -374,7 +436,7 @@ pub(crate) unsafe fn handle_resume(msg: &TronaMsg, reply: &mut TronaMsg) -> bool
 
         reply.label = crate::TRONA_OK;
         reply.length = 0;
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] pm_resume reply-ready pid=");
             _lb.hex(pid as u64);
             _lb.str(b"\n");

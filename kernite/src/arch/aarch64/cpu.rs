@@ -8,10 +8,15 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+unsafe extern "C" {
+    fn aarch64_cpu_write_tpidr_el1(value: u64);
+    fn aarch64_cpu_read_tpidr_el1() -> u64;
+}
+
 /// Per-CPU data structure.
 ///
 /// Accessed via the active host TPIDR register → pointer → field offset.
-/// Layout must be `#[repr(C)]` for stable offsets used by inline assembly.
+/// Layout must be `#[repr(C)]` for stable offsets used by explicit assembly.
 #[repr(C)]
 pub struct PerCpuData {
     /// Logical CPU index (0 = BSP).
@@ -57,19 +62,15 @@ static AP_CLAIMED: [AtomicBool; super::MAX_CPUS] =
 fn write_host_tpidr(val: u64) {
     // SAFETY: Writing TPIDR_EL1 is safe from EL1 kernel context.
     unsafe {
-        core::arch::asm!("msr TPIDR_EL1, {}", in(reg) val, options(nomem, nostack));
+        aarch64_cpu_write_tpidr_el1(val);
     }
 }
 
 /// Read TPIDR_EL1 (per-CPU data base pointer).
 #[inline(always)]
 fn read_host_tpidr() -> u64 {
-    let val: u64;
     // SAFETY: Reading TPIDR_EL1 is always safe from EL1 kernel context.
-    unsafe {
-        core::arch::asm!("mrs {}, TPIDR_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_cpu_read_tpidr_el1() }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,20 @@ pub fn set_kernel_stack(stack_top: u64) {
     unsafe {
         let ptr = (base + 8) as *mut u64;
         core::ptr::write_volatile(ptr, stack_top);
+    }
+}
+
+/// Return the kernel stack top for the current CPU.
+pub fn get_kernel_stack() -> u64 {
+    let base = read_host_tpidr();
+    if base == 0 {
+        return 0;
+    }
+    // SAFETY: The active host TPIDR points to a valid PerCpuData;
+    // kernel_stack_top is at offset 8.
+    unsafe {
+        let ptr = (base + 8) as *const u64;
+        core::ptr::read_volatile(ptr)
     }
 }
 

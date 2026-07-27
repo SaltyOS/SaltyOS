@@ -14,8 +14,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::Cap;
-use trona::types::TronaMsg;
+use trona_kernel::core_types::Cap;
+use trona_kernel::core_types::TronaMsg;
 
 /// Maximum objects tracked explicitly per reservation. Rollback also sweeps
 /// the full reserved slot range defensively, so this limit is best-effort.
@@ -101,22 +101,24 @@ impl Allocator {
     // -----------------------------------------------------------------------
 
     pub fn alloc_slots(&mut self, count: usize) -> Option<(Cap, usize)> {
-        let base = trona::slot_alloc::slot_alloc_consecutive(count as u64)?;
+        let base = trona_runtime::core::slot_alloc::slot_alloc_consecutive(count as u64)?;
         Some((base, count))
     }
 
-    pub fn mark_slot_used(&mut self, _slot: Cap) {}
+    pub fn mark_slot_used(&mut self, slot: Cap) -> bool {
+        trona_runtime::core::slot_alloc::slot_mark_used(slot)
+    }
 
     pub fn free_slots(&mut self, base: Cap, count: usize) {
-        trona::slot_alloc::slot_free_range(base, count as u64);
+        trona_runtime::core::slot_alloc::slot_free_range(base, count as u64);
     }
 
     pub fn alloc_single_slot(&mut self) -> Option<Cap> {
-        trona::slot_alloc::slot_alloc()
+        trona_runtime::core::slot_alloc::slot_alloc()
     }
 
     pub fn free_single_slot(&mut self, slot: Cap) {
-        let _ = trona::slot_alloc::slot_free(slot);
+        let _ = trona_runtime::core::slot_alloc::slot_free(slot);
     }
 
     // -----------------------------------------------------------------------
@@ -131,10 +133,11 @@ impl Allocator {
         if self.reservation.active {
             return false;
         }
-        let slot_base = match trona::slot_alloc::slot_alloc_consecutive(total_slots as u64) {
-            Some(base) => base,
-            None => return false,
-        };
+        let slot_base =
+            match trona_runtime::core::slot_alloc::slot_alloc_consecutive(total_slots as u64) {
+                Some(base) => base,
+                None => return false,
+            };
         self.reservation = Reservation {
             active: true,
             slot_base,
@@ -188,13 +191,13 @@ impl Allocator {
         // any leftover caps that bypassed the reservation accounting.
         for off in 0..self.reservation.slot_count {
             let slot = self.reservation.slot_base + off as Cap;
-            let err = trona::invoke::cnode_revoke(self.cap_self_cspace, slot);
+            let err = trona_kernel::invoke::cnode_revoke(self.cap_self_cspace, slot);
             if err != 0 {
-                trona::invoke::cnode_delete(self.cap_self_cspace, slot);
+                trona_kernel::invoke::cnode_delete(self.cap_self_cspace, slot);
             }
         }
 
-        trona::slot_alloc::slot_free_range(
+        trona_runtime::core::slot_alloc::slot_free_range(
             self.reservation.slot_base,
             self.reservation.slot_count as u64,
         );
@@ -216,10 +219,10 @@ impl Allocator {
         size_bits: u64,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(trona::TRONA_INVALID_OPERATION as i32);
+            return Err(trona_protocol::posix::TRONA_INVALID_OPERATION as i32);
         }
         if self.reservation.next_offset >= self.reservation.slot_count {
-            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
+            return Err(trona_protocol::posix::TRONA_OUT_OF_MEMORY as i32);
         }
         let offset = self.reservation.next_offset;
         self.reservation.next_offset += 1;
@@ -245,10 +248,10 @@ impl Allocator {
         offset: usize,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(trona::TRONA_INVALID_OPERATION as i32);
+            return Err(trona_protocol::posix::TRONA_INVALID_OPERATION as i32);
         }
         if offset >= self.reservation.slot_count {
-            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
+            return Err(trona_protocol::posix::TRONA_OUT_OF_MEMORY as i32);
         }
         let slot = self.reservation_slot(offset);
         let handle = alloc_object_into_slot(
@@ -292,7 +295,8 @@ pub fn alloc_single(
     obj_type: u64,
     size_bits: u64,
 ) -> Result<(Cap, u64), i32> {
-    let slot = trona::slot_alloc::slot_alloc().ok_or(trona::TRONA_OUT_OF_MEMORY as i32)?;
+    let slot = trona_runtime::core::slot_alloc::slot_alloc()
+        .ok_or(trona_protocol::posix::TRONA_OUT_OF_MEMORY as i32)?;
     match alloc_object_into_slot(
         rsrcsrv_ep,
         owner_id,
@@ -303,7 +307,7 @@ pub fn alloc_single(
     ) {
         Ok(handle) => Ok((slot, handle)),
         Err(e) => {
-            let _ = trona::slot_alloc::slot_free(slot);
+            let _ = trona_runtime::core::slot_alloc::slot_free(slot);
             Err(e)
         }
     }
@@ -311,13 +315,13 @@ pub fn alloc_single(
 
 pub fn free_handle(rsrcsrv_ep: Cap, owner_id: u64, handle: u64) -> i32 {
     let mut req = TronaMsg::zeroed();
-    req.label = trona::protocol::RES_FREE_HANDLE;
+    req.label = trona_protocol::RES_FREE_HANDLE;
     req.length = 2;
     req.regs[0] = owner_id;
     req.regs[1] = handle;
     let mut resp = TronaMsg::zeroed();
     let err = unsafe {
-        trona::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
+        trona_kernel::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
     };
     if err != 0 {
         return err;
@@ -327,12 +331,12 @@ pub fn free_handle(rsrcsrv_ep: Cap, owner_id: u64, handle: u64) -> i32 {
 
 pub fn reclaim_owner(rsrcsrv_ep: Cap, owner_id: u64) -> i32 {
     let mut req = TronaMsg::zeroed();
-    req.label = trona::protocol::RES_RECLAIM_OWNER;
+    req.label = trona_protocol::RES_RECLAIM_OWNER;
     req.length = 1;
     req.regs[0] = owner_id;
     let mut resp = TronaMsg::zeroed();
     let err = unsafe {
-        trona::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
+        trona_kernel::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
     };
     if err != 0 {
         return err;
@@ -354,10 +358,15 @@ fn alloc_object_into_slot(
     dest_slot: Cap,
 ) -> Result<u64, i32> {
     unsafe {
-        trona::ipc::set_receive_slot_ctx(crate::ipc_ctx(), cap_self_cspace, dest_slot, 0);
+        trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+            crate::ipc_ctx(),
+            cap_self_cspace,
+            dest_slot,
+            0,
+        );
     }
     let mut req = TronaMsg::zeroed();
-    req.label = trona::protocol::RES_ALLOC_OBJECT;
+    req.label = trona_protocol::RES_ALLOC_OBJECT;
     req.length = 4;
     req.regs[0] = owner_id;
     req.regs[1] = obj_type;
@@ -365,12 +374,12 @@ fn alloc_object_into_slot(
     req.regs[3] = 0;
     let mut resp = TronaMsg::zeroed();
     let err = unsafe {
-        trona::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
+        trona_kernel::ipc::call_ctx(crate::ipc_ctx(), rsrcsrv_ep, &raw const req, &raw mut resp)
     };
     if err != 0 {
         return Err(err);
     }
-    if resp.label != trona::TRONA_OK {
+    if resp.label != trona_protocol::common::TRONA_OK {
         return Err(resp.label as i32);
     }
     Ok(resp.regs[0])

@@ -1,15 +1,24 @@
 [Service]
 Name=console
 Binary=/bin/console
-Type=notify
+Type=broker
 Restart=always
-PreProcmgr=yes
 
 [Dependencies]
-After=
-Before=procmgr namesrv vfs
+After=mmsrv ldsrv
+Before=vfs
+Requires.aarch64=com1_ioport.cap com1_irq.cap
+Requires.x86_64=com1_ioport.cap com1_irq.cap kbd_ioport.cap kbd_irq.cap
+RequiresInterface=mmsrv:process-client
 
-[Capabilities]
-CopyCap.aarch64=8:64 9:65 10:66
-CopyCap.x86_64=8:64 9:65 10:66 6:69 7:70
-NeedEP=posix_ttysrv:67 dispdrv:68
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

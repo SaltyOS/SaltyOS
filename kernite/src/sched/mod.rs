@@ -1,20 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Scheduler
 //!
-//! EDF (Earliest Deadline First) with budget enforcement.
-//!
-//! SPDX-License-Identifier: GPL-2.0-only
+//! Class-based scheduler:
+//! - general tasks use Fair/EEVDF-style virtual-runtime accounting
+//! - future RT workloads use RT FIFO
+//! - explicit scheduling-context workloads use Deadline
+//! - idle threads stay in the Idle class
 
+pub mod class;
+pub mod control;
+pub mod deadline_queue;
 pub mod pip;
 pub mod scheduler;
-pub mod sleep_queue;
 pub mod thread;
 
 // Re-exports for public API
 pub use thread::Tcb;
 
+/// Scheduler tick frequency (Hz). Must stay in sync with
+/// `lib/trona/uapi/consts/kernel.rs::TICKS_PER_SEC`.
+///
+/// One timer tick = 1 / `TICKS_PER_SEC` seconds. Used by sysctlfs /
+/// procfs compatibility projections that still render Linux/FreeBSD-style
+/// tick counters from the kernel's runtime-nanosecond accounting.
+pub const TICKS_PER_SEC: u64 = 100;
+
 use crate::arch;
 use crate::arch::MAX_CPUS;
-use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
+use crate::mm::{PAGE_SIZE, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, pmm_alloc};
 
 /// Idle thread stack size
 const IDLE_STACK_SIZE: usize = PAGE_SIZE;
@@ -36,8 +49,15 @@ extern "C" fn idle_thread() -> ! {
         // with_lock acquires scheduler lock internally and calls kernel_exit_epilogue
         scheduler().with_lock(|_| {});
 
-        // Flush any deferred TCB destruction from sched_ref release
-        unsafe { scheduler().flush_deferred_current_release(); }
+        // Flush any deferred TCB destruction from the current[] slot
+        // transition (the only per-CPU persistent deferred slot). Other
+        // sched_ref releases (ready queue, pending_enqueue, stale skips)
+        // now travel through ephemeral `DeferredReleaseList` stack-local
+        // batches that are drained by each scheduler API before it
+        // returns, so no separate flush is needed here.
+        unsafe {
+            scheduler().flush_deferred_current_release();
+        }
 
         // BSP also processes deferred free (only BSP to avoid concurrent manipulation)
         if arch::current_cpu() == 0 {
@@ -64,8 +84,9 @@ pub fn init() {
     // Initialize bootstrap thread context first
     // This represents the thread currently running kmain
     unsafe {
-        BOOTSTRAP_TCB.state = crate::sched::thread::ThreadState::Running;
-        BOOTSTRAP_TCB.priority = 0; // Higher priority than idle
+        crate::task::wait::mark_runnable_locked(&raw mut BOOTSTRAP_TCB);
+        BOOTSTRAP_TCB.sched_class = crate::sched::class::SCHED_CLASS_FAIR;
+        BOOTSTRAP_TCB.priority = 0;
         BOOTSTRAP_TCB.sched_context = core::ptr::null_mut();
         BOOTSTRAP_TCB.vspace_root = core::ptr::null_mut();
         BOOTSTRAP_TCB.cspace_root = core::ptr::null_mut();
@@ -83,14 +104,17 @@ pub fn init() {
 
     // Initialize idle thread context
     unsafe {
-        (*idle_tcb).state = crate::sched::thread::ThreadState::Ready;
-        (*idle_tcb).priority = u64::MAX; // Lowest priority (infinite deadline)
-        (*idle_tcb).sched_context = core::ptr::null_mut(); // No scheduling context
+        (*idle_tcb).ensure_trace_id();
+        crate::task::wait::mark_runnable_locked(idle_tcb);
+        (*idle_tcb).sched_class = crate::sched::class::SCHED_CLASS_IDLE;
+        (*idle_tcb).priority = crate::sched::thread::Tcb::encode_idle_priority();
+        (*idle_tcb).base_priority = (*idle_tcb).priority;
+        (*idle_tcb).sched_context = core::ptr::null_mut();
         (*idle_tcb).vspace_root = core::ptr::null_mut();
         (*idle_tcb).cspace_root = core::ptr::null_mut();
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
-        (*idle_tcb).cpu_affinity = 0; // Pin idle thread to BSP
+        (*idle_tcb).cpu_affinity = 0;
         (*idle_tcb).stack_canary = crate::arch::generate_stack_canary();
     }
 
@@ -135,8 +159,11 @@ pub fn init_cpu(cpu_id: usize) {
     let idle_tcb = unsafe { allocate_idle_tcb(cpu_id) };
 
     unsafe {
-        (*idle_tcb).state = crate::sched::thread::ThreadState::Ready;
-        (*idle_tcb).priority = u64::MAX;
+        (*idle_tcb).ensure_trace_id();
+        crate::task::wait::mark_runnable_locked(idle_tcb);
+        (*idle_tcb).sched_class = crate::sched::class::SCHED_CLASS_IDLE;
+        (*idle_tcb).priority = crate::sched::thread::Tcb::encode_idle_priority();
+        (*idle_tcb).base_priority = (*idle_tcb).priority;
         (*idle_tcb).sched_context = core::ptr::null_mut();
         (*idle_tcb).vspace_root = core::ptr::null_mut();
         (*idle_tcb).cspace_root = core::ptr::null_mut();
@@ -190,7 +217,9 @@ unsafe fn allocate_idle_tcb(cpu_id: usize) -> *mut Tcb {
 ///
 /// Allocates a physical frame and returns its virtual address.
 unsafe fn allocate_idle_stack() -> u64 {
-    let phys = match pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::KernelStack }) {
+    let phys = match pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::KernelStack,
+    }) {
         Some(p) => p,
         None => {
             // Halt on allocation failure - no memory available
@@ -226,11 +255,7 @@ pub fn yield_now() {
 pub fn current() -> Option<&'static mut Tcb> {
     unsafe {
         let tcb = scheduler().current();
-        if tcb.is_null() {
-            None
-        } else {
-            Some(&mut *tcb)
-        }
+        if tcb.is_null() { None } else { Some(&mut *tcb) }
     }
 }
 
@@ -238,8 +263,11 @@ pub fn current() -> Option<&'static mut Tcb> {
 ///
 /// Called by the APIC timer interrupt handler (1ms intervals).
 /// Notifies the scheduler of the tick for budget enforcement.
-pub fn timer_tick() {
-    scheduler().timer_tick();
+/// Entry/exit hooks account user/kernel runtime precisely at privilege
+/// boundaries; the interrupt-mode hint is retained only for the arch-facing
+/// timer API shape.
+pub fn timer_tick(_interrupted_user_mode: bool) {
+    scheduler().timer_tick(_interrupted_user_mode);
 }
 
 /// Handle reschedule IPI

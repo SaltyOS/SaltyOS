@@ -288,18 +288,25 @@ pub fn process_byte(state: &mut DisplayState, byte: u8) {
 fn process_normal(state: &mut DisplayState, byte: u8) {
     match byte {
         0x1B => state.vt_state = VtState::Escape,
-        0x07 => {}                            // BEL — silently ignore
-        0x08 | 0x09 | 0x0A | 0x0D =>         // BS, HT, LF, CR
-            super::terminal_putc(state, byte),
-        0x0B | 0x0C =>                        // VT, FF — treat as LF
-            super::terminal_putc(state, b'\n'),
-        0x0E => state.active_charset = 1,     // SO — shift to G1
-        0x0F => state.active_charset = 0,     // SI — shift to G0
-        0x20..=0x7E => {                      // Printable ASCII
+        0x07 => {} // BEL — silently ignore
+        0x08 | 0x09 | 0x0A | 0x0D =>
+        // BS, HT, LF, CR
+        {
+            super::terminal_putc(state, byte)
+        }
+        0x0B | 0x0C =>
+        // VT, FF — treat as LF
+        {
+            super::terminal_putc(state, b'\n')
+        }
+        0x0E => state.active_charset = 1, // SO — shift to G1
+        0x0F => state.active_charset = 0, // SI — shift to G0
+        0x20..=0x7E => {
+            // Printable ASCII
             state.last_printed_char = byte;
             super::terminal_putc(state, byte);
         }
-        _ => {}                               // NUL, DEL, other C0, high bytes — ignore
+        _ => {} // NUL, DEL, other C0, high bytes — ignore
     }
 }
 
@@ -424,7 +431,7 @@ fn process_escape_intermediate(state: &mut DisplayState, byte: u8) {
         b'B' => 0, // ASCII
         b'0' => 1, // DEC Special Graphics
         b'A' => 2, // UK
-        _ => 0,     // Default to ASCII for unknown
+        _ => 0,    // Default to ASCII for unknown
     };
 
     match intermediate {
@@ -450,8 +457,8 @@ fn process_osc(state: &mut DisplayState, byte: u8) {
     }
     match byte {
         0x07 => state.vt_state = VtState::Normal, // BEL terminates OSC
-        0x1B => state.osc_saw_esc = true,          // Possible ST start
-        _ => {}                                     // Absorb
+        0x1B => state.osc_saw_esc = true,         // Possible ST start
+        _ => {}                                   // Absorb
     }
 }
 
@@ -478,9 +485,11 @@ fn process_csi(state: &mut DisplayState, byte: u8) {
     match byte {
         b'0'..=b'9' => {
             state.csi_parser.has_current = true;
-            state.csi_parser.current_param =
-                state.csi_parser.current_param.saturating_mul(10)
-                    .saturating_add((byte - b'0') as u16);
+            state.csi_parser.current_param = state
+                .csi_parser
+                .current_param
+                .saturating_mul(10)
+                .saturating_add((byte - b'0') as u16);
         }
         b';' => {
             if (state.csi_parser.param_count as usize) < state.csi_parser.params.len() {
@@ -643,7 +652,11 @@ fn dispatch_csi(state: &mut DisplayState, cmd: u8) {
         b'L' => {
             // Insert Lines
             let n = param0 as u32;
-            let n = if n > state.max_rows { state.max_rows } else { n };
+            let n = if n > state.max_rows {
+                state.max_rows
+            } else {
+                n
+            };
             if state.text_row < state.max_rows {
                 super::insert_lines(state, state.text_row, n);
             }
@@ -651,7 +664,11 @@ fn dispatch_csi(state: &mut DisplayState, cmd: u8) {
         b'M' => {
             // Delete Lines
             let n = param0 as u32;
-            let n = if n > state.max_rows { state.max_rows } else { n };
+            let n = if n > state.max_rows {
+                state.max_rows
+            } else {
+                n
+            };
             if state.text_row < state.max_rows {
                 super::delete_lines(state, state.text_row, n);
             }
@@ -1015,7 +1032,7 @@ fn sgr_apply(state: &mut DisplayState, param: u16) {
         7 => state.reverse_video = true,
         8 => state.hidden = true,
         9 => state.strikethrough = true,
-        21 => state.bold = false,       // xterm: bold off (double underline not supported)
+        21 => state.bold = false, // xterm: bold off (double underline not supported)
         22 => {
             state.bold = false;
             state.dim = false;

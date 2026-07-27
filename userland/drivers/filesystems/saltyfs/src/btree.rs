@@ -34,6 +34,7 @@ pub(crate) fn btree_leaf_find(block_data: *const u8, key: &BTreeKey) -> Option<(
 
 /// Search a leaf node for all items with matching object_id and item_type.
 /// Calls the callback for each match. Returns number found.
+#[allow(dead_code)]
 pub(crate) fn btree_leaf_find_all<F>(
     block_data: *const u8,
     object_id: u64,
@@ -296,6 +297,76 @@ pub(crate) fn btree_find_item(root_block: u64, key: &BTreeKey) -> Option<(*const
         return None;
     }
     btree_leaf_find(leaf, key)
+}
+
+/// Forward-scan every leaf in the tree and return the highest `object_id`
+/// carrying a `TRONA_INODE_ITEM`. Returns `0` if the tree is empty.
+///
+/// Unlike a first-hole walk, this inspects every inode record regardless of
+/// gaps produced by prior deletions, so the returned value is the authoritative
+/// maximum live inode id at the moment of the call. Used by the one-time
+/// `legacy_upgrade_next_inode_seq` path on volumes predating the on-disk
+/// `SB.next_inode_seq` field.
+pub(crate) fn btree_max_inode_object_id(root_block: u64) -> u64 {
+    let mut max_ino: u64 = 0;
+    let mut search_key = BTreeKey {
+        object_id: 0,
+        item_type: 0,
+        offset: 0,
+    };
+    let mut prev_leaf_block: u64 = u64::MAX;
+
+    // Bounded iteration count matches `btree_find_all_for_ino`'s safety cap.
+    // At 1024 leaves per pass this tolerates multi-million-inode volumes; if
+    // we ever need more we can lift the bound to a `BLOCK_COUNT / fan-out`
+    // expression.
+    for _ in 0..(1024 * 1024) {
+        let leaf = btree_search(root_block, &search_key);
+        if leaf.is_null() {
+            break;
+        }
+
+        let hdr = unsafe { &*(leaf as *const BTreeNodeHeader) };
+        if hdr.num_items == 0 {
+            break;
+        }
+
+        // Same-leaf detection: if `btree_search` routes us back to the leaf
+        // we already visited, advance via the parent pointer to the next
+        // sibling's separator.
+        if hdr.block_nr == prev_leaf_block {
+            match find_next_leaf_key(root_block, &search_key) {
+                Some(next_key) => {
+                    search_key = next_key;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        prev_leaf_block = hdr.block_nr;
+
+        unsafe {
+            let items_start = leaf.add(core::mem::size_of::<BTreeNodeHeader>());
+            let item_size = core::mem::size_of::<BTreeItem>();
+
+            for i in 0..hdr.num_items as usize {
+                let item =
+                    core::ptr::read_unaligned(items_start.add(i * item_size) as *const BTreeItem);
+                if item.key.item_type == TRONA_INODE_ITEM && item.key.object_id > max_ino {
+                    max_ino = item.key.object_id;
+                }
+            }
+        }
+
+        match find_next_leaf_key(root_block, &search_key) {
+            Some(next_key) => {
+                search_key = next_key;
+            }
+            None => break,
+        }
+    }
+
+    max_ino
 }
 
 /// Walk the B-tree from root to leaf, recording the path for COW propagation.

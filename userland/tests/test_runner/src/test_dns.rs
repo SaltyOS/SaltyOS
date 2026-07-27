@@ -6,11 +6,9 @@
 //! - netsrv running with network connectivity
 //! - QEMU user networking with DNS forwarder at 10.0.2.3
 
-use trona::consts::kernel::*;
-use trona::serial;
-use trona::serial::LineBuf;
-use trona::types::core::*;
 use trona_posix::*;
+use trona_runtime::debug::serial;
+use trona_runtime::debug::serial::LineBuf;
 
 pub fn run() -> bool {
     serial::serial_puts(b"[TEST_DNS] Starting DNS tests\n");

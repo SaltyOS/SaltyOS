@@ -1,0 +1,5 @@
+[Unit]
+Name=vfs.socket
+
+[Socket]
+Provider=vfs

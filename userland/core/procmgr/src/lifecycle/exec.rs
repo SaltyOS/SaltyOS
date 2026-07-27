@@ -1,14 +1,38 @@
 //! Exec handler
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::*;
 
 use crate::base::proc_table::{
-    find_by_badge, proctab, MAX_NAME_LEN, NSIG,
-    SIG_DISP_CATCH, SIG_DISP_DFL,
+    MAX_NAME_LEN, NSIG, SIG_DISP_CATCH, SIG_DISP_DFL, find_by_badge, proctab,
 };
 use crate::personality::PersonalityKind;
 
+/// Cleanup for a failure that happens *before* `prepare_exec_transition`.
+/// The client TCB is still Blocked in its `Call` IPC, so a normal reply
+/// label unblocks it and the process continues running.
+unsafe fn abort_preflight_exec(
+    reply: &mut TronaMsg,
+    label: u64,
+    badged_vfs: Option<Cap>,
+    vfs_source: &mut crate::loader::vfs_load::VfsExecSource,
+) {
+    unsafe {
+        if let Some(ep) = badged_vfs {
+            crate::loader::vfs_load::cleanup_exec_source_on(ep, vfs_source);
+            crate::loader::vfs_load::release_badged_vfs_cap(ep);
+        } else {
+            crate::loader::vfs_load::cleanup_exec_source(vfs_source);
+        }
+        reply.label = label;
+    }
+}
+
+/// Cleanup for a failure that happens *after* `prepare_exec_transition`.
+/// The client TCB is Inactive and its reply linkage has been cleared by
+/// `TCB_SUSPEND`, so the caller cannot be resumed — the only correct
+/// action is to kill the process. `reply.label` is set to `0` so the
+/// outer dispatcher does not spuriously fire a reply at a dead link.
 unsafe fn abort_destroyed_exec(
     idx: usize,
     reply: &mut TronaMsg,
@@ -16,7 +40,7 @@ unsafe fn abort_destroyed_exec(
     vfs_source: &mut crate::loader::vfs_load::VfsExecSource,
 ) {
     unsafe {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC: terminating PID=");
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" after destructive failure\n");
@@ -28,12 +52,59 @@ unsafe fn abort_destroyed_exec(
         } else {
             crate::loader::vfs_load::cleanup_exec_source(vfs_source);
         }
-        let _ = crate::personality::posix::signal::terminate_proc(idx, crate::personality::posix::PM_SIGKILL);
+        let _ = crate::personality::posix::signal::terminate_proc(
+            idx,
+            crate::personality::posix::PM_SIGKILL,
+        );
         reply.label = 0;
     }
 }
 
-unsafe fn set_exec_process_name(p: &mut crate::base::proc_table::Process, name: &[u8], name_len: usize) {
+/// Move the target TCB into `Inactive` so subsequent `TCB_SET_STACK_BOUNDS`,
+/// `TCB_CONFIGURE`, `TCB_SET_TLS_BASE`, `TCB_SET_IPC_BUFFER` and
+/// `TCB_WRITE_REGISTERS` invocations succeed. The kernel requires those
+/// ops to observe `ThreadState::Inactive`; without this step, a client in
+/// `Blocked` state (waiting on its exec Call) trips `Busy(0x7)` when the
+/// stack bounds are published.
+///
+/// Must be called exactly once, on the destructive boundary —
+/// `quiesce_and_deregister_mmsrv_client` has succeeded and the first
+/// `vspace_unmap` has not yet run. Before this call, exec may still fail
+/// and return a reply to the caller. After this call the caller's reply
+/// linkage is cleared (`TCB_SUSPEND` on a Blocked thread wipes
+/// `saved_caller_msg`/`reply_tcb`), so any failure must route through
+/// `abort_destroyed_exec`.
+unsafe fn prepare_exec_transition(
+    idx: usize,
+    reply: &mut TronaMsg,
+    badged_vfs: &mut Option<Cap>,
+    vfs_source: &mut crate::loader::vfs_load::VfsExecSource,
+) -> bool {
+    unsafe {
+        let err = trona_kernel::invoke::tcb_suspend(proctab(idx).tcb_cap);
+        if err != 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] EXEC: prepare tcb_suspend failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
+            abort_preflight_exec(
+                reply,
+                trona_protocol::posix::TRONA_IO_ERROR,
+                badged_vfs.take(),
+                vfs_source,
+            );
+            return false;
+        }
+        true
+    }
+}
+
+unsafe fn set_exec_process_name(
+    p: &mut crate::base::proc_table::Process,
+    name: &[u8],
+    name_len: usize,
+) {
     let name_copy = if name_len > 31 { 31 } else { name_len };
     for i in 0..name_copy {
         p.name[i] = name[i];
@@ -69,6 +140,7 @@ unsafe fn switch_exec_personality(idx: usize, target_kind: PersonalityKind) {
 
         let old_pid = proctab(idx).pid;
         let old_ppid = proctab(idx).ppid;
+        let old_completion_observer_pid = proctab(idx).completion_observer_pid;
         let old_badge = proctab(idx).badge;
         let old_tcb = proctab(idx).tcb_cap;
         let old_vs = proctab(idx).vspace_cap;
@@ -83,17 +155,30 @@ unsafe fn switch_exec_personality(idx: usize, target_kind: PersonalityKind) {
         let old_slot_count = proctab(idx).slot_count;
         let old_has_service_ep = proctab(idx).has_service_ep;
         let old_mmsrv_registered = proctab(idx).mmsrv_registered;
+        let old_launch_pending = proctab(idx).launch_pending;
         let old_respawn = proctab(idx).respawn;
+        let old_respawn_policy = proctab(idx).respawn_policy;
+        let old_respawn_attempt_count = proctab(idx).respawn_attempt_count;
+        let old_respawn_next_ready_tick = proctab(idx).respawn_next_ready_tick;
+        let old_respawn_first_attempt_tick = proctab(idx).respawn_first_attempt_tick;
+        let old_stdio_mode = proctab(idx).stdio_mode;
         let old_respawn_binary = proctab(idx).respawn_binary;
         let old_timer_interval_ns = proctab(idx).timer_interval_ns;
         let old_timer_deadline_ns = proctab(idx).timer_deadline_ns;
         let old_ready_badge_bit = proctab(idx).ready_badge_bit;
         let old_start_time_ns = proctab(idx).start_time_ns;
         let old_stop_status = proctab(idx).stop_status;
-        let old_waiter_reply = proctab(idx).waiter_reply;
-        let old_waiter_pid = proctab(idx).waiter_pid;
-        let old_any_waiter_reply = proctab(idx).any_waiter_reply;
-        let old_waiting_for_any = proctab(idx).waiting_for_any;
+        let old_completion_event_kind = proctab(idx).completion_event_kind;
+        let old_completion_event_status = proctab(idx).completion_event_status;
+        let old_completion_event_cookie = proctab(idx).completion_event_cookie;
+        let old_completion_wait_reply = proctab(idx).completion_wait_reply;
+        let old_completion_wait_target_pid = proctab(idx).completion_wait_target_pid;
+        let old_completion_wait_options = proctab(idx).completion_wait_options;
+        let old_completion_wait_deadline_ns = proctab(idx).completion_wait_deadline_ns;
+        let old_completion_wait_wake_retry_deadline_ns =
+            proctab(idx).completion_wait_wake_retry_deadline_ns;
+        let old_observer_event_count = proctab(idx).observer_event_count;
+        let old_observer_events = proctab(idx).observer_events;
         let old_exe_path = proctab(idx).exe_path;
         let old_wait_ready_on_resume = proctab(idx).wait_ready_on_resume;
         let old_ready_timeout_ns = proctab(idx).ready_timeout_ns;
@@ -122,6 +207,7 @@ unsafe fn switch_exec_personality(idx: usize, target_kind: PersonalityKind) {
         let p = proctab(idx);
         p.pid = old_pid;
         p.ppid = old_ppid;
+        p.completion_observer_pid = old_completion_observer_pid;
         p.badge = old_badge;
         p.tcb_cap = old_tcb;
         p.vspace_cap = old_vs;
@@ -136,17 +222,29 @@ unsafe fn switch_exec_personality(idx: usize, target_kind: PersonalityKind) {
         p.slot_count = old_slot_count;
         p.has_service_ep = old_has_service_ep;
         p.mmsrv_registered = old_mmsrv_registered;
+        p.launch_pending = old_launch_pending;
         p.respawn = old_respawn;
+        p.respawn_policy = old_respawn_policy;
+        p.respawn_attempt_count = old_respawn_attempt_count;
+        p.respawn_next_ready_tick = old_respawn_next_ready_tick;
+        p.respawn_first_attempt_tick = old_respawn_first_attempt_tick;
+        p.stdio_mode = old_stdio_mode;
         p.respawn_binary = old_respawn_binary;
         p.timer_interval_ns = old_timer_interval_ns;
         p.timer_deadline_ns = old_timer_deadline_ns;
         p.ready_badge_bit = old_ready_badge_bit;
         p.start_time_ns = old_start_time_ns;
         p.stop_status = old_stop_status;
-        p.waiter_reply = old_waiter_reply;
-        p.waiter_pid = old_waiter_pid;
-        p.any_waiter_reply = old_any_waiter_reply;
-        p.waiting_for_any = old_waiting_for_any;
+        p.completion_event_kind = old_completion_event_kind;
+        p.completion_event_status = old_completion_event_status;
+        p.completion_event_cookie = old_completion_event_cookie;
+        p.completion_wait_reply = old_completion_wait_reply;
+        p.completion_wait_target_pid = old_completion_wait_target_pid;
+        p.completion_wait_options = old_completion_wait_options;
+        p.completion_wait_deadline_ns = old_completion_wait_deadline_ns;
+        p.completion_wait_wake_retry_deadline_ns = old_completion_wait_wake_retry_deadline_ns;
+        p.observer_event_count = old_observer_event_count;
+        p.observer_events = old_observer_events;
         p.exe_path = old_exe_path;
         p.wait_ready_on_resume = old_wait_ready_on_resume;
         p.ready_timeout_ns = old_ready_timeout_ns;
@@ -160,26 +258,12 @@ unsafe fn switch_exec_personality(idx: usize, target_kind: PersonalityKind) {
 }
 
 unsafe fn notify_vfs_client_exec(badge: u64) {
-    unsafe {
-        let mut vfs_msg = TronaMsg::zeroed();
-        vfs_msg.label = trona::protocol::VFS_CLIENT_EXEC;
-        vfs_msg.length = 1;
-        vfs_msg.regs[0] = badge;
-        let err = trona::ipc::send_timed_ctx(
-            crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
-            &raw const vfs_msg,
-            50_000_000,
-        );
-        if err != 0 {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[PROCMGR] VFS client-exec timed out badge=");
-                _lb.hex(badge);
-                _lb.str(b" err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
-            });
-        }
+    if !crate::base::vfs_notify::enqueue_client_exec(badge) {
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS client-exec queue full badge=");
+            _lb.hex(badge);
+            _lb.str(b"\n");
+        });
     }
 }
 
@@ -192,7 +276,7 @@ unsafe fn finalize_exec_transition(
     target_kind: PersonalityKind,
     entry: u64,
     rsp: u64,
-    layout: trona::layout::VmLayoutPlan,
+    layout: trona_runtime::spawn::layout::VmLayoutPlan,
     shared_lib_base: u64,
     shared_lib_map: crate::base::proc_table::ProcLibMap,
     name: &[u8],
@@ -205,15 +289,9 @@ unsafe fn finalize_exec_transition(
     log_prefix: &[u8],
 ) {
     unsafe {
-        let susp_err = trona::invoke::tcb_suspend(proctab(idx).tcb_cap);
-        if susp_err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] EXEC: tcb_suspend failed\n");
-            });
-            abort_destroyed_exec(idx, reply, badged_vfs.take(), vfs_source);
-            return;
-        }
-
+        // The target TCB was moved to `Inactive` by `prepare_exec_transition`
+        // on the destructive boundary, so every TCB invocation below
+        // observes the state the kernel requires.
         switch_exec_personality(idx, target_kind);
 
         if proctab(idx).is_posix() {
@@ -231,9 +309,9 @@ unsafe fn finalize_exec_transition(
             crate::loader::vfs_load::cleanup_exec_source(vfs_source);
         }
 
-        let err = trona::invoke::tcb_configure(proctab(idx).tcb_cap, entry, rsp, 0);
+        let err = trona_kernel::invoke::tcb_configure(proctab(idx).tcb_cap, entry, rsp, 0);
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: tcb_configure failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" pid=");
@@ -245,20 +323,20 @@ unsafe fn finalize_exec_transition(
             abort_destroyed_exec(idx, reply, badged_vfs.take(), vfs_source);
             return;
         }
-        let err = trona::invoke::tcb_set_tls_base(proctab(idx).tcb_cap, 0);
+        let err = trona_kernel::invoke::tcb_set_tls_base(proctab(idx).tcb_cap, 0);
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: clear TLS base failed\n");
             });
             abort_destroyed_exec(idx, reply, badged_vfs.take(), vfs_source);
             return;
         }
-        trona::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
+        trona_kernel::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
         notify_vfs_client_exec(proctab(idx).badge);
 
-        let err = trona::invoke::tcb_resume(proctab(idx).tcb_cap);
+        let err = trona_kernel::invoke::tcb_resume(proctab(idx).tcb_cap);
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: resume failed\n");
             });
             abort_destroyed_exec(idx, reply, badged_vfs.take(), vfs_source);
@@ -281,8 +359,17 @@ unsafe fn finalize_exec_transition(
                 p.posix_mut().sgid = file_gid;
             }
         }
+        crate::base::trace_meta::emit_process_mapping(
+            b"exec",
+            p.pid,
+            p.ppid,
+            p.tcb_cap,
+            p.vspace_cap,
+            &p.name,
+            &p.exe_path,
+        );
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.bytes(log_prefix);
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" -> entry=");
@@ -350,6 +437,40 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             return;
         }
 
+        // Snapshot argv/env payload before any helper IPC. The incoming
+        // INIT_EXEC transfer uses this thread's IPC buffer reserved area, so
+        // later VFS/mmsrv RPCs are free to reuse the same buffer.
+        let path_regs = 1 + ((msg.regs[0] as usize + 7) / 8);
+        let argc: u32;
+        let envc: u32;
+        let mut exec_str_data = [0u8; IPC_BUFFER_RESERVED_BYTES];
+        let exec_str_len: usize;
+        if msg.length as usize <= path_regs + 1 {
+            reply.label = crate::TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
+        let packed = msg.regs[path_regs];
+        argc = (packed >> 32) as u32;
+        envc = (packed & 0xFFFF_FFFF) as u32;
+        exec_str_len = msg.regs[path_regs + 1] as usize;
+        if exec_str_len > exec_str_data.len() {
+            reply.label = crate::TRONA_OUT_OF_RANGE;
+            return;
+        }
+        if exec_str_len != 0 {
+            let ctx = &*crate::ipc_ctx();
+            if ctx.ipc_buffer.is_null() {
+                reply.label = crate::TRONA_INVALID_ARGUMENT;
+                return;
+            }
+
+            let src = (*ctx.ipc_buffer).reserved.as_ptr() as *const u8;
+            for i in 0..exec_str_len {
+                exec_str_data[i] = *src.add(i);
+            }
+        }
+
         let (name, name_len) = crate::extract_name(msg, 1);
         let mut exec_path = [0u8; crate::base::proc_table::MAX_EXE_PATH_LEN];
 
@@ -389,50 +510,19 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             false
         };
 
-        let exec_path_len = core::cmp::min(resolved_len, crate::base::proc_table::MAX_EXE_PATH_LEN - 1);
+        let exec_path_len =
+            core::cmp::min(resolved_len, crate::base::proc_table::MAX_EXE_PATH_LEN - 1);
         for i in 0..exec_path_len {
             exec_path[i] = resolved_path[i];
         }
         exec_path[exec_path_len] = 0;
-
-        // Parse argv/envp from message registers after the path
-        let path_regs = 1 + ((msg.regs[0] as usize + 7) / 8);
-        let argc: u32;
-        let envc: u32;
-        let mut exec_str_data = [0u8; IPC_BUFFER_RESERVED_BYTES];
-        let exec_str_len: usize;
-        if msg.length as usize <= path_regs + 1 {
-            reply.label = crate::TRONA_INVALID_ARGUMENT;
-            return;
-        }
-
-        let packed = msg.regs[path_regs];
-        argc = (packed >> 32) as u32;
-        envc = (packed & 0xFFFF_FFFF) as u32;
-        exec_str_len = msg.regs[path_regs + 1] as usize;
-        if exec_str_len > exec_str_data.len() {
-            reply.label = crate::TRONA_OUT_OF_RANGE;
-            return;
-        }
-        if exec_str_len != 0 {
-            let ctx = &*crate::ipc_ctx();
-            if ctx.ipc_buffer.is_null() {
-                reply.label = crate::TRONA_INVALID_ARGUMENT;
-                return;
-            }
-
-            let src = (*ctx.ipc_buffer).reserved.as_ptr() as *const u8;
-            for i in 0..exec_str_len {
-                exec_str_data[i] = *src.add(i);
-            }
-        }
 
         let mut argv0_len = 0usize;
         while argv0_len < exec_str_len && exec_str_data[argv0_len] != 0 {
             argv0_len += 1;
         }
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC PID=");
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" -> '");
@@ -459,13 +549,19 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         let cpio_name_len = resolved_len - cpio_off;
 
         let mut elf_entry = CpioEntryExt::zeroed();
-        let mut found = trona_loader::cpio::cpio_find_file_ext(
-            initrd,
-            initrd_size,
-            resolved_path[cpio_off..].as_ptr(),
-            cpio_name_len,
-            &raw mut elf_entry,
-        ) != 0;
+        let cpio_name = &resolved_path[cpio_off..cpio_off + cpio_name_len];
+        let mut found = if let Some(e) =
+            trona_loader::common::cpio::cpio_find_file_ext(initrd, initrd_size, cpio_name)
+        {
+            elf_entry.data = e.data;
+            elf_entry.data_len = e.data_len;
+            elf_entry.mode = e.mode;
+            elf_entry.uid = e.uid;
+            elf_entry.gid = e.gid;
+            true
+        } else {
+            false
+        };
 
         if !found && cpio_name_len + 4 <= MAX_NAME_LEN {
             let mut legacy = [0u8; MAX_NAME_LEN + 5];
@@ -476,13 +572,20 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             legacy[cpio_name_len + 1] = b'e';
             legacy[cpio_name_len + 2] = b'l';
             legacy[cpio_name_len + 3] = b'f';
-            found = trona_loader::cpio::cpio_find_file_ext(
+            found = if let Some(e) = trona_loader::common::cpio::cpio_find_file_ext(
                 initrd,
                 initrd_size,
-                legacy.as_ptr(),
-                cpio_name_len + 4,
-                &raw mut elf_entry,
-            ) != 0;
+                &legacy[..cpio_name_len + 4],
+            ) {
+                elf_entry.data = e.data;
+                elf_entry.data_len = e.data_len;
+                elf_entry.mode = e.mode;
+                elf_entry.uid = e.uid;
+                elf_entry.gid = e.gid;
+                true
+            } else {
+                false
+            };
         }
 
         // Track file mode/uid/gid for setuid/setgid application.
@@ -516,9 +619,10 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                     }
                 }
             } else if have_vfs_stat {
-                if let Some(source) =
-                    crate::loader::vfs_load::try_open_exec_source_from_vfs(resolved_path, resolved_len)
-                {
+                if let Some(source) = crate::loader::vfs_load::try_open_exec_source_from_vfs(
+                    resolved_path,
+                    resolved_len,
+                ) {
                     if let Some((data, data_len)) = source.buffered_data() {
                         elf_entry.data = data;
                         elf_entry.data_len = data_len;
@@ -531,9 +635,10 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 }
             } else {
                 // No stat available — load without permission check (early boot)
-                if let Some(source) =
-                    crate::loader::vfs_load::try_open_exec_source_from_vfs(resolved_path, resolved_len)
-                {
+                if let Some(source) = crate::loader::vfs_load::try_open_exec_source_from_vfs(
+                    resolved_path,
+                    resolved_len,
+                ) {
                     if let Some((data, data_len)) = source.buffered_data() {
                         elf_entry.data = data;
                         elf_entry.data_len = data_len;
@@ -547,39 +652,78 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             if let Some(ep) = badged_vfs.take() {
                 crate::loader::vfs_load::release_badged_vfs_cap(ep);
             }
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n");
             });
             reply.label = crate::TRONA_NOT_FOUND;
             return;
         }
 
-        let vfs_stream = vfs_source.streamed();
-        let is_pe = vfs_stream.is_none()
+        // Read-only probes on `vfs_source` below use inline `.streamed()`
+        // calls so the immutable borrows end at each expression boundary.
+        // A long-lived `let vfs_stream = vfs_source.streamed()` binding
+        // would overlap with the later `&mut vfs_source` passed to
+        // `abort_preflight_exec` / `prepare_exec_transition`.
+        let is_pe = vfs_source.streamed().is_none()
             && elf_entry.data_len >= 2
-            && trona_loader::pe_loader::pe_is_pe(elf_entry.data, elf_entry.data_len);
+            && unsafe { *elf_entry.data == 0x4D && *elf_entry.data.add(1) == 0x5A };
         let is_dynamic = if is_pe {
             true
-        } else if let Some(vfs) = vfs_stream {
+        } else if let Some(vfs) = vfs_source.streamed() {
             vfs.is_dynamic
         } else {
-            trona_loader::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len)
+            unsafe {
+                use trona_loader::common::elf::header::{has_interp, phdr_slice, validate_ehdr};
+                if let Ok(ehdr) = validate_ehdr(elf_entry.data, elf_entry.data_len) {
+                    if let Ok(phdrs) = phdr_slice(elf_entry.data, elf_entry.data_len, ehdr) {
+                        has_interp(phdrs)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
         };
         let proc_vs = proctab(idx).vspace_cap;
         let pid = proctab(idx).pid;
 
         // 1. Deregister old mappings from mmsrv so it doesn't hold stale frame refs
-        let _ =
-            crate::base::mmsrv_ipc::quiesce_and_deregister_mmsrv_client(proctab(idx).tcb_cap, pid, badge);
+        if !crate::base::mmsrv_ipc::quiesce_and_deregister_mmsrv_client(
+            proctab(idx).tcb_cap,
+            pid,
+            badge,
+        ) {
+            abort_preflight_exec(
+                reply,
+                trona_protocol::posix::TRONA_IO_ERROR,
+                badged_vfs.take(),
+                &mut vfs_source,
+            );
+            return;
+        }
+
+        // Destructive boundary. The caller's vspace / cap-table / ipc buffer
+        // are about to be torn down; suspend the target TCB now so that
+        // later `TCB_SET_STACK_BOUNDS` / `TCB_CONFIGURE` / `TCB_SET_TLS_BASE`
+        // see `ThreadState::Inactive`. Suspend clears the caller's reply
+        // linkage, so from here on any failure must route through
+        // `abort_destroyed_exec` and terminate the process.
+        if !prepare_exec_transition(idx, reply, &mut badged_vfs, &mut vfs_source) {
+            return;
+        }
 
         // 2. Unmap existing user pages
         let mut walk_start: u64 = 0;
         loop {
-            let err = trona::invoke::vspace_walk(proc_vs, walk_start, crate::VSPACE_WALK_BATCH);
+            let err =
+                trona_kernel::invoke::vspace_walk(proc_vs, walk_start, crate::VSPACE_WALK_BATCH);
             if err != 0 {
                 break;
             }
-            let Some((count, next_addr)) = trona::invoke::vspace_walk_result_header() else {
+            let Some((count, next_addr)) = trona_kernel::invoke::vspace_walk_result_header_ctx(
+                trona_runtime::current_ipc_ctx(),
+            ) else {
                 break;
             };
             if count == 0 {
@@ -587,11 +731,13 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
 
             for i in 0..count {
-                let Some((page_vaddr, _, _)) = trona::invoke::vspace_walk_result_entry(i as usize)
-                else {
+                let Some((page_vaddr, _, _)) = trona_kernel::invoke::vspace_walk_result_entry_ctx(
+                    trona_runtime::current_ipc_ctx(),
+                    i as usize,
+                ) else {
                     break;
                 };
-                trona::invoke::vspace_unmap(proc_vs, page_vaddr);
+                trona_kernel::invoke::vspace_unmap(proc_vs, page_vaddr);
             }
 
             if next_addr == 0 {
@@ -610,7 +756,7 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             let cnode_bits = crate::lifecycle::spawn::effective_child_cnode_bits(child_cn);
             let cnode_total = 1u64 << cnode_bits;
             for slot in frame_floor..cnode_total {
-                trona::invoke::cnode_delete(child_cn, slot);
+                trona_kernel::invoke::cnode_delete(child_cn, slot);
             }
         }
 
@@ -622,9 +768,9 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         if old_slot_count > off_fixed {
             for i in off_fixed..old_slot_count {
                 let slot = old_slot_base + i as u64;
-                let err = trona::invoke::cnode_revoke(crate::CAP_SELF_CSPACE, slot);
+                let err = trona_kernel::invoke::cnode_revoke(crate::CAP_SELF_CSPACE, slot);
                 if err != 0 {
-                    trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, slot);
+                    trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, slot);
                 }
             }
             alloc.free_slots(old_slot_base + off_fixed as u64, old_slot_count - off_fixed);
@@ -632,35 +778,42 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         }
 
         if is_pe {
-            let pe_span =
-                trona_loader::pe_loader::pe_compute_load_span(elf_entry.data, elf_entry.data_len);
+            let pe_span = unsafe {
+                match trona_loader::common::pe::header::validate(elf_entry.data, elf_entry.data_len)
+                {
+                    Ok(h) => h.opt.size_of_image as u64,
+                    Err(_) => 0,
+                }
+            };
             if pe_span == 0 {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] EXEC: invalid PE image\n");
                 });
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
                 return;
             }
 
-            let Some(pe_support) = crate::loader::pe_load::plan_pe_runtime_support(initrd, initrd_size)
+            let Some(pe_support) =
+                crate::loader::pe_load::plan_pe_runtime_support(initrd, initrd_size)
             else {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] EXEC: PE runtime support not found\n");
                 });
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
                 return;
             };
 
-            let layout = trona::layout::compute_vm_layout_randomized(
+            let layout = trona_runtime::spawn::layout::compute_vm_layout_randomized(
                 pe_span,
                 pe_support.pe_rtld_span,
                 pe_support.kernel32_pages,
                 false,
                 0,
-                || trona::syscall::sys_getrandom(),
+                trona_runtime::spawn::stack_plan::StackLayoutSpec::default_service(),
+                || trona_kernel::syscall::sys_getrandom(),
             );
             if layout.stack_top == 0 {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] EXEC: PE too large for VA layout\n");
                 });
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -668,9 +821,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
 
             let heap_base = layout.heap_base();
-            let mmap_base = trona::layout::compute_mmap_base(&layout, heap_base);
-            if !crate::base::mmsrv_ipc::register_mmsrv_client(badge, pid, proc_vs, heap_base, mmap_base) {
-                trona::uerror!(|_lb| {
+            let mmap_base = trona_runtime::spawn::layout::compute_mmap_base(&layout, heap_base);
+            if !crate::base::mmsrv_ipc::register_mmsrv_client(
+                badge, pid, proc_vs, heap_base, mmap_base,
+            ) {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] EXEC: mmsrv re-register failed\n");
                 });
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -710,7 +865,7 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 Some(exec_cap_layout.win32srv_ep),
                 badge,
             ) {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] EXEC: win32 personality prepare failed\n");
                 });
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -718,7 +873,8 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
 
             let stack_pages = layout.stack.page_count();
-            let Some(stack_stage) = crate::loader::stack_build::alloc_zeroed_exec_stack_page() else {
+            let Some(stack_stage) = crate::loader::stack_build::alloc_zeroed_exec_stack_page()
+            else {
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
                 return;
             };
@@ -749,6 +905,10 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 &[],
                 0,
                 0,
+                // exec preserves VFS client slot state (VFS_CLIENT_EXEC only
+                // closes CLOEXEC-marked slots), so stdio slots 0/1/2 that
+                // were populated at the original spawn remain live.
+                crate::base::pty_handoff::STDIO_PRE_BITS_TTY,
             ) {
                 Ok(rsp) => rsp,
                 Err(_) => {
@@ -760,14 +920,15 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
 
             if !crate::loader::stack_build::commit_exec_stack_page(
                 pid,
-                layout.stack.base,
                 layout.stack_top,
-                stack_pages,
+                layout.stack_spec,
                 stack_stage,
+                proctab(idx).tcb_cap,
             ) {
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
                 return;
             }
+            let _ = stack_pages;
             crate::loader::mem_util::free_staging_buffer(stack_stage, 1);
             if let Some(ep) = badged_vfs.take() {
                 crate::loader::vfs_load::cleanup_exec_source_on(ep, &mut vfs_source);
@@ -802,12 +963,12 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         let Some(elf_runtime) = crate::loader::elf_load::plan_elf_runtime(
             elf_entry.data,
             elf_entry.data_len,
-            vfs_stream,
+            vfs_source.streamed(),
             initrd,
             initrd_size,
-            is_dynamic,
+            false,
         ) else {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: ELF too large for VA layout\n");
             });
             abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -817,9 +978,10 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
 
         // 4. Re-register with mmsrv for the new exec image
         let heap_base = layout.heap_base();
-        let mmap_base = trona::layout::compute_mmap_base(&layout, heap_base);
-        if !crate::base::mmsrv_ipc::register_mmsrv_client(badge, pid, proc_vs, heap_base, mmap_base) {
-            trona::uerror!(|_lb| {
+        let mmap_base = trona_runtime::spawn::layout::compute_mmap_base(&layout, heap_base);
+        if !crate::base::mmsrv_ipc::register_mmsrv_client(badge, pid, proc_vs, heap_base, mmap_base)
+        {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: mmsrv re-register failed\n");
             });
             abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -829,7 +991,7 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         let Some(elf_loads) = crate::loader::elf_load::load_elf_runtime(
             elf_entry.data,
             elf_entry.data_len,
-            vfs_stream,
+            vfs_source.streamed(),
             &elf_runtime,
             initrd,
             initrd_size,
@@ -843,19 +1005,6 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         let rtld_result = elf_loads.rtld_result;
         // 6. Map initrd and boot info for dynamic executables
         if is_dynamic {
-            let initrd_window_size = elf_runtime.lib_window_pages * 4096;
-            let err = crate::base::mmsrv_ipc::exec_map_initrd_mmsrv(
-                proc_vs,
-                initrd,
-                initrd_window_size,
-                pid,
-                layout.initrd.base,
-            );
-            if err != 0 {
-                abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
-                return;
-            }
-
             let err = crate::base::mmsrv_ipc::exec_map_bootinfo_mmsrv(pid);
             if err != 0 {
                 abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
@@ -883,26 +1032,21 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         // 10. Entry point and final stack image.
         let mut new_entry = elf_result.entry;
         let new_rsp: u64;
-        let (phdr_vaddr, phent, phnum) = if let Some(vfs) = vfs_stream {
+        let (phdr_vaddr, phent, phnum) = if let Some(vfs) = vfs_source.streamed() {
             (layout.elf_code.base + vfs.phdr_vaddr, vfs.phent, vfs.phnum)
         } else {
-            let mut phdr_vaddr = 0u64;
-            let mut phent = 0u64;
-            let mut phnum = 0u64;
-            if trona_loader::elf_dynamic::elf_get_phdr_info(
+            match trona_loader::common::elf::loader::get_phdr_info(
                 elf_entry.data,
                 elf_entry.data_len,
                 layout.elf_code.base,
-                &raw mut phdr_vaddr,
-                &raw mut phent,
-                &raw mut phnum,
-            ) != 0
-            {
-                crate::loader::mem_util::free_staging_buffer(stack_stage, 1);
-                abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
-                return;
+            ) {
+                Some(info) => (info.phdr_vaddr, info.phent as u64, info.phnum as u64),
+                None => {
+                    crate::loader::mem_util::free_staging_buffer(stack_stage, 1);
+                    abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
+                    return;
+                }
             }
-            (phdr_vaddr, phent, phnum)
         };
 
         if is_dynamic {
@@ -914,14 +1058,14 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 0,
                 &elf_result,
                 &rtld_result,
-                elf_runtime.lib_window_pages * 4096,
-                shared_lib_base,
+                &elf_loads.mapped_images[..elf_loads.mapped_image_count],
+                layout.shared_libs.base,
+                layout.shared_libs.size,
                 argc,
                 envc,
                 &exec_str_data,
                 exec_str_len,
                 layout.scratch.base,
-                layout.initrd.base,
                 layout.stack_top,
                 crate::lifecycle::spawn::child_service_cspace_layout(
                     proctab(idx).cnode_cap,
@@ -936,6 +1080,8 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 &[],
                 0,
                 0,
+                // exec preserves VFS client slot state; stdio 0/1/2 remain.
+                crate::base::pty_handoff::STDIO_PRE_BITS_TTY,
             ) {
                 Ok(rsp) => {
                     new_rsp = rsp;
@@ -955,7 +1101,6 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 &exec_str_data,
                 exec_str_len,
                 layout.scratch.base,
-                layout.initrd.base,
                 layout.stack_top,
                 stack_stage,
                 true,
@@ -973,15 +1118,47 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
 
         if !crate::loader::stack_build::commit_exec_stack_page(
             pid,
-            layout.stack.base,
             layout.stack_top,
-            stack_pages,
+            layout.stack_spec,
             stack_stage,
+            proctab(idx).tcb_cap,
         ) {
             abort_destroyed_exec(idx, reply, badged_vfs, &mut vfs_source);
             return;
         }
+        let _ = stack_pages;
         crate::loader::mem_util::free_staging_buffer(stack_stage, 1);
+
+        // Capture the exec argv into the process entry before the image is
+        // replaced. exec_str_data holds NUL-separated argv+envp bytes; store
+        // only the argv portion (first argc NUL-terminated strings).
+        {
+            let p = proctab(idx);
+            let argv_bytes = {
+                // Walk through exec_str_data to find the end of argv strings.
+                let mut pos = 0usize;
+                let mut strings_seen = 0u32;
+                while strings_seen < argc && pos < exec_str_len {
+                    if exec_str_data[pos] == 0 {
+                        strings_seen += 1;
+                    }
+                    pos += 1;
+                }
+                pos
+            };
+            let copy_len = if argv_bytes > crate::base::proc_table::ARGV_BUF_LEN {
+                crate::base::proc_table::ARGV_BUF_LEN
+            } else {
+                argv_bytes
+            };
+            for i in 0..copy_len {
+                p.argv_buf[i] = exec_str_data[i];
+            }
+            for i in copy_len..crate::base::proc_table::ARGV_BUF_LEN {
+                p.argv_buf[i] = 0;
+            }
+            p.argv_len = copy_len as u16;
+        }
 
         finalize_exec_transition(
             idx,

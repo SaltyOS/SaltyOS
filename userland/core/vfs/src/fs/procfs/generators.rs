@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Formatting utilities and byte-level generators for /proc content.
+//
+//! Formatting utilities and byte-level generators for `/proc`
+//! content. Pure CPU-bound formatting — no IPC, no allocations.
 
-/// Parse a decimal ASCII string as a PID. Returns (value, ok).
+/// Parse a decimal ASCII string as a PID. Returns `(value, ok)`.
 pub(super) fn parse_pid(buf: &[u8]) -> (u32, bool) {
     if buf.is_empty() || buf.len() > 10 {
         return (0, false);
@@ -16,7 +18,8 @@ pub(super) fn parse_pid(buf: &[u8]) -> (u32, bool) {
     (val, true)
 }
 
-/// Format u32 as decimal into buf. Returns number of bytes written.
+/// Format `u32` as decimal into `buf`. Returns the number of
+/// bytes written.
 pub(super) fn fmt_u32(mut v: u32, buf: &mut [u8]) -> usize {
     if v == 0 {
         if !buf.is_empty() {
@@ -39,7 +42,8 @@ pub(super) fn fmt_u32(mut v: u32, buf: &mut [u8]) -> usize {
     len
 }
 
-/// Format u64 as decimal into buf. Returns number of bytes written.
+/// Format `u64` as decimal into `buf`. Returns the number of
+/// bytes written.
 pub(super) fn fmt_u64(mut v: u64, buf: &mut [u8]) -> usize {
     if v == 0 {
         if !buf.is_empty() {
@@ -62,7 +66,8 @@ pub(super) fn fmt_u64(mut v: u64, buf: &mut [u8]) -> usize {
     len
 }
 
-/// Format u64 as hex into buf. Returns number of bytes written.
+/// Format `u64` as 0x-prefixed hex into `buf`. Returns the
+/// number of bytes written.
 pub(super) fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
     if v == 0 {
         if buf.len() >= 3 {
@@ -140,7 +145,11 @@ pub(super) fn append_mac(buf: &mut [u8], pos: &mut usize, mac: &[u8; 6]) {
     let mut i = 0usize;
     while i < 6 {
         let b = mac[i];
-        append_bytes(buf, pos, &[HEX[(b >> 4) as usize], HEX[(b & 0x0F) as usize]]);
+        append_bytes(
+            buf,
+            pos,
+            &[HEX[(b >> 4) as usize], HEX[(b & 0x0F) as usize]],
+        );
         if i != 5 {
             append_bytes(buf, pos, b":");
         }

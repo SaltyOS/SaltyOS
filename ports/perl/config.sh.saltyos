@@ -915,7 +915,10 @@ line=''
 lint=''
 lkflags=''
 ln='ln'
-lns='/bin/ln -s'
+# Top-level cross build re-links host helper binaries (`miniperl`,
+# `generate_uudmap`) from parallel make jobs. Use a forceful symlink command
+# so duplicate recipes converge instead of racing on an existing target.
+lns='/bin/ln -sfn'
 localtime_r_proto='0'
 locincpth='/usr/local/include /opt/local/include /usr/gnu/include /opt/gnu/include /usr/GNU/include /opt/GNU/include'
 loclibpth='/usr/local/lib /opt/local/lib /usr/gnu/lib /opt/gnu/lib /usr/GNU/lib /opt/GNU/lib'

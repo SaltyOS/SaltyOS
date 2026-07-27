@@ -18,7 +18,6 @@ pub(crate) struct TcpHeader {
     pub(crate) dst_port: u16,
     pub(crate) seq: u32,
     pub(crate) ack: u32,
-    pub(crate) data_offset: u8,
     pub(crate) flags: u8,
     pub(crate) window: u16,
 }
@@ -55,7 +54,6 @@ pub(crate) fn parse(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
             dst_port,
             seq,
             ack,
-            data_offset,
             flags,
             window,
         },

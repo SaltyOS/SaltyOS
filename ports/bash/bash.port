@@ -94,5 +94,11 @@ bash_cv_posix_signals = yes
 [prepare]
 sed -i.bak 's/^LIBS_FOR_BUILD = .*/LIBS_FOR_BUILD =/' ${SRCDIR}/support/Makefile.in && rm -f ${SRCDIR}/support/Makefile.in.bak
 
-[install]
-bin/bash = bash
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/info
+usr/share/doc
+usr/share/locale
+usr/share/man

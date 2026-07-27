@@ -45,6 +45,7 @@ EXTENT_PREALLOC = 2
 # Inode modes
 S_IFDIR = 0o040000
 S_IFREG = 0o100000
+S_IFLNK = 0o120000
 
 # Inode numbers
 ROOT_INO = 1
@@ -474,6 +475,7 @@ def parse_size(size_str: str) -> int:
 def create_saltyfs_image(output_path: Path, size: int, files: list, label: str = "saltyfs",
                          permissions: dict = None,
                          empty_dirs: list = None,
+                         symlinks: list = None,
                          incompat_flags: int = 0,
                          compat_ro_flags: int = 0,
                          casefold_version: int = 0,
@@ -484,11 +486,17 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
     files: list of (name, content_bytes) tuples.
     permissions: optional dict mapping path → (mode, uid, gid).
     empty_dirs: optional list of directory paths to create (even if no files live there).
+    symlinks: optional list of (name, target_bytes) tuples — symlink inodes.
+              Stored as mode=S_IFLNK|0o777, size=len(target), inline extent
+              holding the target path. DIR_ITEM dir_type=7 (DT_LNK) — matches
+              the on-disk layout that the runtime saltyfs driver writes.
     casefold_root: if True, set SALTY_INODE_CASEFOLD on the root inode and
                    also set SALTYFS_INCOMPAT_CASEFOLD + casefold_version.
     """
     if permissions is None:
         permissions = {}
+    if symlinks is None:
+        symlinks = []
     total_blocks = size // BLOCK_SIZE
     if total_blocks < 16:
         print("Error: Image too small (need at least 16 blocks)", file=sys.stderr)
@@ -533,6 +541,12 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
         for fname, _content in files:
             parts = fname.strip('/').split('/')
             for i in range(1, len(parts)):  # skip the filename itself
+                dir_paths.add('/'.join(parts[:i]))
+
+        # Symlink parents — same treatment as regular files.
+        for sname, _target in symlinks:
+            parts = sname.strip('/').split('/')
+            for i in range(1, len(parts)):
                 dir_paths.add('/'.join(parts[:i]))
 
         # Merge explicitly requested empty directories and their parents
@@ -686,6 +700,57 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
 
                 file_data_blocks.append((data_block, content))
 
+        # Symlinks: separate inode, inline extent holding the target path,
+        # DIR_ITEM with dir_type=7 (DT_LNK). Must match the runtime driver's
+        # on-disk layout (userland/drivers/filesystems/saltyfs/src/handlers.rs
+        # around line 2274).
+        for sname, target_bytes in symlinks:
+            sym_ino = next_ino
+            next_ino += 1
+
+            stripped = sname.strip('/')
+            if '/' in stripped:
+                parent_path, basename = stripped.rsplit('/', 1)
+                parent_ino = dir_ino_map.get(parent_path, ROOT_INO)
+            else:
+                basename = stripped
+                parent_ino = ROOT_INO
+
+            name_bytes = basename.encode("ascii")
+
+            sym_inode_data = pack_inode(
+                generation=generation,
+                size=len(target_bytes),
+                blocks=0,
+                nlink=1,
+                mode=S_IFLNK | 0o777,
+                atime=now_ns, mtime=now_ns, ctime=now_ns, crtime=now_ns,
+            )
+            btree_items.append((
+                pack_btree_key(sym_ino, SALTY_INODE_ITEM, 0),
+                sym_inode_data,
+            ))
+
+            dir_item_data = pack_dir_item(sym_ino, name_bytes, dir_type=7)
+            btree_items.append((
+                pack_btree_key(parent_ino, SALTY_DIR_ITEM, fnv1a_hash(name_bytes)),
+                dir_item_data,
+            ))
+
+            btree_items.append((
+                pack_btree_key(sym_ino, SALTY_INODE_REF, parent_ino),
+                name_bytes,
+            ))
+
+            # Target stored as inline extent (all realistic symlink targets
+            # fit within the inline limit — saltyfs driver caps target_len at
+            # 64 bytes in the V2 protocol, well under EXTENT_INLINE's 256).
+            extent_data = pack_extent_data_inline(generation, target_bytes)
+            btree_items.append((
+                pack_btree_key(sym_ino, SALTY_EXTENT_DATA, 0),
+                extent_data,
+            ))
+
         btree_items.sort(key=btree_item_sort_key)
         return btree_items, file_data_blocks, next_data_block
 
@@ -835,6 +900,14 @@ def main():
         help="Create an empty directory at PATH (e.g., /dev, /proc)",
     )
     parser.add_argument(
+        "--add-symlink",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("NAME", "TARGET"),
+        help="Add a symlink at NAME pointing to TARGET (up to 64-byte target)",
+    )
+    parser.add_argument(
         "--label",
         default="saltyfs",
         help="Volume label (default: saltyfs)",
@@ -916,9 +989,22 @@ def main():
                     path, mode_str, uid_str, gid_str = parts
                     permissions[path] = (int(mode_str, 8), int(uid_str), int(gid_str))
 
+    symlinks = []
+    for name, target in args.add_symlink:
+        target_bytes = target.encode("utf-8")
+        if len(target_bytes) > 64:
+            print(
+                f"Error: symlink target too long ({len(target_bytes)} bytes > 64-byte cap): "
+                f"{name} -> {target}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        symlinks.append((name, target_bytes))
+
     create_saltyfs_image(args.output, size, files, label=args.label,
                          permissions=permissions,
                          empty_dirs=args.add_dir if args.add_dir else None,
+                         symlinks=symlinks if symlinks else None,
                          incompat_flags=args.fake_incompat,
                          compat_ro_flags=args.fake_compat_ro,
                          casefold_version=args.casefold_version,

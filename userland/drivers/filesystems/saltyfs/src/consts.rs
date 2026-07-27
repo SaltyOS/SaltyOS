@@ -3,11 +3,11 @@
 
 // All cross-service caps flow through the role-based startup capability
 // table. System roles (`namesrv`, `mmsrv`) come from the substrate
-// `trona::caps::*` getters (backed by libtrona's `__trona_cap_*` weak
-// symbols). The service-local `Require=blkdrv:blkdrv_ep` entry flows
-// through the build-generated `svc_caps` crate.
+// `trona_runtime::client::caps::*` getters (backed by libtrona's `__trona_cap_*` weak
+// symbols). The service-local `Require=blkdrv-ep.socket` entry is
+// resolved through the `trona_runtime::local_cap!` macro in `main.rs`.
 /// SHM for saltyfs<->blkdrv data (mapped from blkdrv's SHM)
-pub(crate) const SHM_VADDR: u64 = 0x0000_0000_5000_0000;
+pub(crate) const SHM_VADDR: u64 = 0x0000_0000_2200_0000;
 pub(crate) const SHM_SIZE: u64 = 256 * 1024; // 256KB (64 pages)
 
 /// Block size (4KB default, read from superblock)
@@ -15,7 +15,7 @@ pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 4096;
 pub(crate) const SECTOR_SIZE: u64 = 512;
 
 /// Block cache: 256 blocks cached in memory (1MB)
-pub(crate) const CACHE_VADDR: u64 = 0x0000_0000_5100_0000;
+pub(crate) const CACHE_VADDR: u64 = 0x0000_0000_2240_0000;
 pub(crate) const CACHE_SLOTS: usize = 256;
 /// Each cache slot is one block (4KB)
 pub(crate) const CACHE_SLOT_SIZE: usize = 4096;
@@ -28,8 +28,10 @@ pub(crate) const BTREE_NODE_MAGIC: [u8; 4] = *b"BTND";
 pub(crate) const TRONA_INODE_ITEM: u8 = 0x01;
 pub(crate) const TRONA_INODE_REF: u8 = 0x02;
 pub(crate) const TRONA_DIR_ITEM: u8 = 0x03;
+#[allow(dead_code)]
 pub(crate) const TRONA_DIR_INDEX: u8 = 0x04;
 pub(crate) const TRONA_EXTENT_DATA: u8 = 0x05;
+#[allow(dead_code)]
 pub(crate) const TRONA_EXTENT_REF: u8 = 0x06;
 pub(crate) const TRONA_XATTR_ITEM: u8 = 0x07;
 
@@ -37,9 +39,26 @@ pub(crate) const TRONA_XATTR_ITEM: u8 = 0x07;
 pub(crate) const EXTENT_INLINE: u8 = 0;
 pub(crate) const EXTENT_REGULAR: u8 = 1;
 
-/// VFS-SaltyFS shared memory for bulk data transport
-pub(crate) const VFS_SHM_VADDR: u64 = 0x0000_0000_5200_0000;
-pub(crate) const VFS_SHM_PAGES: u64 = 256; // 1MB
+/// VFS-SaltyFS shared memory for bulk data transport. Each
+/// `SessionSlot` carves a 64 KiB sub-region out of this base — the
+/// total reservation is `SALTYFS_SESSION_SLOTS * SALTYFS_SHM_REGION_BYTES`
+/// (= 64 × 64 KiB = 4 MiB). The legacy `VFS_SHM_PAGES = 256` constant
+/// described a single 1 MB window and is no longer load-bearing; per-slot
+/// bounds checks consult `SessionSlot::shm_bytes`.
+pub(crate) const VFS_SHM_VADDR: u64 = 0x0000_0000_2300_0000;
+
+/// Per-write MemoryObject staging window for the Hybrid-1 backend
+/// `TRANSFER_KIND_MO` path. The owner / worker maps the inbound MO
+/// here, copies the payload through `execute_write_locked`, then
+/// unmaps the region and drops the cap. Single-window: writes are
+/// serialised under `BLOCK_LOCK`, so one staging slot is enough.
+pub(crate) const MO_STAGING_VADDR: u64 = 0x0000_0000_2380_0000;
+/// Daemon staging-window cap. Writes beyond this size are rejected
+/// with `KERNITE_ERR_OUT_OF_RANGE`; the VFS frontend must chunk
+/// payloads above this threshold across multiple BACKEND_WRITEs.
+/// Wire-visible to the frontend through
+/// `trona_protocol::vfs::backend::SALTYFS_MO_TRANSFER_MAX_BYTES`.
+pub(crate) const MO_STAGING_SIZE: u64 = 1 << 20; // 1 MiB
 
 /// Bitmap block allocator
 pub(crate) const BITMAP_CACHE_SLOTS: usize = 4;
@@ -80,10 +99,29 @@ pub(crate) const SALTY_INODE_CASEFOLD: u32 = 1 << 0;
 pub(crate) const SALTY_INODE_HIDDEN: u32 = 1 << 1;
 
 // ============================================================
-// Mount flags (`SALTYFS_MOUNT` request `regs[0]`)
+// Mount flags (`BACKEND_OPEN_SESSION` request `regs[0]`)
 // ============================================================
 
 pub(crate) const SALTYFS_MOUNT_RO: u64 = 1 << 0;
+
+// ============================================================
+// Session policy advertised in `BACKEND_OPEN_SESSION` reply
+// ============================================================
+
+/// Per-session inflight credit cap reported to VFS on session open.
+/// VFS never exceeds this number of outstanding correlated requests
+/// against this SaltyFS instance. Chosen to comfortably cover the
+/// working set of metadata + bulk-read traffic a busy workload produces
+/// without letting a single client starve the owner loop.
+pub(crate) const SALTYFS_MAX_INFLIGHT: u16 = 64;
+
+/// Suggested SHM region size advertised in `BACKEND_OPEN_SESSION`'s
+/// `regs[5]`. vfs uses the hint to size its `mmsrv MM_SHM_CREATE`
+/// request; the daemon's `BACKEND_SHM_SETUP` handler maps the same
+/// region into its own vspace via `MM_SHM_MAP`. The region holds
+/// readdir bulk batches plus xattr name+value staging, sized to fit
+/// 256 readdir records (~96 B each) plus a single xattr round-trip.
+pub(crate) const SALTYFS_SHM_REGION_BYTES: u64 = 64 * 1024;
 
 // ============================================================
 // Protocol version sentinel (create / mkdir / symlink)
@@ -93,7 +131,7 @@ pub(crate) const SALTYFS_MOUNT_RO: u64 = 1 << 0;
 /// carries uid/gid and inheritable flags. V1 callers leave bit 63 clear — no
 /// real inode number ever reaches 2^63, so this is collision-free.
 ///
-/// V2 layout for `SALTYFS_CREATE` / `SALTYFS_MKDIR`:
+/// V2 layout for `BACKEND_CREATE` / `BACKEND_MKDIR`:
 ///   regs[0] = parent_ino | SALTYFS_PROTO_V2
 ///   regs[1] = mode
 ///   regs[2] = uid (u32)
@@ -101,7 +139,7 @@ pub(crate) const SALTYFS_MOUNT_RO: u64 = 1 << 0;
 ///   regs[4] = name_len (u8, ≤120)
 ///   regs[5..20] = name bytes (120 bytes)
 ///
-/// V2 layout for `SALTYFS_SYMLINK`:
+/// V2 layout for `BACKEND_SYMLINK`:
 ///   regs[0] = parent_ino | SALTYFS_PROTO_V2
 ///   regs[1] = uid (u32)
 ///   regs[2] = gid (u32)

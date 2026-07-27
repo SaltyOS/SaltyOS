@@ -1,27 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Ramfs — in-memory filesystem with Vnode-native implementation.
+//
+//! ramfs — in-memory writable filesystem.
 //!
-//! This module replaces the legacy flat-inode ramfs with a proper
-//! `VopVector` + `VfsOps` implementation that uses per-mount pools
-//! for vnode data, writable block chains, and symlink targets.
+//! Synthetic backend with no daemon — every entry runs synchronously
+//! on the owner thread. Per-mount state owns three pools (vnode-data,
+//! writable block chains, symlink targets) plus a dirent array hung
+//! off each directory vnode. The arena that holds the live `Vnode`
+//! slots is the central `VfsState.vnodes`; this module only manages
+//! the backend-private side.
 //!
-//! # Module layout
+//! Module layout:
 //!
-//! - [`types`] — `RamfsVnodeData`, `RamfsMountData`
-//! - [`pool`] — Per-mount pool management (allocation, growth, block chains)
-//! - [`vops`] — `VopVector` function implementations
-//! - [`vfsops`] — `VfsOps` function implementations
+//! - [`types`]   — `Dirent`, `RamfsVnodeData`, `RamfsMountData`.
+//! - [`pool`]    — per-mount pool allocators + chain / dirent helpers.
+//! - [`vfsops`]  — `VfsOps` (mount, unmount, root, vget, statfs, sync).
+//! - [`vops`]    — `VopVector` (lookup, create, read, write, ...).
 
 pub(crate) mod pool;
-mod types;
+pub(crate) mod types;
 mod vfsops;
 mod vops;
 
-pub(crate) use types::{RamfsMountData, RamfsVnodeData};
-
-use crate::vfs_core::error::VfsResult;
-use crate::vfs_core::vfs::{register_fs_type, VfsOps};
-use crate::vfs_core::vop::{VopVector, VopMetaOps, VopDataOps, META_OPS_DEFAULT, DATA_OPS_DEFAULT};
+use crate::core::vop::{
+    DATA_OPS_DEFAULT, META_OPS_DEFAULT, VfsOps, VopDataOps, VopMetaOps, VopVector,
+};
 
 // =========================================================================
 // Static dispatch tables
@@ -31,10 +33,11 @@ use crate::vfs_core::vop::{VopVector, VopMetaOps, VopDataOps, META_OPS_DEFAULT, 
 pub(crate) static RAMFS_VOPS: VopVector = VopVector {
     meta: VopMetaOps {
         lookup: vops::ramfs_lookup,
-        lookup_ci: vops::ramfs_lookup,
+        lookup_ci: vops::ramfs_lookup_ci,
         create: vops::ramfs_create,
         mkdir: vops::ramfs_mkdir,
         symlink: vops::ramfs_symlink,
+        mkfifo: crate::core::vop::META_OPS_DEFAULT.mkfifo,
         unlink: vops::ramfs_unlink,
         rmdir: vops::ramfs_rmdir,
         link: vops::ramfs_link,
@@ -46,15 +49,22 @@ pub(crate) static RAMFS_VOPS: VopVector = VopVector {
         access: vops::ramfs_access,
         readlink: vops::ramfs_readlink,
         truncate: vops::ramfs_truncate,
+        data_size: vops::ramfs_data_size,
         inactive: vops::ramfs_inactive,
     },
     data: VopDataOps {
         read: vops::ramfs_read,
         write: vops::ramfs_write,
+        writeback: vops::ramfs_write,
         fsync: vops::ramfs_fsync,
         readdir: vops::ramfs_readdir,
         statfs: vops::ramfs_statfs,
-        ..DATA_OPS_DEFAULT
+        getxattr: DATA_OPS_DEFAULT.getxattr,
+        setxattr: DATA_OPS_DEFAULT.setxattr,
+        listxattr: DATA_OPS_DEFAULT.listxattr,
+        removexattr: DATA_OPS_DEFAULT.removexattr,
+        ioctl: DATA_OPS_DEFAULT.ioctl,
+        mmap_get_page: DATA_OPS_DEFAULT.mmap_get_page,
     },
 };
 
@@ -68,17 +78,8 @@ pub(crate) static RAMFS_VFSOPS: VfsOps = VfsOps {
     sync: vfsops::ramfs_sync,
 };
 
-// =========================================================================
-// Registration
-// =========================================================================
-
-/// Register the `ramfs` filesystem type. Called during VFS bootstrap Stage 2.
-pub(crate) unsafe fn register() -> VfsResult<()> {
-    unsafe {
-        register_fs_type(
-            b"ramfs",
-            &raw const RAMFS_VFSOPS,
-            &raw const RAMFS_VOPS,
-        )
-    }
-}
+// Suppress the META_OPS_DEFAULT import warning while only the
+// override fields above are referenced — kept available for
+// future ramfs lookup_ci customisation.
+#[allow(dead_code)]
+const _META_OPS_DEFAULT_REF: &VopMetaOps = &META_OPS_DEFAULT;

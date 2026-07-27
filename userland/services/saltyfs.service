@@ -1,14 +1,32 @@
 [Service]
 Name=saltyfs
 Binary=/bin/saltyfs
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
 After=blkdrv namesrv mmsrv
+Requires=namesrv.socket blkdrv-ep.socket
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# System roles via trona::caps::*, service-local via generated svc_caps::*.
-Require=namesrv
-Require=mmsrv
-Require=blkdrv:blkdrv_ep
+ProvidesInterface=fs
+InterfaceFlags=fs:clone,exec
+Exports=backend_callback
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

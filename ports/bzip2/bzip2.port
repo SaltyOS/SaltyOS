@@ -22,8 +22,12 @@ sed -i.bak \
     -e '/^all:/s/test//' \
     ${SRCDIR}/Makefile
 
-[install]
-libbz2.a = libbz2.a
-bin/bzip2 = bzip2
-bin/bunzip2 = bzip2
-bin/bzcat = bzip2
+[stage]
+mode = script
+commands =
+    install -d ${STAGE}/usr/include ${STAGE}/usr/lib ${STAGE}/usr/bin
+    install -m 0644 bzlib.h ${STAGE}/usr/include/bzlib.h
+    install -m 0644 libbz2.a ${STAGE}/usr/lib/libbz2.a
+    install -m 0755 bzip2 ${STAGE}/usr/bin/bzip2
+    ln -sf bzip2 ${STAGE}/usr/bin/bunzip2
+    ln -sf bzip2 ${STAGE}/usr/bin/bzcat

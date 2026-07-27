@@ -1,0 +1,32 @@
+[Service]
+Name=ldsrv
+Binary=/bin/ldsrv
+Type=broker
+Restart=always
+
+[Dependencies]
+After=namesrv mmsrv
+Before=test_runner
+Requires=namesrv.socket mmsrv.socket
+
+[Capabilities]
+ProvidesInterface=library-loader
+InterfaceRole=library-loader:ROLE_LDSRV_CLIENT
+InterfaceFlags=library-loader:clone,exec,drop
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=64
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

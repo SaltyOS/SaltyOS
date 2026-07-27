@@ -3,7 +3,11 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use core::mem::size_of;
-use crate::kdebug;
+
+unsafe extern "C" {
+    fn x86_idt_lidt(ptr: *const IdtPtr);
+    fn x86_idt_sidt(ptr: *mut IdtPtr);
+}
 
 /// IDT entry (16 bytes)
 #[repr(C, packed)]
@@ -91,6 +95,41 @@ pub struct InterruptStackFrame {
     pub rsp: u64,
     /// Stack segment selector
     pub ss: u64,
+}
+
+/// Lightweight interrupt frame pushed by `irq_stub_nobkl` stubs.
+///
+/// Only caller-saved registers are preserved (the Rust handler is an
+/// `extern "C"` function, so the ABI guarantees callee-saved regs will be
+/// preserved across the call). Layout must match the push order in
+/// `exceptions.S`: the first push (`rax`) sits at the highest address
+/// within the saved region, and the last push (`r11`) is at the lowest —
+/// i.e. the top of the stack when the handler is called.
+#[repr(C)]
+pub struct InterruptFrame {
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rax: u64,
+    // Pushed by the CPU on interrupt entry.
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl InterruptFrame {
+    /// Returns `true` if the interrupted context was user (CS.RPL != 0).
+    #[inline]
+    pub fn interrupted_user_mode(&self) -> bool {
+        self.cs & 0x3 != 0
+    }
 }
 
 /// Full exception frame built by assembly stubs + CPU
@@ -232,11 +271,7 @@ pub fn load() {
             limit: (size_of::<Idt>() - 1) as u16,
             base: (&raw const IDT) as u64,
         };
-        core::arch::asm!(
-            "lidt [{}]",
-            in(reg) &idt_ptr,
-            options(nostack)
-        );
+        x86_idt_lidt(&idt_ptr);
     }
 }
 
@@ -258,16 +293,16 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         return;
     }
 
-    // Vector 7: #NM Device Not Available — lazy FPU/SSE switching
+    // Vector 7: #NM Device Not Available — must not occur in eager FPU mode.
+    // CR0.TS is held at 0 throughout, so any #NM is a regression: either a
+    // stray set_ts caller still exists, or hardware misbehaved.
     if f.vector == 7 {
-        if (f.cs & 3) == 0 {
-            // Kernel should never use FPU — this is a bug
-            crate::serial_puts_raw("\n*** FATAL: #NM in kernel mode — kernel must not use FPU ***\n");
-            loop { super::halt(); }
-        }
-        // SAFETY: Called from exception context with current thread set
-        unsafe { super::fpu::handle_nm(); }
-        return;
+        crate::kernel::panic::fatal_exception_context(
+            "x86 exception",
+            format_args!("unexpected #NM in eager FPU mode"),
+            x86_panic_context(f),
+            || dump_x86_exception(f),
+        );
     }
 
     // User-mode exception: try fault delivery via IPC
@@ -295,92 +330,149 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                     let vspace = &mut *(*current).vspace_root;
                     // Phase 2: Kernel fast-path COW with pre-allocated pool.
                     // Falls through to VMFault IPC (Phase 1 path) when pool is empty.
-                    if let Ok(true) = vspace.handle_cow_fault_pooled(f.cr2, fault) {
-                        if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                    let cow_pooled_result = vspace.handle_cow_fault_pooled(f.cr2, fault);
+                    if let Ok(true) = cow_pooled_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
                             scheduler.reschedule();
                         }
                         return;
                     }
+                    let cow_result = vspace.handle_cow_fault(f.cr2, fault);
                     // Non-pooled COW fallback: kernel frame allocator
-                    if let Ok(true) = vspace.handle_cow_fault(f.cr2, fault) {
-                        if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                    if let Ok(true) = cow_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
                             scheduler.reschedule();
                         }
                         return;
                     }
-                    // Demand paging and stack growth are handled by mmsrv
-                    // via VMFault IPC. The kernel fast-paths
-                    // (handle_demand_fault / handle_stack_growth_fault)
-                    // use pmm_alloc which can return frames inside
-                    // untyped blocks; a later retype from that untyped
-                    // zeroes the frame, destroying live user data.
-                    // Delegating to mmsrv avoids the conflict because
-                    // mmsrv allocates exclusively via retype.
+                    // Anonymous zero-fill and stack growth resolve
+                    // inline. The PMM/untyped disjointness invariant
+                    // (see `mm/frame.rs::OwnerTag`) guarantees that a
+                    // frame from `pmm_alloc` cannot sit inside a live
+                    // untyped block, so the retype race that motivated
+                    // the old IPC-only path no longer exists. File-
+                    // backed and shm regions still fall through: the
+                    // demand handler gates on MoKind and returns
+                    // `Ok(false)` for those so mmsrv pages them in.
+                    let demand_result = vspace.handle_demand_fault(f.cr2, fault);
+                    if let Ok(true) = demand_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
+                    }
+                    // Stack growth is handled entirely by the demand
+                    // fault path now: every byte of the full-span stack
+                    // reserve is covered by a REGION_KIND_STACK VmArea
+                    // + DEMAND PTE at map time, so a stack miss is a
+                    // normal MO-backed demand fault. An access below
+                    // the reserve base falls into the unmapped guard
+                    // hole and drops through to SIGSEGV here.
+                    let oom =
+                        matches!(
+                            cow_pooled_result,
+                            Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                        ) || matches!(cow_result, Err(crate::mm::vspace::VSpaceError::OutOfMemory))
+                            || matches!(
+                                demand_result,
+                                Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                            );
+                    if oom && !current.is_null() && !(*current).fault_pipe.is_null() {
+                        let record = crate::ipc::fault::oom_record(f.cr2, f.rip, 0);
+                        // `deliver_fault` parks `current` on the
+                        // bound fault pipe's `MP_CALL`-shaped reply
+                        // path. `true` means the handler replied
+                        // `KERNITE_OK` — return to userspace at the
+                        // faulting RIP for instruction retry.
+                        // `false` means no live handler / non-OK
+                        // reply / cancel — escalate to destroy.
+                        if crate::ipc::fault::deliver_fault(current, record) {
+                            return;
+                        }
+                        crate::task::quiesce::begin_destroy_on_fault(current);
+                        scheduler.reschedule();
+                        return;
+                    }
                 }
             }
 
-            if !current.is_null() && !(*current).fault_handler.is_null() {
-                let fault_ep = &mut *((*current).fault_handler
-                    as *mut crate::ipc::Endpoint);
-
-                // Build fault message using arch-neutral PageFaultInfo
-                // for VMFaults, raw error_code for other exceptions.
-                let msg = if let Some(ref fault) = pf_fault {
+            if !current.is_null() && !(*current).fault_pipe.is_null() {
+                let record = if let Some(ref fault) = pf_fault {
                     let is_instr = f.error_code & 16 != 0;
+                    if fault.present && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        let _ = vspace.note_present_fault_activity(f.cr2);
+                    }
                     let ipc_ec = fault.to_ipc_error_code(is_instr);
-                    crate::ipc::vm_fault_message(
-                        f.cr2,
-                        ipc_ec,
-                        f.rip,
-                        is_instr,
-                    )
+                    crate::ipc::fault::page_fault_record(f.cr2, ipc_ec, f.rip, is_instr)
                 } else {
-                    crate::ipc::user_exception_message(
-                        f.vector,
-                        f.error_code,
-                        f.rip,
-                        f.rsp,
-                    )
+                    crate::ipc::fault::user_exception_record(f.vector, f.error_code, f.rip, f.rsp)
                 };
 
-                // Deliver to handler endpoint (sets state/blocked_reason internally)
-                fault_ep.deliver_fault(current, &msg);
-
-                // Switch to handler (or whoever is next)
+                if crate::ipc::fault::deliver_fault(current, record) {
+                    return; // handler consumed → instruction retry
+                }
+                crate::task::quiesce::begin_destroy_on_fault(current);
                 scheduler.reschedule();
-
-                // Handler replied — we're back. Return to assembly which
-                // restores GPRs from the exception frame and iretq retries
-                // the faulting instruction.
                 return;
             }
         }
     }
 
-    // No fault handler — diagnostic dump
+    if (f.cs & 3) == 0 {
+        crate::kernel::panic::fatal_exception_context(
+            "x86 exception",
+            format_args!(
+                "{} vector={} error={:#x}",
+                f.exception_name(),
+                f.vector,
+                f.error_code
+            ),
+            x86_panic_context(f),
+            || dump_x86_exception(f),
+        );
+    }
+
+    // No fault handler — user diagnostic dump
     // No lock is held on exception entry; assembly stubs do not acquire locks.
     // reschedule() acquires per-CPU scheduler lock internally if needed.
     // Use raw serial — this is a crash path, another CPU may hold SERIAL_LOCK
     {
-        crate::serial_puts_raw("\n*** EXCEPTION: ");
-        crate::serial_puts_raw(f.exception_name());
-        crate::serial_puts_raw(" (vector ");
-        crate::serial_dec_raw(f.vector);
-        crate::serial_puts_raw(", error_code ");
-        crate::serial_hex_raw(f.error_code);
-        crate::serial_puts_raw(")\n");
+        crate::kernel::printk::serial_puts_raw("\n*** EXCEPTION: ");
+        crate::kernel::printk::serial_puts_raw(f.exception_name());
+        crate::kernel::printk::serial_puts_raw(" (vector ");
+        crate::kernel::printk::serial_dec_raw(f.vector);
+        crate::kernel::printk::serial_puts_raw(", error_code ");
+        crate::kernel::printk::serial_hex_raw(f.error_code);
+        crate::kernel::printk::serial_puts_raw(")\n");
 
         if f.vector == 14 {
-            crate::serial_puts_raw("  CR2 (fault addr): ");
-            crate::serial_hex_raw(f.cr2);
-            crate::serial_putc_hw(b'\n');
-            crate::serial_puts_raw("  Flags: ");
-            if f.error_code & 1 != 0 { crate::serial_puts_raw("P "); } else { crate::serial_puts_raw("NP "); }
-            if f.error_code & 2 != 0 { crate::serial_puts_raw("W "); } else { crate::serial_puts_raw("R "); }
-            if f.error_code & 4 != 0 { crate::serial_puts_raw("U "); } else { crate::serial_puts_raw("S "); }
-            if f.error_code & 8 != 0 { crate::serial_puts_raw("RSVD "); }
-            if f.error_code & 16 != 0 { crate::serial_puts_raw("I/D "); }
-            crate::serial_putc_hw(b'\n');
+            crate::kernel::printk::serial_puts_raw("  CR2 (fault addr): ");
+            crate::kernel::printk::serial_hex_raw(f.cr2);
+            crate::kernel::printk::serial_putc_hw(b'\n');
+            crate::kernel::printk::serial_puts_raw("  Flags: ");
+            if f.error_code & 1 != 0 {
+                crate::kernel::printk::serial_puts_raw("P ");
+            } else {
+                crate::kernel::printk::serial_puts_raw("NP ");
+            }
+            if f.error_code & 2 != 0 {
+                crate::kernel::printk::serial_puts_raw("W ");
+            } else {
+                crate::kernel::printk::serial_puts_raw("R ");
+            }
+            if f.error_code & 4 != 0 {
+                crate::kernel::printk::serial_puts_raw("U ");
+            } else {
+                crate::kernel::printk::serial_puts_raw("S ");
+            }
+            if f.error_code & 8 != 0 {
+                crate::kernel::printk::serial_puts_raw("RSVD ");
+            }
+            if f.error_code & 16 != 0 {
+                crate::kernel::printk::serial_puts_raw("I/D ");
+            }
+            crate::kernel::printk::serial_putc_hw(b'\n');
 
             // Dump PTE chain for the faulting address to diagnose NX at any level
             if f.error_code & 16 != 0 {
@@ -389,46 +481,74 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 let addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
                 let nx_bit: u64 = 1u64 << 63;
 
-                let pml4 = unsafe { &*(crate::mm::phys_to_virt(cr3 & addr_mask) as *const PageTable) };
+                let pml4 =
+                    unsafe { &*(crate::mm::phys_to_virt(cr3 & addr_mask) as *const PageTable) };
                 let pml4_idx = ((f.cr2 >> 39) & 0x1FF) as usize;
                 let pml4e = pml4.entry(pml4_idx);
-                crate::serial_puts_raw("  PML4E["); crate::serial_dec_raw(pml4_idx as u64);
-                crate::serial_puts_raw("]="); crate::serial_hex_raw(pml4e);
-                if pml4e & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
-                crate::serial_putc_hw(b'\n');
+                crate::kernel::printk::serial_puts_raw("  PML4E[");
+                crate::kernel::printk::serial_dec_raw(pml4_idx as u64);
+                crate::kernel::printk::serial_puts_raw("]=");
+                crate::kernel::printk::serial_hex_raw(pml4e);
+                if pml4e & nx_bit != 0 {
+                    crate::kernel::printk::serial_puts_raw(" NX!");
+                }
+                crate::kernel::printk::serial_putc_hw(b'\n');
 
                 if pml4e & 1 != 0 {
-                    let pdpt = unsafe { &*(crate::mm::phys_to_virt(pml4e & addr_mask) as *const PageTable) };
+                    let pdpt = unsafe {
+                        &*(crate::mm::phys_to_virt(pml4e & addr_mask) as *const PageTable)
+                    };
                     let pdpt_idx = ((f.cr2 >> 30) & 0x1FF) as usize;
                     let pdpte = pdpt.entry(pdpt_idx);
-                    crate::serial_puts_raw("  PDPTE["); crate::serial_dec_raw(pdpt_idx as u64);
-                    crate::serial_puts_raw("]="); crate::serial_hex_raw(pdpte);
-                    if pdpte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
-                    crate::serial_putc_hw(b'\n');
+                    crate::kernel::printk::serial_puts_raw("  PDPTE[");
+                    crate::kernel::printk::serial_dec_raw(pdpt_idx as u64);
+                    crate::kernel::printk::serial_puts_raw("]=");
+                    crate::kernel::printk::serial_hex_raw(pdpte);
+                    if pdpte & nx_bit != 0 {
+                        crate::kernel::printk::serial_puts_raw(" NX!");
+                    }
+                    crate::kernel::printk::serial_putc_hw(b'\n');
 
                     if pdpte & 1 != 0 {
                         if pdpte & (1 << 7) != 0 {
-                            crate::serial_puts_raw("  PDPTE is 1GB page (PS=1), no PD\n");
+                            crate::kernel::printk::serial_puts_raw(
+                                "  PDPTE is 1GB page (PS=1), no PD\n",
+                            );
                         } else {
-                            let pd = unsafe { &*(crate::mm::phys_to_virt(pdpte & addr_mask) as *const PageTable) };
+                            let pd = unsafe {
+                                &*(crate::mm::phys_to_virt(pdpte & addr_mask) as *const PageTable)
+                            };
                             let pd_idx = ((f.cr2 >> 21) & 0x1FF) as usize;
                             let pde = pd.entry(pd_idx);
-                            crate::serial_puts_raw("  PDE["); crate::serial_dec_raw(pd_idx as u64);
-                            crate::serial_puts_raw("]="); crate::serial_hex_raw(pde);
-                            if pde & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
-                            crate::serial_putc_hw(b'\n');
+                            crate::kernel::printk::serial_puts_raw("  PDE[");
+                            crate::kernel::printk::serial_dec_raw(pd_idx as u64);
+                            crate::kernel::printk::serial_puts_raw("]=");
+                            crate::kernel::printk::serial_hex_raw(pde);
+                            if pde & nx_bit != 0 {
+                                crate::kernel::printk::serial_puts_raw(" NX!");
+                            }
+                            crate::kernel::printk::serial_putc_hw(b'\n');
 
                             if pde & 1 != 0 {
                                 if pde & (1 << 7) != 0 {
-                                    crate::serial_puts_raw("  PDE is 2MB page (PS=1), no PT\n");
+                                    crate::kernel::printk::serial_puts_raw(
+                                        "  PDE is 2MB page (PS=1), no PT\n",
+                                    );
                                 } else {
-                                    let pt = unsafe { &*(crate::mm::phys_to_virt(pde & addr_mask) as *const PageTable) };
+                                    let pt = unsafe {
+                                        &*(crate::mm::phys_to_virt(pde & addr_mask)
+                                            as *const PageTable)
+                                    };
                                     let pt_idx = ((f.cr2 >> 12) & 0x1FF) as usize;
                                     let pte = pt.entry(pt_idx);
-                                    crate::serial_puts_raw("  PTE["); crate::serial_dec_raw(pt_idx as u64);
-                                    crate::serial_puts_raw("]="); crate::serial_hex_raw(pte);
-                                    if pte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
-                                    crate::serial_putc_hw(b'\n');
+                                    crate::kernel::printk::serial_puts_raw("  PTE[");
+                                    crate::kernel::printk::serial_dec_raw(pt_idx as u64);
+                                    crate::kernel::printk::serial_puts_raw("]=");
+                                    crate::kernel::printk::serial_hex_raw(pte);
+                                    if pte & nx_bit != 0 {
+                                        crate::kernel::printk::serial_puts_raw(" NX!");
+                                    }
+                                    crate::kernel::printk::serial_putc_hw(b'\n');
                                 }
                             }
                         }
@@ -438,80 +558,288 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         }
 
         if f.vector == 13 && f.error_code != 0 {
-            crate::serial_puts_raw("  Selector: ");
-            crate::serial_hex_raw(f.error_code & 0xFFF8);
-            crate::serial_puts_raw("  Table: ");
+            crate::kernel::printk::serial_puts_raw("  Selector: ");
+            crate::kernel::printk::serial_hex_raw(f.error_code & 0xFFF8);
+            crate::kernel::printk::serial_puts_raw("  Table: ");
             match (f.error_code >> 1) & 3 {
-                0 => crate::serial_puts_raw("GDT"),
-                1 => crate::serial_puts_raw("IDT"),
-                2 => crate::serial_puts_raw("LDT"),
-                3 => crate::serial_puts_raw("IDT"),
+                0 => crate::kernel::printk::serial_puts_raw("GDT"),
+                1 => crate::kernel::printk::serial_puts_raw("IDT"),
+                2 => crate::kernel::printk::serial_puts_raw("LDT"),
+                3 => crate::kernel::printk::serial_puts_raw("IDT"),
                 _ => {}
             }
-            if f.error_code & 1 != 0 { crate::serial_puts_raw(" (External)"); }
-            crate::serial_putc_hw(b'\n');
+            if f.error_code & 1 != 0 {
+                crate::kernel::printk::serial_puts_raw(" (External)");
+            }
+            crate::kernel::printk::serial_putc_hw(b'\n');
         }
 
-        crate::serial_puts_raw("  RIP:    "); crate::serial_hex_raw(f.rip);
-        crate::serial_puts_raw("  CS:     "); crate::serial_hex_raw(f.cs); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  RSP:    "); crate::serial_hex_raw(f.rsp);
-        crate::serial_puts_raw("  SS:     "); crate::serial_hex_raw(f.ss); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  RFLAGS: "); crate::serial_hex_raw(f.rflags); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  RAX: "); crate::serial_hex_raw(f.rax);
-        crate::serial_puts_raw("  RBX: "); crate::serial_hex_raw(f.rbx);
-        crate::serial_puts_raw("  RCX: "); crate::serial_hex_raw(f.rcx); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  RDX: "); crate::serial_hex_raw(f.rdx);
-        crate::serial_puts_raw("  RSI: "); crate::serial_hex_raw(f.rsi);
-        crate::serial_puts_raw("  RDI: "); crate::serial_hex_raw(f.rdi); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  RBP: "); crate::serial_hex_raw(f.rbp);
-        crate::serial_puts_raw("  R8:  "); crate::serial_hex_raw(f.r8);
-        crate::serial_puts_raw("  R9:  "); crate::serial_hex_raw(f.r9); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  R10: "); crate::serial_hex_raw(f.r10);
-        crate::serial_puts_raw("  R11: "); crate::serial_hex_raw(f.r11);
-        crate::serial_puts_raw("  R12: "); crate::serial_hex_raw(f.r12); crate::serial_putc_hw(b'\n');
-        crate::serial_puts_raw("  R13: "); crate::serial_hex_raw(f.r13);
-        crate::serial_puts_raw("  R14: "); crate::serial_hex_raw(f.r14);
-        crate::serial_puts_raw("  R15: "); crate::serial_hex_raw(f.r15); crate::serial_putc_hw(b'\n');
-
-
-
+        crate::kernel::printk::serial_puts_raw("  RIP:    ");
+        crate::kernel::printk::serial_hex_raw(f.rip);
+        crate::kernel::printk::serial_puts_raw("  CS:     ");
+        crate::kernel::printk::serial_hex_raw(f.cs);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  RSP:    ");
+        crate::kernel::printk::serial_hex_raw(f.rsp);
+        crate::kernel::printk::serial_puts_raw("  SS:     ");
+        crate::kernel::printk::serial_hex_raw(f.ss);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  RFLAGS: ");
+        crate::kernel::printk::serial_hex_raw(f.rflags);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  RAX: ");
+        crate::kernel::printk::serial_hex_raw(f.rax);
+        crate::kernel::printk::serial_puts_raw("  RBX: ");
+        crate::kernel::printk::serial_hex_raw(f.rbx);
+        crate::kernel::printk::serial_puts_raw("  RCX: ");
+        crate::kernel::printk::serial_hex_raw(f.rcx);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  RDX: ");
+        crate::kernel::printk::serial_hex_raw(f.rdx);
+        crate::kernel::printk::serial_puts_raw("  RSI: ");
+        crate::kernel::printk::serial_hex_raw(f.rsi);
+        crate::kernel::printk::serial_puts_raw("  RDI: ");
+        crate::kernel::printk::serial_hex_raw(f.rdi);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  RBP: ");
+        crate::kernel::printk::serial_hex_raw(f.rbp);
+        crate::kernel::printk::serial_puts_raw("  R8:  ");
+        crate::kernel::printk::serial_hex_raw(f.r8);
+        crate::kernel::printk::serial_puts_raw("  R9:  ");
+        crate::kernel::printk::serial_hex_raw(f.r9);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  R10: ");
+        crate::kernel::printk::serial_hex_raw(f.r10);
+        crate::kernel::printk::serial_puts_raw("  R11: ");
+        crate::kernel::printk::serial_hex_raw(f.r11);
+        crate::kernel::printk::serial_puts_raw("  R12: ");
+        crate::kernel::printk::serial_hex_raw(f.r12);
+        crate::kernel::printk::serial_putc_hw(b'\n');
+        crate::kernel::printk::serial_puts_raw("  R13: ");
+        crate::kernel::printk::serial_hex_raw(f.r13);
+        crate::kernel::printk::serial_puts_raw("  R14: ");
+        crate::kernel::printk::serial_hex_raw(f.r14);
+        crate::kernel::printk::serial_puts_raw("  R15: ");
+        crate::kernel::printk::serial_hex_raw(f.r15);
+        crate::kernel::printk::serial_putc_hw(b'\n');
     }
 
     // User-mode fault without handler: terminate thread and reschedule
-    // instead of halting the CPU permanently.
+    // instead of halting the CPU permanently. `begin_destroy_on_fault`
+    // routes through to `arch::system_halt()` if the faulting TCB has
+    // no fault sink — that is the core-service self-fault case where
+    // tearing down the TCB would deadlock the system.
     if (f.cs & 3) != 0 {
         unsafe {
-            // No lock is held on exception entry; assembly stubs do not acquire locks.
-            // reschedule() acquires per-CPU scheduler lock internally and manages
-            // lock lifecycle around context_switch.
             let scheduler = crate::sched::scheduler::scheduler();
             let current = scheduler.current();
             if !current.is_null() {
-                (*current).state = crate::sched::thread::ThreadState::Inactive;
-                crate::serial_puts_raw("[FAULT] Thread terminated, rescheduling\n");
-                // reschedule picks next runnable thread and context-switches.
-                // The dead thread never resumes, so the assembly epilogue
-                // The iretq for THIS frame is never reached.
-                // That is correct: do_context_switch releases per-object lock
-                // before switching, and the new thread resumes normally.
-                scheduler.reschedule();
-                // Not reached — this thread is Inactive and won't be scheduled
+                crate::kernel::printk::serial_puts_raw("[FAULT] Thread terminated, rescheduling\n");
+                crate::task::quiesce::begin_destroy_on_fault(current);
             }
-            // Fallback: no current thread (shouldn't happen), halt
         }
     }
 
-    // Kernel-mode fault: no recovery possible
-    loop {
-        super::halt();
+    crate::sched::scheduler::scheduler().reschedule();
+}
+
+fn dump_x86_exception(f: &ExceptionFrame) {
+    use crate::kernel::printk::{serial_dec_raw, serial_hex_raw, serial_putc_hw, serial_puts_raw};
+
+    serial_puts_raw("exception: ");
+    serial_puts_raw(f.exception_name());
+    serial_puts_raw(" vector=");
+    serial_dec_raw(f.vector);
+    serial_puts_raw(" error_code=");
+    serial_hex_raw(f.error_code);
+    serial_putc_hw(b'\n');
+
+    if f.vector == 14 {
+        serial_puts_raw("page_fault: cr2=");
+        serial_hex_raw(f.cr2);
+        serial_puts_raw(" flags=");
+        if f.error_code & 1 != 0 {
+            serial_puts_raw("P ");
+        } else {
+            serial_puts_raw("NP ");
+        }
+        if f.error_code & 2 != 0 {
+            serial_puts_raw("W ");
+        } else {
+            serial_puts_raw("R ");
+        }
+        if f.error_code & 4 != 0 {
+            serial_puts_raw("U ");
+        } else {
+            serial_puts_raw("S ");
+        }
+        if f.error_code & 8 != 0 {
+            serial_puts_raw("RSVD ");
+        }
+        if f.error_code & 16 != 0 {
+            serial_puts_raw("I/D ");
+        }
+        serial_putc_hw(b'\n');
+        dump_x86_pte_chain(f.cr2);
     }
+
+    if f.vector == 13 && f.error_code != 0 {
+        serial_puts_raw("gpf: selector=");
+        serial_hex_raw(f.error_code & 0xFFF8);
+        serial_puts_raw(" table=");
+        match (f.error_code >> 1) & 3 {
+            0 => serial_puts_raw("GDT"),
+            1 => serial_puts_raw("IDT"),
+            2 => serial_puts_raw("LDT"),
+            3 => serial_puts_raw("IDT"),
+            _ => {}
+        }
+        if f.error_code & 1 != 0 {
+            serial_puts_raw(" external");
+        }
+        serial_putc_hw(b'\n');
+    }
+
+    serial_puts_raw("RIP: ");
+    serial_hex_raw(f.rip);
+    serial_puts_raw(" CS: ");
+    serial_hex_raw(f.cs);
+    serial_puts_raw(" RFLAGS: ");
+    serial_hex_raw(f.rflags);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("RSP: ");
+    serial_hex_raw(f.rsp);
+    serial_puts_raw(" SS: ");
+    serial_hex_raw(f.ss);
+    serial_puts_raw(" RBP: ");
+    serial_hex_raw(f.rbp);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("RAX: ");
+    serial_hex_raw(f.rax);
+    serial_puts_raw(" RBX: ");
+    serial_hex_raw(f.rbx);
+    serial_puts_raw(" RCX: ");
+    serial_hex_raw(f.rcx);
+    serial_puts_raw(" RDX: ");
+    serial_hex_raw(f.rdx);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("RSI: ");
+    serial_hex_raw(f.rsi);
+    serial_puts_raw(" RDI: ");
+    serial_hex_raw(f.rdi);
+    serial_puts_raw(" R8: ");
+    serial_hex_raw(f.r8);
+    serial_puts_raw(" R9: ");
+    serial_hex_raw(f.r9);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("R10: ");
+    serial_hex_raw(f.r10);
+    serial_puts_raw(" R11: ");
+    serial_hex_raw(f.r11);
+    serial_puts_raw(" R12: ");
+    serial_hex_raw(f.r12);
+    serial_puts_raw(" R13: ");
+    serial_hex_raw(f.r13);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("R14: ");
+    serial_hex_raw(f.r14);
+    serial_puts_raw(" R15: ");
+    serial_hex_raw(f.r15);
+    serial_putc_hw(b'\n');
+}
+
+fn x86_panic_context(f: &ExceptionFrame) -> crate::kernel::stacktrace::ArchPanicContext {
+    crate::kernel::stacktrace::ArchPanicContext {
+        kind: crate::kernel::stacktrace::ContextKind::Exception,
+        rip: f.rip,
+        rsp: f.rsp,
+        rbp: f.rbp,
+        rflags: f.rflags,
+        cr2: f.cr2,
+        cr3: super::paging::read_cr3(),
+        vector: f.vector,
+        error_code: f.error_code,
+        irq_state: f.rflags & (1 << 9),
+    }
+}
+
+fn dump_x86_pte_chain(addr: u64) {
+    use super::paging::PageTable;
+    use crate::kernel::printk::{serial_dec_raw, serial_hex_raw, serial_putc_hw, serial_puts_raw};
+
+    let cr3 = super::paging::read_cr3();
+    let addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
+    let nx_bit: u64 = 1u64 << 63;
+
+    let pml4 = unsafe { &*(crate::mm::phys_to_virt(cr3 & addr_mask) as *const PageTable) };
+    let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+    let pml4e = pml4.entry(pml4_idx);
+    serial_puts_raw("PTE walk: cr3=");
+    serial_hex_raw(cr3);
+    serial_putc_hw(b'\n');
+    serial_puts_raw("  PML4E[");
+    serial_dec_raw(pml4_idx as u64);
+    serial_puts_raw("]=");
+    serial_hex_raw(pml4e);
+    if pml4e & nx_bit != 0 {
+        serial_puts_raw(" NX");
+    }
+    serial_putc_hw(b'\n');
+
+    if pml4e & 1 == 0 {
+        return;
+    }
+
+    let pdpt = unsafe { &*(crate::mm::phys_to_virt(pml4e & addr_mask) as *const PageTable) };
+    let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+    let pdpte = pdpt.entry(pdpt_idx);
+    serial_puts_raw("  PDPTE[");
+    serial_dec_raw(pdpt_idx as u64);
+    serial_puts_raw("]=");
+    serial_hex_raw(pdpte);
+    if pdpte & nx_bit != 0 {
+        serial_puts_raw(" NX");
+    }
+    serial_putc_hw(b'\n');
+
+    if pdpte & 1 == 0 || pdpte & (1 << 7) != 0 {
+        return;
+    }
+
+    let pd = unsafe { &*(crate::mm::phys_to_virt(pdpte & addr_mask) as *const PageTable) };
+    let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+    let pde = pd.entry(pd_idx);
+    serial_puts_raw("  PDE[");
+    serial_dec_raw(pd_idx as u64);
+    serial_puts_raw("]=");
+    serial_hex_raw(pde);
+    if pde & nx_bit != 0 {
+        serial_puts_raw(" NX");
+    }
+    serial_putc_hw(b'\n');
+
+    if pde & 1 == 0 || pde & (1 << 7) != 0 {
+        return;
+    }
+
+    let pt = unsafe { &*(crate::mm::phys_to_virt(pde & addr_mask) as *const PageTable) };
+    let pt_idx = ((addr >> 12) & 0x1FF) as usize;
+    let pte = pt.entry(pt_idx);
+    serial_puts_raw("  PTE[");
+    serial_dec_raw(pt_idx as u64);
+    serial_puts_raw("]=");
+    serial_hex_raw(pte);
+    if pte & nx_bit != 0 {
+        serial_puts_raw(" NX");
+    }
+    serial_putc_hw(b'\n');
 }
 
 /// Initialize IDT
 pub fn init() {
     // SAFETY: Single-threaded initialization, IDT is properly structured
     unsafe {
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("\n[IDT] Starting init\n");
             _g.puts("[IDT] IDT addr: ");
             _g.hex((&raw const IDT) as u64);
@@ -567,12 +895,12 @@ pub fn init() {
             }
         }
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT] Exception handlers set\n");
             _g.puts("[IDT] Setting IRQ handlers\n");
         });
         idt.entries[32].set_handler(irq_stub_timer as *const () as u64);
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT]   timer handler: ");
             _g.hex(irq_stub_timer as *const () as u64);
             _g.putc(b'\n');
@@ -586,7 +914,7 @@ pub fn init() {
         idt.entries[48].set_handler(irq_stub_ipi_tlb_shootdown as *const () as u64);
         // Vector 49: IPI full TLB Shootdown
         idt.entries[49].set_handler(irq_stub_ipi_tlb_shootdown_all as *const () as u64);
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT] IPI handlers set (vectors 40-41, 48-49)\n");
         });
 
@@ -604,7 +932,7 @@ pub fn init() {
         idt.entries[45].set_handler(irq_stub_generic_45 as *const () as u64);
         idt.entries[46].set_handler(irq_stub_generic_46 as *const () as u64);
         idt.entries[47].set_handler(irq_stub_generic_47 as *const () as u64);
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
             _g.puts("[IDT] Preparing IDT pointer\n");
         });
@@ -613,7 +941,7 @@ pub fn init() {
             base: (&raw const IDT) as u64,
         };
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT]   limit: ");
             _g.hex(idt_ptr.limit as u64);
             _g.puts("\n[IDT]   base: ");
@@ -622,22 +950,18 @@ pub fn init() {
         });
 
         // Load IDT
-        crate::kdebug!(arch, |_g| { _g.puts("[IDT] Calling lidt\n"); });
-        core::arch::asm!(
-            "lidt [{}]",
-            in(reg) &idt_ptr,
-            options(nostack)
-        );
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[IDT] Calling lidt\n");
+        });
+        x86_idt_lidt(&idt_ptr);
 
         // Verify with sidt
-        crate::kdebug!(arch, |_g| { _g.puts("[IDT] Verifying with sidt...\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[IDT] Verifying with sidt...\n");
+        });
         let mut idt_read_back: IdtPtr = IdtPtr { limit: 0, base: 0 };
-        core::arch::asm!(
-            "sidt [{}]",
-            in(reg) &mut idt_read_back,
-            options(nostack)
-        );
-        crate::kdebug!(arch, |_g| {
+        x86_idt_sidt(&mut idt_read_back);
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT] sidt result: limit=");
             _g.hex(idt_read_back.limit as u64);
             _g.puts(" base=");
@@ -646,7 +970,7 @@ pub fn init() {
         });
 
         // Verify struct sizes
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IDT] Struct sizes:\n");
             _g.puts("  size_of::<IdtEntry>() = ");
             _g.hex(size_of::<IdtEntry>() as u64);
@@ -658,21 +982,29 @@ pub fn init() {
         });
 
         assert!(size_of::<IdtEntry>() == 16, "IdtEntry must be 16 bytes!");
-        assert!(size_of::<IdtPtr>() == 10, "IdtPtr must be 10 bytes (packed)!");
+        assert!(
+            size_of::<IdtPtr>() == 10,
+            "IdtPtr must be 10 bytes (packed)!"
+        );
 
-        crate::kdebug!(arch, |_g| { _g.puts("[IDT] IDT loaded and verified successfully\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[IDT] IDT loaded and verified successfully\n");
+        });
     }
 }
 
 /// Timer interrupt handler (called from assembly stub irq_stub_timer)
 ///
 /// Vector 32 - dispatches to APIC or PIT handler based on active timer backend.
+/// `frame` points at the saved `InterruptFrame`; the timer backend still passes
+/// the interrupted mode hint through to the scheduler's timer API shape, while
+/// runtime attribution itself happens in the common entry/exit hooks.
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler_timer() {
+extern "C" fn irq_handler_timer(frame: *const InterruptFrame) {
     if super::has_apic() {
-        super::apic::timer_handler();
+        super::apic::timer_handler(frame);
     } else {
-        super::pit::timer_handler();
+        super::pit::timer_handler(frame);
     }
 }
 
@@ -681,7 +1013,7 @@ extern "C" fn irq_handler_timer() {
 /// Vector 40 - sent when a VSpace is being torn down and this CPU
 /// needs to switch away from it. Only fires in APIC mode (SMP).
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler_ipi_vspace_teardown() {
+extern "C" fn irq_handler_ipi_vspace_teardown(_frame: *const InterruptFrame) {
     if super::has_apic() {
         super::apic::handle_ipi(super::apic::IpiKind::VSpaceTeardown);
         super::apic::eoi();
@@ -693,7 +1025,7 @@ extern "C" fn irq_handler_ipi_vspace_teardown() {
 /// Vector 41 - sent when a thread with specific CPU affinity is
 /// enqueued and the target CPU should check for work. Only fires in APIC mode.
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler_ipi_reschedule() {
+extern "C" fn irq_handler_ipi_reschedule(_frame: *const InterruptFrame) {
     if super::has_apic() {
         // Send EOI BEFORE handle_ipi: handle_reschedule_ipi() may context-switch
         // via do_context_switch(), and the old thread may not resume for a long
@@ -709,7 +1041,7 @@ extern "C" fn irq_handler_ipi_reschedule() {
 /// Vector 48 — sent when a page table entry is modified and remote CPUs
 /// must invalidate the corresponding TLB entry via `invlpg`.
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler_ipi_tlb_shootdown() {
+extern "C" fn irq_handler_ipi_tlb_shootdown(_frame: *const InterruptFrame) {
     if super::has_apic() {
         let cpu_id = crate::arch::current_cpu() as usize;
         let addr = super::apic::tlb_shootdown_addr(cpu_id);
@@ -725,7 +1057,7 @@ extern "C" fn irq_handler_ipi_tlb_shootdown() {
 /// Vector 49 — sent when many PTEs are updated in one operation.
 /// Reloading CR3 flushes non-global TLB entries in one step.
 #[unsafe(no_mangle)]
-extern "C" fn irq_handler_ipi_tlb_shootdown_all() {
+extern "C" fn irq_handler_ipi_tlb_shootdown_all(_frame: *const InterruptFrame) {
     if super::has_apic() {
         let cr3 = super::paging::read_cr3();
         unsafe {
@@ -743,14 +1075,18 @@ extern "C" fn irq_handler_ipi_tlb_shootdown_all() {
 extern "C" fn irq_handler_generic(vector: u32) {
     // Convert vector to IRQ number (vector = IRQ + 32)
     let irq_num = vector.saturating_sub(32) as usize;
-    crate::ipc::irq::dispatch_irq(irq_num);
+    crate::event::irq::dispatch_irq(irq_num);
     if super::has_apic() {
         super::apic::eoi();
     } else {
         // PIC EOI: if IRQ >= 8, also send EOI to slave PIC
         if irq_num >= 8 {
-            unsafe { super::outb(0xA0, 0x20); }
+            unsafe {
+                super::outb(0xA0, 0x20);
+            }
         }
-        unsafe { super::outb(0x20, 0x20); }
+        unsafe {
+            super::outb(0x20, 0x20);
+        }
     }
 }

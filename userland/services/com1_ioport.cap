@@ -1,0 +1,5 @@
+[Unit]
+Name=com1_ioport.cap
+
+[Capability]
+SourceSlot=20

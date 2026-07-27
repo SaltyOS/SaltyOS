@@ -6,10 +6,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::invoke;
+use trona_kernel::invoke;
+use trona_kernel::uapi::*;
 
-/// ECAM device untyped cap slot (received via CopyCap from init slot 15).
+/// ECAM device untyped cap slot (mirrors init slot 15 in pcidrv's bootstrap layout).
 const CAP_ECAM_DEVUT: u64 = 64;
 
 /// Self VSpace cap slot.
@@ -30,11 +30,11 @@ pub fn pci_init() {
     // Map 1 MiB (256 pages x 4 KiB) covering bus 0 config space.
     // Bus 0 has 32 devices x 8 functions x 4 KiB = 1 MiB.
     let num_pages = 256u64;
-    let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_CACHE_DISABLE;
+    let flags = KERNITE_PAGE_FLAG_WRITABLE | KERNITE_PAGE_FLAG_USER | KERNITE_PAGE_FLAG_NOCACHE;
 
     let (err, mapped) = invoke::vspace_map_device_range(
-        CAP_SELF_VSPACE,
-        CAP_ECAM_DEVUT,
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_VSPACE),
+        trona_runtime::core::slot_alloc::resolved_cap_ref(CAP_ECAM_DEVUT),
         0,
         ECAM_VADDR,
         num_pages,
@@ -42,7 +42,7 @@ pub fn pci_init() {
     );
 
     if err != 0 || mapped != num_pages {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[pcidrv] ECAM map failed err=");
             _lb.hex(err as u64);
             _lb.str(b" mapped=");

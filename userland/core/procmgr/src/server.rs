@@ -1,15 +1,15 @@
 //! Process manager server runtime.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::Cap;
-use trona::types::TronaMsg;
+use trona_kernel::core_types::Cap;
+use trona_kernel::core_types::TronaMsg;
 
-use crate::{
-    dispatch, reply_path, POST_REPLY_RESUME_COUNT, POST_REPLY_RESUME_QUEUE,
-    POST_REPLY_RESUME_QUEUE_CAP,
-};
 use crate::base::readiness;
 use crate::personality::posix;
+use crate::{
+    POST_REPLY_RESUME_COUNT, POST_REPLY_RESUME_QUEUE, POST_REPLY_RESUME_QUEUE_CAP, dispatch,
+    reply_path,
+};
 
 pub(crate) unsafe fn run_post_reply_work() {
     unsafe {
@@ -25,9 +25,9 @@ pub(crate) unsafe fn run_post_reply_work() {
                 continue;
             }
 
-            let err = trona::invoke::tcb_resume(tcb);
+            let err = trona_kernel::invoke::tcb_resume(tcb);
             if err != 0 {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] deferred resume failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b" tcb=");
@@ -63,7 +63,7 @@ pub(crate) unsafe fn run() -> ! {
 
         let err = reply_path::prime_receive(&raw mut msg, &raw mut badge);
         if err != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] initial recv failed\n");
             });
             crate::idle();
@@ -76,6 +76,8 @@ pub(crate) unsafe fn run() -> ! {
             if msg.label == 0 {
                 posix::timer::process_expired_timers();
                 readiness::check_pending_readiness();
+                crate::lifecycle::wait::process_completion_wait_deadlines();
+                crate::lifecycle::exit::process_pending_teardowns();
             }
 
             let mut reply = TronaMsg::zeroed();
@@ -88,8 +90,8 @@ pub(crate) unsafe fn run() -> ! {
                 &raw mut badge,
             );
             if err != 0 {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[PROCMGR] reply_recv failed err=");
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] mp_write_reply_read failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
                 });

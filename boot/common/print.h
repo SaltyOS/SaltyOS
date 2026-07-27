@@ -12,10 +12,11 @@
 #include "types.h"
 
 /* Output targets */
-#define PRINT_TARGET_SERIAL  (1 << 0)
-#define PRINT_TARGET_VGA     (1 << 1)
-#define PRINT_TARGET_FB      (1 << 2)
-#define PRINT_TARGET_ALL     (PRINT_TARGET_SERIAL | PRINT_TARGET_VGA | PRINT_TARGET_FB)
+#define PRINT_TARGET_SERIAL (1 << 0)
+#define PRINT_TARGET_VGA (1 << 1)
+#define PRINT_TARGET_FB (1 << 2)
+#define PRINT_TARGET_ALL                                                       \
+  (PRINT_TARGET_SERIAL | PRINT_TARGET_VGA | PRINT_TARGET_FB)
 
 /* Initialize print subsystem */
 void print_init(uint32_t targets);
@@ -49,8 +50,8 @@ void serial_putc(char c);
 
 /* VGA text mode (x86-specific) */
 #define VGA_TEXT_BASE 0xB8000
-#define VGA_WIDTH     80
-#define VGA_HEIGHT    25
+#define VGA_WIDTH 80
+#define VGA_HEIGHT 25
 
 void vga_init(void);
 void vga_putc(char c);

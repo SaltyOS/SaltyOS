@@ -137,10 +137,6 @@ pub(crate) fn build_with_ttl(
     total_len
 }
 
-pub(crate) fn build(src: u32, dst: u32, protocol: u8, payload: &[u8], buf: &mut [u8]) -> usize {
-    build_with_ttl(src, dst, protocol, 64, payload, buf)
-}
-
 /// Route a destination IP: if on the same subnet, return dst directly;
 /// otherwise return the gateway IP.
 pub(crate) fn route(dst: u32) -> u32 {
@@ -153,12 +149,4 @@ pub(crate) fn our_ip() -> u32 {
 
 pub(crate) fn gateway_ip() -> u32 {
     crate::net::config::gateway_ip()
-}
-
-pub(crate) fn subnet_mask() -> u32 {
-    crate::net::config::subnet_mask()
-}
-
-pub(crate) fn is_broadcast(dst: u32) -> bool {
-    crate::net::config::is_broadcast(dst)
 }

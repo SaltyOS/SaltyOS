@@ -1,186 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPC Subsystem
 //!
-//! Synchronous endpoints and asynchronous notifications.
+//! Hosts the synchronous and bulk IPC primitives — `MessagePipe`
+//! (record + cap-carrier transfer with `MP_CALL` / `reply-marked MP_WRITE` on the
+//! pipe endpoint), `DataPipe` (bytes ring), `Futex`, and per-task
+//! `Fault` pipes.
 //!
-//! SPDX-License-Identifier: GPL-2.0-only
 
-mod endpoint;
+pub mod data_pipe;
+pub mod fault;
 pub mod futex;
-pub mod irq;
-mod notification;
-mod queue;
-
-pub use endpoint::{Endpoint, EndpointState};
-pub use irq::IrqHandler;
-pub use notification::Notification;
-pub use queue::{RecvWaitQueue, WaitQueue};
-
-/// IPC message (register-based for fastpath)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Message {
-    /// Message label (extracted from msg_info bits 51:12)
-    pub label: u64,
-    /// Number of valid message registers (extracted from msg_info bits 6:0)
-    pub length: usize,
-    /// Number of capabilities to transfer (extracted from msg_info bits 11:7)
-    pub extra_caps: usize,
-    /// Message registers (MR0..MR31)
-    pub regs: [u64; 32],
-    /// Sender CSpace slot indices for capability transfer (up to 4)
-    pub caps: [u64; 4],
-}
-
-impl Message {
-    pub const fn empty() -> Self {
-        Self {
-            label: 0,
-            length: 0,
-            extra_caps: 0,
-            regs: [0; 32],
-            caps: [0; 4],
-        }
-    }
-}
+pub mod message_pipe;
+pub mod transfer;
 
 /// IPC Buffer layout (mapped into user VSpace, shared between kernel and user)
 ///
-/// The msg[] array is overlaid by userland as `struct trona_msg`:
+/// Mirrors `kernite_ipc_buffer` in `kernite/include/uapi/ipc.h` 1:1.
+/// The `msg[]` array is overlaid by userland as `struct trona_msg`:
 ///   msg[0] = label, msg[1] = length, msg[2..33] = regs[0..31]
 /// So 34 slots = 2 header + 32 message registers.
 ///
-/// Total size: 4096 bytes (one page)
+/// Total size: 4096 bytes (one page).
 #[repr(C)]
 pub struct IpcBuffer {
     /// trona_msg overlay: [label, length, regs[0..31]]
-    pub msg: [u64; 34],         // 0x000: 272 bytes
-    /// Badge received from sender
-    pub badge: u64,             // 0x110: 8 bytes
-    /// Capability slots to transfer (sender-side: indices into sender's CNode)
-    pub caps: [u64; 4],         // 0x118: 32 bytes
-    /// CNode for receiving transferred capabilities
-    pub receive_cnode: u64,     // 0x138: 8 bytes
-    /// Starting slot index in receive CNode
-    pub receive_index: u64,     // 0x140: 8 bytes
-    /// CNode depth for receive
-    pub receive_depth: u64,     // 0x148: 8 bytes
-    /// Timeout in nanoseconds for timed IPC operations (SendTimed, etc.).
-    /// Written by userland before the syscall; read by the kernel.
-    pub timeout_ns: u64,        // 0x150: 8 bytes
-    /// Reserved/extended payload area used by invoke extensions.
-    /// VSPACE_WALK writes tuples at word offset 43.
-    pub reserved: [u64; 465],   // 0x158: 3720 bytes
+    pub msg: [u64; 34], // 0x000: 272 bytes
+    /// Badge received from sender.
+    pub badge: u64, // 0x110: 8 bytes
+    /// MP record flags surfaced from the inbound `kernite_mp_record`
+    /// (`KERNITE_MP_FLAG_*`). Distinct from `badge` so the sender's
+    /// tag is not entangled with the kernel-set call/reply bits.
+    pub mp_flags: u64, // 0x118: 8 bytes
+    /// Capability slots — sender-side CSpace indices the sender wants
+    /// to transfer; on the receiver side, the kernel-installed
+    /// receive-side slot indices.
+    pub caps: [u64; 4], // 0x120: 32 bytes
+    /// CNode for receiving transferred capabilities.
+    pub receive_cnode: u64, // 0x140: 8 bytes
+    /// Starting slot index in receive CNode.
+    pub receive_index: u64, // 0x148: 8 bytes
+    /// CSpace depth for resolving `receive_cnode`.
+    pub receive_depth: u64, // 0x150: 8 bytes
+    /// MessagePipe call transaction id. Inbound reads publish it;
+    /// replies echo it so the kernel can wake the matching caller.
+    pub mp_txid: u64, // 0x158: 8 bytes
+    /// Reserved / extended payload area. `reserved[0]` carries the
+    /// receive-slot depth for nested cap delivery; remaining words
+    /// are syscall-specific.
+    pub reserved: [u64; 468], // 0x160: 3744 bytes
 }
 
-// Compile-time assertion: IpcBuffer fits in one page
-const _: () = assert!(core::mem::size_of::<IpcBuffer>() <= 4096);
-
-/// Fault types for user-mode exception delivery
-#[repr(u64)]
-#[derive(Clone, Copy)]
-pub enum FaultType {
-    NullFault = 0,
-    CapFault = 1,
-    VMFault = 2,
-    UnknownSyscall = 3,
-    UserException = 4,
-}
-
-/// Build a VMFault message
-///
-/// Layout:
-///   label = FaultType::VMFault (2)
-///   regs[0] = fault address (CR2)
-///   regs[1] = error code (PF error bits)
-///   regs[2] = faulting RIP
-///   regs[3] = is_instruction_fault (1 if I/D bit set)
-pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool) -> Message {
-    let mut msg = Message::empty();
-    msg.label = FaultType::VMFault as u64;
-    msg.length = 4;
-    msg.regs[0] = address;
-    msg.regs[1] = error_code;
-    msg.regs[2] = rip;
-    msg.regs[3] = is_instr as u64;
-    msg
-}
-
-/// Build a UserException message
-///
-/// Layout:
-///   label = FaultType::UserException (4)
-///   regs[0] = exception vector
-///   regs[1] = error code
-///   regs[2] = faulting RIP
-///   regs[3] = faulting RSP
-pub fn user_exception_message(vector: u64, error_code: u64, rip: u64, rsp: u64) -> Message {
-    let mut msg = Message::empty();
-    msg.label = FaultType::UserException as u64;
-    msg.length = 4;
-    msg.regs[0] = vector;
-    msg.regs[1] = error_code;
-    msg.regs[2] = rip;
-    msg.regs[3] = rsp;
-    msg
-}
-
-/// Initialize IPC subsystem
-pub fn init() {
-    // Initialize IPC structures
-}
-
-use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
-
-use crate::sched::scheduler::scheduler as get_scheduler;
-
-/// Block the current thread on an IPC operation
-///
-/// This function:
-/// 1. Sets thread state to Blocked/Waiting
-/// 2. Stores blocked reason
-/// 3. Triggers reschedule
-///
-/// # Safety
-/// Must be called from current thread context with interrupts disabled
-pub unsafe fn block_current_thread(tcb: *mut Tcb, reason: BlockedReason) {
-    unsafe {
-        (*tcb).blocked_reason = Some(reason);
-        (*tcb).state = ThreadState::Blocked;
-    }
-
-    // Do NOT enqueue - thread is in endpoint/notification queue, not ready queue.
-    // Caller must release any IPC/endpoint lock BEFORE calling reschedule.
-    get_scheduler().reschedule();
-}
-
-/// Block current thread WITHOUT calling reschedule.
-///
-/// Sets state to Blocked and blocked_reason. The caller is responsible
-/// for releasing any held locks and calling reschedule() separately.
-/// This is the Zircon-style pattern: lock → modify state → unlock → reschedule.
-///
-/// # Safety
-/// Must be called with interrupts disabled.
-pub unsafe fn block_current_thread_no_switch(tcb: *mut Tcb, reason: BlockedReason) {
-    unsafe {
-        (*tcb).blocked_reason = Some(reason);
-        (*tcb).state = ThreadState::Blocked;
-    }
-}
-
-/// Wake a blocked thread
-///
-/// This function:
-/// 1. Clears blocked reason
-/// 2. Sets thread state to Ready
-/// 3. Enqueues in ready queue
-///
-/// # Safety
-/// Must be called with interrupts disabled
-pub unsafe fn wake_thread(tcb: *mut Tcb) {
-    unsafe {
-        (*tcb).blocked_reason = None;
-        (*tcb).blocked_notification = core::ptr::null_mut();
-    }
-    get_scheduler().enqueue(tcb);
-}
+// Compile-time assertion: IpcBuffer matches the UAPI page-sized layout.
+const _: () = assert!(core::mem::size_of::<IpcBuffer>() == uapi::KERNITE_IPC_BUFFER_SIZE as usize);

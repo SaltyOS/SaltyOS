@@ -25,5 +25,9 @@ configure =
     -DCREATE_LZMA_SYMLINKS=OFF
     -DENABLE_NLS=OFF
 
-[install]
-liblzma.a = _build/liblzma.a
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/man
+usr/share/doc

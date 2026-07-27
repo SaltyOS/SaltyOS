@@ -33,12 +33,14 @@ help:
     @echo "  just reconfigure -Duserland_log_level=debug"
     @echo "  just reconfigure -Dkernel_debug_modules=mm,ipc,syscall,arch"
     @echo "  just reconfigure -Duserland_debug_programs=procmgr,mmsrv,vfs,netsrv"
+    @echo "  just reconfigure -Duserland_aslr=false"
     @echo "  just arch=aarch64 reconfigure -Dkernel_log_level=debug -Duserland_log_level=debug"
     @echo ""
     @echo "== Code Quality =="
     @echo "  just fmt                  Format Rust + C source"
-    @echo "  just fmt-check            Check Rust formatting + cap discipline"
+    @echo "  just fmt-check            Check Rust formatting + cap/asm discipline"
     @echo "  just lint-cap-discipline  Enforce cap_table invariants (no legacy slots)"
+    @echo "  just lint-asm-discipline  Ban Rust inline asm and enforce arch-owned .S/.asm"
     @echo "  just warn                 Recheck all sources for warnings (no cache, no images)"
     @echo "  just arch=aarch64 warn    Same for aarch64 build"
     @echo ""
@@ -68,6 +70,7 @@ help:
     @echo "  just fetch-ports        Download all port sources"
     @echo "  just port-info <name>   Show port configuration"
     @echo "  just clean-ports        Remove port build artifacts"
+    @echo "  just reconfigure -Dbuild_ports=true"
     @echo ""
     @echo "== Images =="
     @echo "  just image              Create BIOS disk image"
@@ -145,7 +148,7 @@ _setup-impl arch:
       -Dbuild_boot=true \
       -Dbuild_kernel=true \
       -Dbuild_userland=true \
-      -Dbuild_ports=true
+      -Dbuild_ports=false
 
 # Configure the build (run once)
 setup: (_setup-impl arch)
@@ -168,8 +171,32 @@ build:
 build-verbose:
     meson compile -C {{builddir}} -v
 
+# Enforce mmsrv 3-layer boundary: policy files (mmap/shm/client/pool/types)
+# must not call kernel syscalls directly, and the kernel-VM wrapper module
+# must not reference policy types. Failure here is part of the
+# memory-model audit's `layering` invariant — see
+# `docs/spec/memory-model-audit.md` Blocker #4 closure.
+layering-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src=userland/core/mmsrv/src
+    policy_files="$src/mmap.rs $src/shm.rs $src/client.rs $src/pool.rs $src/types.rs"
+    bad_policy=$(grep -nE 'invoke::(vspace_|mo_|cnode_copy)' $policy_files 2>/dev/null || true)
+    if [[ -n "$bad_policy" ]]; then
+        echo "layering-check: policy files must call crate::kernel_vm::*, not invoke::*" >&2
+        echo "$bad_policy" >&2
+        exit 1
+    fi
+    bad_kernel_vm=$(grep -nE 'MmRegion|MmClient' $src/kernel_vm.rs 2>/dev/null || true)
+    if [[ -n "$bad_kernel_vm" ]]; then
+        echo "layering-check: kernel_vm.rs must not reference policy types (MmRegion/MmClient)" >&2
+        echo "$bad_kernel_vm" >&2
+        exit 1
+    fi
+    echo "layering-check: ok"
+
 # Recheck all sources for compiler warnings (no cache; disk-image targets excluded)
-warn:
+warn: layering-check
     #!/usr/bin/env bash
     # All compiled objects are wiped first so the result is not affected by a
     # previous incremental build.  Works with 'arch=' just like other recipes.
@@ -358,21 +385,36 @@ cross-hello-cpp: sysroot
 
 # Format all source code
 fmt:
-    find kernite -name "*.rs" -exec rustfmt {} \;
+    #!/usr/bin/env bash
+    source tools/toolchain/env.sh
+    for a in kernite userland lib/trona lib/basalt; do
+        echo "Formatting $a..."
+        find $a -name "*.rs" -exec rustfmt --edition 2024 {} \;
+    done
     find boot -name "*.c" -o -name "*.h" | xargs clang-format -i
 
 # Check formatting without modifying
 fmt-check:
-    find kernite -name "*.rs" -exec rustfmt --check {} \;
-    @just lint-cap-discipline
+    #!/usr/bin/env bash
+    for a in kernite userland lib/trona lib/basalt; do
+        echo "Checking $a..."
+        find $a -name "*.rs" -exec rustfmt --edition 2024 --check {} \;
+    done
+    ./tools/lint/cap_discipline.sh
+    ./tools/lint/asm_discipline.sh
 
 # Capability discipline lint — enforces the role-based startup
 # capability table invariants. See tools/lint/cap_discipline.sh for
-# the exact rules. Fails on any legacy AT_TRONA_*_EP tag reference,
+# the exact rules. Fails on any legacy startup auxv tag reference,
 # removed ROLE_PROCMGR_EXPAND_EP bridge role, raw __trona_cap_*
 # access outside substrate/rtld, or literal CAP_<well-known> const.
 lint-cap-discipline:
     @bash tools/lint/cap_discipline.sh
+
+# Assembly discipline lint — bans Rust inline assembly in built source and
+# requires explicit assembly files to live under arch-owned directories.
+lint-asm-discipline:
+    @bash tools/lint/asm_discipline.sh
 
 # Run clippy on kernel
 clippy:

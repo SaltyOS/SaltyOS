@@ -12,29 +12,29 @@
 #include "types.h"
 
 /* Stage2Info magic: "STAG" */
-#define STAGE2_MAGIC   0x53544147u
+#define STAGE2_MAGIC 0x53544147u
 #define STAGE2_VERSION 1
 
 /* Memory map format identifiers */
-#define MEMMAP_FORMAT_E820   1
-#define MEMMAP_FORMAT_UEFI   2
+#define MEMMAP_FORMAT_E820 1
+#define MEMMAP_FORMAT_UEFI 2
 
 /* Stage2Info flags */
-#define STAGE2_FLAG_A20_ENABLED     (1 << 0)
-#define STAGE2_FLAG_LONG_MODE       (1 << 1)
-#define STAGE2_FLAG_PAGING_ENABLED  (1 << 2)
+#define STAGE2_FLAG_A20_ENABLED (1 << 0)
+#define STAGE2_FLAG_LONG_MODE (1 << 1)
+#define STAGE2_FLAG_PAGING_ENABLED (1 << 2)
 #define STAGE2_FLAG_HAS_FRAMEBUFFER (1 << 3)
-#define STAGE2_FLAG_HAS_ACPI        (1 << 4)
-#define STAGE2_FLAG_HAS_SMBIOS      (1 << 5)
+#define STAGE2_FLAG_HAS_ACPI (1 << 4)
+#define STAGE2_FLAG_HAS_SMBIOS (1 << 5)
 
 /*
  * E820 memory map entry (BIOS)
  */
 struct E820Entry {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t acpi_attr;  /* ACPI 3.0 extended attributes */
+  uint64_t base;
+  uint64_t length;
+  uint32_t type;
+  uint32_t acpi_attr; /* ACPI 3.0 extended attributes */
 } PACKED;
 
 #define E820_MAX_ENTRIES 64
@@ -45,88 +45,87 @@ struct E820Entry {
  * This structure is populated by Stage 2 and validated by Stage 3.
  */
 struct Stage2Info {
-    /* Header */
-    uint32_t magic;           /* STAGE2_MAGIC */
-    uint16_t version;         /* STAGE2_VERSION */
-    uint16_t arch;            /* Architecture (ARCH_*) */
+  /* Header */
+  uint32_t magic;   /* STAGE2_MAGIC */
+  uint16_t version; /* STAGE2_VERSION */
+  uint16_t arch;    /* Architecture (ARCH_*) */
 
-    /* Boot mode and flags */
-    uint32_t boot_mode;       /* BOOT_MODE_BIOS or BOOT_MODE_UEFI */
-    uint32_t flags;           /* Stage2 flags */
+  /* Boot mode and flags */
+  uint32_t boot_mode; /* BOOT_MODE_BIOS or BOOT_MODE_UEFI */
+  uint32_t flags;     /* Stage2 flags */
 
-    /* Boot disk information */
-    uint8_t  boot_drive;      /* BIOS drive number (DL) */
-    uint8_t  reserved1[3];
-    uint32_t reserved2;
+  /* Boot disk information */
+  uint8_t boot_drive; /* BIOS drive number (DL) */
+  uint8_t reserved1[3];
+  uint32_t reserved2;
 
-    /* Manifest location */
-    uint64_t manifest_lba;    /* LBA of boot manifest */
+  /* Manifest location */
+  uint64_t manifest_lba; /* LBA of boot manifest */
 
-    /* Memory map */
-    uint64_t memmap_addr;     /* Physical address of memory map */
-    uint32_t memmap_count;    /* Number of entries */
-    uint16_t memmap_entry_size;  /* Size of each entry */
-    uint8_t  memmap_format;   /* MEMMAP_FORMAT_* */
-    uint8_t  reserved3;
+  /* Memory map */
+  uint64_t memmap_addr;       /* Physical address of memory map */
+  uint32_t memmap_count;      /* Number of entries */
+  uint16_t memmap_entry_size; /* Size of each entry */
+  uint8_t memmap_format;      /* MEMMAP_FORMAT_* */
+  uint8_t reserved3;
 
-    /* Firmware tables */
-    uint64_t rsdp_addr;       /* ACPI RSDP address (0 if not found) */
-    uint64_t dtb_addr;        /* Device tree address (0 if not found) */
-    uint64_t smbios_addr;     /* SMBIOS entry point (0 if not found) */
+  /* Firmware tables */
+  uint64_t rsdp_addr;   /* ACPI RSDP address (0 if not found) */
+  uint64_t dtb_addr;    /* Device tree address (0 if not found) */
+  uint64_t smbios_addr; /* SMBIOS entry point (0 if not found) */
 
-    /* Framebuffer (optional) */
-    uint64_t framebuffer_addr;
-    uint32_t framebuffer_width;
-    uint32_t framebuffer_height;
-    uint32_t framebuffer_pitch;
-    uint32_t framebuffer_bpp;
+  /* Framebuffer (optional) */
+  uint64_t framebuffer_addr;
+  uint32_t framebuffer_width;
+  uint32_t framebuffer_height;
+  uint32_t framebuffer_pitch;
+  uint32_t framebuffer_bpp;
 
-    /* Paging structures (if set up by Stage 2) */
-    uint64_t pml4_addr;       /* PML4 table address (0 if not set up) */
+  /* Paging structures (if set up by Stage 2) */
+  uint64_t pml4_addr; /* PML4 table address (0 if not set up) */
 
-    /* Stage 3 loading info */
-    uint64_t stage3_addr;     /* Where Stage 3 was loaded */
-    uint64_t stage3_size;     /* Stage 3 size */
+  /* Stage 3 loading info */
+  uint64_t stage3_addr; /* Where Stage 3 was loaded */
+  uint64_t stage3_size; /* Stage 3 size */
 
-    /* Preloaded kernel (optional, for BIOS path) */
-    uint64_t kernel_preload_addr;  /* 0 if not preloaded */
-    uint64_t kernel_preload_size;
+  /* Preloaded kernel (optional, for BIOS path) */
+  uint64_t kernel_preload_addr; /* 0 if not preloaded */
+  uint64_t kernel_preload_size;
 
-    /* Framebuffer pixel format (populated by UEFI Stage 2) */
-    uint8_t  fb_red_pos;      /* Red field bit position */
-    uint8_t  fb_red_size;     /* Red field bit width */
-    uint8_t  fb_green_pos;    /* Green field bit position */
-    uint8_t  fb_green_size;   /* Green field bit width */
-    uint8_t  fb_blue_pos;     /* Blue field bit position */
-    uint8_t  fb_blue_size;    /* Blue field bit width */
+  /* Framebuffer pixel format (populated by UEFI Stage 2) */
+  uint8_t fb_red_pos;    /* Red field bit position */
+  uint8_t fb_red_size;   /* Red field bit width */
+  uint8_t fb_green_pos;  /* Green field bit position */
+  uint8_t fb_green_size; /* Green field bit width */
+  uint8_t fb_blue_pos;   /* Blue field bit position */
+  uint8_t fb_blue_size;  /* Blue field bit width */
 
-    /* Firmware version info (populated by UEFI Stage 2) */
-    uint8_t  acpi_revision;   /* ACPI revision (0=1.0, 2=2.0+) */
-    uint8_t  smbios_major;    /* SMBIOS major version */
-    uint8_t  smbios_minor;    /* SMBIOS minor version */
+  /* Firmware version info (populated by UEFI Stage 2) */
+  uint8_t acpi_revision; /* ACPI revision (0=1.0, 2=2.0+) */
+  uint8_t smbios_major;  /* SMBIOS major version */
+  uint8_t smbios_minor;  /* SMBIOS minor version */
 
-    /* EFI context (passed to Stage 3 for Boot Services access) */
-    uint64_t efi_system_table;   /* EFI_SYSTEM_TABLE* (0 for BIOS) */
-    uint64_t efi_image_handle;   /* EFI_HANDLE (0 for BIOS) */
+  /* EFI context (passed to Stage 3 for Boot Services access) */
+  uint64_t efi_system_table; /* EFI_SYSTEM_TABLE* (0 for BIOS) */
+  uint64_t efi_image_handle; /* EFI_HANDLE (0 for BIOS) */
 
-    /* Reserved for future use */
-    uint8_t  reserved4[7];
+  /* Reserved for future use */
+  uint8_t reserved4[7];
 } PACKED;
 
 /*
  * Helper function to validate Stage2Info
  */
-static inline bool stage2_info_valid(const struct Stage2Info *info)
-{
-    if (!info)
-        return false;
-    if (info->magic != STAGE2_MAGIC)
-        return false;
-    if (info->version != STAGE2_VERSION)
-        return false;
-    if (info->memmap_addr == 0 || info->memmap_count == 0)
-        return false;
-    return true;
+static inline bool stage2_info_valid(const struct Stage2Info *info) {
+  if (!info)
+    return false;
+  if (info->magic != STAGE2_MAGIC)
+    return false;
+  if (info->version != STAGE2_VERSION)
+    return false;
+  if (info->memmap_addr == 0 || info->memmap_count == 0)
+    return false;
+  return true;
 }
 
 /*
@@ -151,19 +150,19 @@ static inline bool stage2_info_valid(const struct Stage2Info *info)
  *   0x9FC00 - 0x9FFFF  Extended BDA
  *   0xA0000 - 0xFFFFF  Video memory & ROM
  */
-#define STAGE2_STACK_TOP      0x7FFF
-#define STAGE2_LOAD_ADDR      0x8000
-#define STAGE2_MAX_SIZE       KB(64)
-#define STAGE3_LOAD_ADDR      0x40000
-#define STAGE3_MAX_SIZE       KB(256)
-#define MANIFEST_BUFFER_ADDR  0x28000
-#define MANIFEST_BUFFER_SIZE  KB(32)
-#define MEMMAP_BUFFER_ADDR    0x30000
-#define MEMMAP_BUFFER_SIZE    KB(64)
-#define PAGE_TABLE_ADDR       0x80000
+#define STAGE2_STACK_TOP 0x7FFF
+#define STAGE2_LOAD_ADDR 0x8000
+#define STAGE2_MAX_SIZE KB(64)
+#define STAGE3_LOAD_ADDR 0x40000
+#define STAGE3_MAX_SIZE KB(256)
+#define MANIFEST_BUFFER_ADDR 0x28000
+#define MANIFEST_BUFFER_SIZE KB(32)
+#define MEMMAP_BUFFER_ADDR 0x30000
+#define MEMMAP_BUFFER_SIZE KB(64)
+#define PAGE_TABLE_ADDR 0x80000
 
 /* Long Mode stack (above 1MB) */
-#define LONGMODE_STACK_TOP    0x200000  /* 2 MB */
-#define LONGMODE_STACK_SIZE   KB(64)
+#define LONGMODE_STACK_TOP 0x200000 /* 2 MB */
+#define LONGMODE_STACK_SIZE KB(64)
 
 #endif /* BOOT_COMMON_STAGE2_INFO_H */

@@ -1,394 +1,684 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! SaltyFS client VfsOps implementation — filesystem-level operations.
+//
+//! SaltyFS VfsOps — mount-level operations.
 //!
-//! Handles mount (namesrv lookup, SALTYFS_MOUNT IPC, SHM setup),
-//! unmount, root, vget, statfs, and sync.
+//! Wires the saltyfs daemon session into a `Mount` slot. The
+//! generic mount dispatcher calls [`begin_mount`]; all SaltyFS
+//! feature checks, SHM sizing, vdata pool setup, and root vnode
+//! materialisation stay in this module.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::{Cap, TronaMsg};
 
-use crate::personality::posix::consts::*;
-use crate::server::consts::*;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::VStatfs;
-use crate::vfs_core::mount::Mount;
-use crate::vfs_core::mount_ctl;
-use crate::vfs_core::vnode::{VnodeHandle, VN_ROOT, VT_DIR};
+use crate::core::error::VfsError;
+use crate::core::file::VStatfs;
+use crate::core::identity::{BackendNodeId, VnodeKey};
+use crate::core::mount::{Mount, MountHandle, MountKind};
+use crate::core::vnode::{VN_ROOT, VnodeHandle};
+use crate::core::vop::VfsOps;
+use crate::core::vop_context::OwnerMountCtx;
+use crate::ipc::protocol::backend::{
+    BACKEND_CLOSE_SESSION, BACKEND_DRAIN, BACKEND_GETINFO, VFS_BACKEND_REPLY_OK,
+};
+use crate::owner::VfsState;
+use crate::personality::wire::{send_reply_err_for_client, send_reply_ok_for_client};
+use crate::server::types::ClientHandle;
 
-use super::pool;
-use super::rpc;
-use super::types::{SaltyfsMountData, SaltyfsVnodeData};
+use super::feature::FeatureResult;
+use super::types::{SALTYFS_VDATA_POOL_SIZE, SaltyfsMountData, SaltyfsVnodeData};
 
-// =========================================================================
-// Mount
-// =========================================================================
+/// SaltyFS readdir / xattr SHM ring size. Sized to hold ~256
+/// readdir records (96 B each) plus a single xattr name+value
+/// staging buffer; tuned to fit a single contiguous mmsrv-managed
+/// region without spilling into a multi-region scheme.
+const SALTYFS_SHM_BYTES: u64 = 64 * 1024;
 
-/// Initialize a SaltyFS mount.
+/// Begin a SaltyFS mount.
 ///
-/// `source` is the IPC endpoint capability slot for the SaltyFS server.
-/// If `source == 0`, the implementation performs a namesrv lookup for "saltyfs".
-pub(super) unsafe fn saltyfs_mount(
-    mp: *mut Mount,
-    source: u64,
-    _opts_ptr: *const u8,
-    _opts_len: u8,
-) -> VfsResult<()> {
+/// This is deliberately kept in the SaltyFS client module rather
+/// than the generic POSIX mount dispatcher: backend name, feature
+/// policy, SHM sizing, vdata-pool shape, and root-vnode construction
+/// are all SaltyFS-specific. Future ext4 / FAT / NTFS clients should
+/// add their own `begin_mount` helpers with their own negotiation
+/// rules instead of extending a shared path with filesystem-specific
+/// assumptions.
+pub(crate) unsafe fn begin_mount(
+    state: &mut VfsState,
+    client: ClientHandle,
+    target_vh: VnodeHandle,
+    flags: u64,
+    mount_path: &[u8],
+    reply_lease: trona_server::ReplyLease,
+) {
+    // SHM ring sizing — mmsrv counts in pages, vfs in bytes.
+    const PAGE_BYTES: u64 = 4096;
+    const VDATA_POOL_BYTES: u64 =
+        (SALTYFS_VDATA_POOL_SIZE as u64) * (::core::mem::size_of::<SaltyfsVnodeData>() as u64);
+
+    let Some(backend_ep) = trona_runtime::client::lazy_resolve::namesrv_lookup_blocking(b"saltyfs")
+    else {
+        send_reply_err_for_client(state, client, reply_lease, VfsError::SessionTornDown);
+        return;
+    };
+
+    let fs_id = state.next_fs_instance_id();
+    let Some(mount_h) = state.mounts.alloc() else {
+        // `backend_ep` (OwnedCap) drops here, freeing the cap.
+        send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+        return;
+    };
+    if let Some(mount) = state.mounts.get_mut(mount_h) {
+        *mount = Mount::EMPTY;
+        mount.kind = MountKind::SaltyFs;
+        mount.fs_instance_id = fs_id;
+        mount.mount_flags = flags;
+        mount.case_fold = crate::fs::mount::case_fold_for_flags(flags);
+        mount.set_mount_path(mount_path);
+    }
+    let mount_handle_raw = mount_handle_to_raw(mount_h);
+
+    let md_bytes = ((::core::mem::size_of::<SaltyfsMountData>() as u64) + PAGE_BYTES - 1)
+        / PAGE_BYTES
+        * PAGE_BYTES;
+    let md_ptr = unsafe { crate::server::mem::map_anon(md_bytes) } as *mut SaltyfsMountData;
+    if md_ptr as usize == usize::MAX {
+        // `backend_ep` (OwnedCap) drops here, freeing the cap.
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+        return;
+    }
+    unsafe { *md_ptr = SaltyfsMountData::zeroed() };
+
+    // Capture the backend EP's raw slot before it moves into the session
+    // (which owns its lifetime); the mount keeps a borrowed view in `fs_cap`.
+    let backend_ep_raw = backend_ep.as_raw();
+    let outcome = match unsafe {
+        crate::owner::session::attach_backend_session(
+            state,
+            backend_ep,
+            fs_id,
+            mount_handle_raw,
+            flags,
+            super::completion::saltyfs_completion,
+            None,
+            None,
+            None,
+        )
+    } {
+        Ok(o) => o,
+        Err(e) => {
+            // `backend_ep` was moved into attach_backend_session, which frees it
+            // on its own failure paths; nothing to release here.
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, e);
+            return;
+        }
+    };
+
+    // After attach succeeds the slot owns `backend_ep` via its
+    // `send_cap` field; rolling back from this point forward goes
+    // through `tear_down`, never `release_caller_cap`.
+    match super::feature::check_features(outcome.feature_bits) {
+        FeatureResult::Supported => {}
+        FeatureResult::Reject => {
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, VfsError::NotSup);
+            return;
+        }
+    }
+    let root_seq = match u32::try_from(outcome.aux1) {
+        Ok(seq) => seq,
+        Err(_) => {
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, VfsError::Io);
+            return;
+        }
+    };
+    if outcome.session_token != 0 || outcome.aux2 != SALTYFS_SHM_BYTES {
+        crate::owner::session::tear_down(state, outcome.slot_idx);
+        unsafe {
+            let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+        }
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, VfsError::NotSup);
+        return;
+    }
+    let max_inflight = match u16::try_from(outcome.inflight_max) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, VfsError::Io);
+            return;
+        }
+    };
+
+    let shm_name = state.alloc_shm_id();
+    let (shm_id, shm_cap) = match unsafe {
+        crate::owner::client_shm::mmsrv_shm_create(state, shm_name, SALTYFS_SHM_BYTES)
+    } {
+        Ok(v) => v,
+        Err(e) => {
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, e);
+            return;
+        }
+    };
+    // vfs keeps `shm_cap` for release; mmsrv and the daemon each get a
+    // disposable copy (the kernel moves a staged cap out of vfs's CSpace).
+    let map_cap = match trona_runtime::core::slot_alloc::dup_for_transfer(
+        trona_runtime::core::slot_alloc::resolved_cap_ref(shm_cap),
+    ) {
+        Some(c) => c,
+        None => {
+            release_saltyfs_shm(shm_id, shm_cap, 0, 0);
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+            return;
+        }
+    };
+    let vfs_shm_vaddr = match unsafe {
+        crate::owner::client_shm::mmsrv_shm_map(shm_id, map_cap, SALTYFS_SHM_BYTES)
+    } {
+        Ok(va) => va,
+        Err(e) => {
+            release_saltyfs_shm(shm_id, shm_cap, 0, 0);
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, e);
+            return;
+        }
+    };
+
+    let setup_cap = match trona_runtime::core::slot_alloc::dup_for_transfer(
+        trona_runtime::core::slot_alloc::resolved_cap_ref(shm_cap),
+    ) {
+        Some(c) => c,
+        None => {
+            release_saltyfs_shm(shm_id, shm_cap, vfs_shm_vaddr, SALTYFS_SHM_BYTES);
+            crate::owner::session::tear_down(state, outcome.slot_idx);
+            unsafe {
+                let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+            }
+            state.mounts.release(mount_h);
+            send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+            return;
+        }
+    };
+    if let Err(e) = unsafe {
+        crate::owner::session::attach_session_shm_setup(
+            state,
+            outcome.slot_idx,
+            shm_id,
+            setup_cap,
+            vfs_shm_vaddr,
+            SALTYFS_SHM_BYTES,
+        )
+    } {
+        release_saltyfs_shm(shm_id, shm_cap, vfs_shm_vaddr, SALTYFS_SHM_BYTES);
+        crate::owner::session::tear_down(state, outcome.slot_idx);
+        unsafe {
+            let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+        }
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, e);
+        return;
+    }
+
+    let vdata_bytes = ((VDATA_POOL_BYTES) + PAGE_BYTES - 1) / PAGE_BYTES * PAGE_BYTES;
+    let vdata_ptr = unsafe { crate::server::mem::map_anon(vdata_bytes) } as *mut SaltyfsVnodeData;
+    if vdata_ptr as usize == usize::MAX {
+        release_saltyfs_shm(shm_id, shm_cap, vfs_shm_vaddr, SALTYFS_SHM_BYTES);
+        crate::owner::session::tear_down(state, outcome.slot_idx);
+        unsafe {
+            let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+        }
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+        return;
+    }
+    for i in 0..SALTYFS_VDATA_POOL_SIZE {
+        unsafe { *vdata_ptr.add(i) = SaltyfsVnodeData::zeroed() };
+    }
+
+    let root_ino = outcome.aux0;
+    let root_backend_id = BackendNodeId::new(root_ino, root_seq);
+    let Some(root_vh) = state.vnodes.alloc() else {
+        unsafe {
+            let _ = crate::server::mem::unmap(vdata_ptr as *mut u8, vdata_bytes);
+        }
+        release_saltyfs_shm(shm_id, shm_cap, vfs_shm_vaddr, SALTYFS_SHM_BYTES);
+        crate::owner::session::tear_down(state, outcome.slot_idx);
+        unsafe {
+            let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+        }
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, VfsError::NoMem);
+        return;
+    };
+    if let Some(root_vp) = unsafe { state.vnodes.raw_ptr(root_vh) } {
+        unsafe {
+            *root_vp = crate::core::vnode::Vnode::EMPTY;
+            (*root_vp).kind = crate::core::vnode::VnodeKind::Directory;
+            (*root_vp).key = VnodeKey {
+                fs_instance_id: fs_id,
+                backend_id: root_backend_id,
+            };
+            (*root_vp).backend_seq = 0;
+            (*root_vp).data = ::core::ptr::null_mut();
+            (*root_vp).nlink = 1;
+            (*root_vp).mount = mount_h;
+            (*root_vp).fs_instance_id = fs_id;
+            (*root_vp).ops = &raw const super::SALTYFS_VOPS;
+            (*root_vp).flags |= VN_ROOT;
+        }
+    }
+
     unsafe {
-        // Allocate SaltyfsMountData
-        let alloc_size = core::mem::size_of::<SaltyfsMountData>();
-        let alloc_pages = (alloc_size + 4095) / 4096;
-        let md_raw = crate::server::mem::map_anon((alloc_pages * 4096) as u64);
-        if md_raw.is_null() || md_raw == usize::MAX as *mut u8 {
-            return Err(VfsError::NoSpace);
+        (*md_ptr).fs_cap = backend_ep_raw;
+        (*md_ptr).session_id = outcome.session_id;
+        (*md_ptr).max_inflight = max_inflight;
+        (*md_ptr).feature_bits = outcome.feature_bits;
+        (*md_ptr).root_node = root_backend_id;
+        (*md_ptr).root_ino = root_ino;
+        (*md_ptr).shm_id = shm_id;
+        (*md_ptr).shm_cap = shm_cap;
+        (*md_ptr).shm_vaddr = vfs_shm_vaddr;
+        (*md_ptr).shm_size = SALTYFS_SHM_BYTES;
+        (*md_ptr).shm_active = true;
+        (*md_ptr).vdata_ptr = vdata_ptr;
+        (*md_ptr).vdata_cap = SALTYFS_VDATA_POOL_SIZE;
+        (*md_ptr).backend_session_idx = outcome.slot_idx;
+    }
+
+    if let Some(mount) = state.mounts.get_mut(mount_h) {
+        mount.root = root_vh;
+        mount.data = md_ptr as *mut u8;
+        mount.vfsops = &raw const super::SALTYFS_VFSOPS;
+        mount.backend_session_idx = outcome.slot_idx;
+    }
+
+    if let Err(e) =
+        unsafe { crate::core::mount_ctl::finalize_mount_tail(state, mount_h, target_vh, fs_id) }
+    {
+        let _ = state.vnodes.release(root_vh);
+        unsafe {
+            let _ = crate::server::mem::unmap(vdata_ptr as *mut u8, vdata_bytes);
         }
-        core::ptr::write_bytes(md_raw, 0, alloc_pages * 4096);
+        release_saltyfs_shm(shm_id, shm_cap, vfs_shm_vaddr, SALTYFS_SHM_BYTES);
+        crate::owner::session::tear_down(state, outcome.slot_idx);
+        unsafe {
+            let _ = crate::server::mem::unmap(md_ptr as *mut u8, md_bytes);
+        }
+        state.mounts.release(mount_h);
+        send_reply_err_for_client(state, client, reply_lease, e);
+        return;
+    }
+    unsafe {
+        crate::core::mount_ctl::refresh_global_ns(state);
+    }
+    unsafe {
+        crate::boot::late_mount::on_mount_finalized(state, mount_h, target_vh);
+    }
 
-        let md = md_raw as *mut SaltyfsMountData;
-        *md = SaltyfsMountData::zeroed();
-        (*mp).data = md as *mut u8;
+    send_reply_ok_for_client(state, client, reply_lease, &[fs_id.0]);
+}
 
-        // Resolve the SaltyFS server endpoint
-        let fs_cap = if source != 0 {
-            source
-        } else {
-            resolve_saltyfs_endpoint()?
+#[inline]
+fn mount_handle_to_raw(mh: MountHandle) -> u64 {
+    ((mh.slot() as u64) << 32) | (mh.epoch() as u64)
+}
+
+fn release_saltyfs_shm(shm_id: u64, shm_cap: u64, shm_vaddr: u64, shm_size: u64) {
+    if shm_vaddr != 0 && shm_size != 0 {
+        let _ = unsafe { crate::owner::client_shm::mmsrv_munmap(shm_vaddr, shm_size) };
+    }
+    // SAFETY: callers pass the SHM cap this vfs owns for the region being torn
+    // down (same trusted-caller contract as the munmap/destroy above); freed once.
+    unsafe { trona_runtime::core::slot_alloc::delete_and_free(shm_cap) };
+    if shm_id != 0 {
+        let _ = unsafe { crate::owner::client_shm::mmsrv_shm_destroy(shm_id) };
+    }
+}
+
+/// Tear down a mount slot whose finalize failed (or whose
+/// unmount path has reached zero references). Wipes the
+/// session-identifying fields so any in-flight completion
+/// observes the cleared state and drops on the live_gen check.
+/// The mount slot itself is released by the caller via
+/// `state.mounts.retire`.
+pub(crate) unsafe fn saltyfs_mount_teardown(state: &mut VfsState, mount_h: MountHandle) {
+    unsafe {
+        let Some(mount) = state.mounts.get_mut(mount_h) else {
+            return;
         };
-        (*md).fs_cap = fs_cap;
+        let md = mount.data as *mut SaltyfsMountData;
+        if !md.is_null() {
+            (*md).fs_cap = 0;
+            (*md).session_id = 0;
+            (*md).max_inflight = 0;
+            (*md).shm_active = false;
+            (*md).shm_id = 0;
+            (*md).shm_cap = 0;
+            (*md).shm_vaddr = 0;
+            (*md).shm_size = 0;
+        }
+    }
+}
 
-        // Send SALTYFS_MOUNT
-        let mut mnt_req = TronaMsg::zeroed();
-        mnt_req.label = SALTYFS_MOUNT;
-        mnt_req.length = 0;
+// ---------------------------------------------------------------------------
+// SALTYFS_VFSOPS — mount-level entries dispatched through
+// `Mount.vfsops`. Backend RPCs run synchronously on the owner thread
+// here because the surrounding handlers (handle_umount /
+// handle_statvfs) treat the VfsOps return value as the immediate
+// reply payload; converting to async would require parking those
+// handlers, which is a larger restructuring than the small wins
+// would justify on the current call frequency (one per
+// unmount/statvfs RPC).
+// ---------------------------------------------------------------------------
 
-        let mut mnt_reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
+/// Resolve the backend send cap for a mount the owner is currently
+/// inspecting. `BackendSessionSlot.send_cap` is populated by
+/// `attach_backend_session` and lives until session teardown; this
+/// helper extracts it via the per-mount `backend_session_idx`.
+unsafe fn saltyfs_send_cap_for(ctx: &OwnerMountCtx<'_>) -> Result<Cap, VfsError> {
+    unsafe {
+        let session_idx = (*ctx.mount).backend_session_idx;
+        if session_idx == u32::MAX {
+            return Err(VfsError::SessionTornDown);
+        }
+        let handle = ctx
+            .state
+            .backend_sessions
+            .handle_from_slot(session_idx)
+            .ok_or(VfsError::SessionTornDown)?;
+        let send_cap = ctx
+            .state
+            .backend_sessions
+            .get(handle)
+            .map(|s| s.send_cap.as_raw())
+            .ok_or(VfsError::SessionTornDown)?;
+        if send_cap == 0 {
+            return Err(VfsError::SessionTornDown);
+        }
+        Ok(send_cap)
+    }
+}
+
+/// Issue a synchronous backend RPC with no transferred caps. Used
+/// for mount-level entries (DRAIN / CLOSE_SESSION / GETINFO) where
+/// the reply payload is consumed immediately by the calling
+/// handler without parking a `PendingOp`.
+unsafe fn saltyfs_sync_backend_call(
+    send_cap: Cap,
+    label: u64,
+    regs: &[u64],
+) -> Result<TronaMsg, VfsError> {
+    let mut req = TronaMsg::default();
+    req.label = label;
+    let len = regs.len().min(req.regs.len());
+    for i in 0..len {
+        req.regs[i] = regs[i];
+    }
+    req.length = len as u64;
+    let mut resp = TronaMsg::default();
+    let err = unsafe {
+        trona_kernel::ipc::mp_call_ctx(
             crate::ipc_ctx(),
-            fs_cap,
-            &raw const mnt_req,
-            &raw mut mnt_reply,
-        );
-        if err != 0 || (mnt_reply.label != TRONA_OK && mnt_reply.label != TRONA_ALREADY_EXISTS) {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] saltyfs mount failed err=");
-                _lb.hex(err as u64);
-                _lb.str(b" label=");
-                _lb.hex(mnt_reply.label);
-                _lb.str(b"\n");
-            });
-            return Err(VfsError::Io);
+            send_cap,
+            &raw const req,
+            &raw mut resp,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
+    if err != 0 {
+        return Err(VfsError::Io);
+    }
+    if resp.label != VFS_BACKEND_REPLY_OK {
+        return Err(VfsError::from_backend_reply(resp.label));
+    }
+    Ok(resp)
+}
+
+/// Mount entry. Saltyfs never reaches this code path through
+/// `vfsops_for` — `begin_mount` runs the
+/// multi-step `BACKEND_OPEN_SESSION` + `BACKEND_SHM_SETUP` +
+/// root-vnode allocation directly and stamps
+/// `Mount.vfsops = SALTYFS_VFSOPS` only after the steps have all
+/// succeeded. Reaching here means the dispatcher routed a saltyfs
+/// mount through the in-memory path by mistake.
+pub(crate) unsafe fn saltyfs_mount(_ctx: &mut OwnerMountCtx<'_>) -> Result<VnodeHandle, VfsError> {
+    Err(VfsError::Inval)
+}
+
+/// Unmount entry. Drains in-flight operations, closes the daemon
+/// session, releases mmsrv-owned SHM region, then runs the
+/// shared `saltyfs_mount_teardown` to wipe per-mount data.
+pub(crate) unsafe fn saltyfs_unmount(ctx: &mut OwnerMountCtx<'_>) -> Result<(), VfsError> {
+    unsafe {
+        let send_cap = saltyfs_send_cap_for(ctx)?;
+        // Drain first so any in-flight backend op completes before
+        // we cancel the session. Errors here are logged by the
+        // sync helper's `from_backend_reply` mapping; we still
+        // proceed to close so the slot is reclaimed even on a
+        // partial drain.
+        let _ = saltyfs_sync_backend_call(send_cap, BACKEND_DRAIN, &[]);
+        let _ = saltyfs_sync_backend_call(send_cap, BACKEND_CLOSE_SESSION, &[]);
+
+        let mount_h = ctx.mount_handle;
+        let session_idx = (*ctx.mount).backend_session_idx;
+        let (shm_id, shm_cap, shm_vaddr, shm_size) = {
+            let md = (*ctx.mount).data as *const SaltyfsMountData;
+            if md.is_null() {
+                (0, 0, 0, 0)
+            } else {
+                ((*md).shm_id, (*md).shm_cap, (*md).shm_vaddr, (*md).shm_size)
+            }
+        };
+
+        if session_idx != u32::MAX {
+            crate::owner::session::tear_down(ctx.state, session_idx);
+        }
+        if shm_id != 0 {
+            release_saltyfs_shm(shm_id, shm_cap, shm_vaddr, shm_size);
         }
 
-        let root_ino = mnt_reply.regs[0];
-        (*md).root_ino = root_ino;
-
-        // Enable V2 protocol (current SaltyFS server always supports it)
-        (*md).v2_protocol = true;
-
-        // Initialize vdata pool
-        if pool::init_pools(md) != 0 {
-            return Err(VfsError::NoSpace);
+        saltyfs_mount_teardown(ctx.state, mount_h);
+        if let Some(mount) = ctx.state.mounts.get_mut(mount_h) {
+            mount.root = VnodeHandle::INVALID;
+            mount.data = ::core::ptr::null_mut();
+            mount.backend_session_idx = u32::MAX;
         }
-
-        // Set up SHM bulk transport
-        setup_shm(md, fs_cap);
-
-        // Create root vnode data
-        let root_vd = pool::alloc_vdata(md);
-        if root_vd.is_null() {
-            return Err(VfsError::NoSpace);
-        }
-        (*root_vd).active = 1;
-        (*root_vd).ftype = VT_DIR;
-        (*root_vd).mode = S_IFDIR_L | 0o755;
-        (*root_vd).remote_ino = root_ino;
-        (*root_vd).nlink = 2;
-
-        // Allocate root vnode from the central arena via trampoline.
-        let (root_vh, root_vp) = mount_ctl::trampoline_alloc_vnode().ok_or(VfsError::NoSpace)?;
-        let mount_handle =
-            mount_ctl::trampoline_mount_handle_from_slot((*mp).id as u32).ok_or(VfsError::Io)?;
-        (*root_vp).id = root_ino;
-        (*root_vp).vtype = VT_DIR;
-        (*root_vp).flags = VN_ROOT;
-        (*root_vp).data = root_vd as *mut u8;
-        (*root_vp).nlink = 2;
-        (*root_vp).mount = mount_handle;
-        (*root_vp).ops = &raw const super::SALTYFS_VOPS;
-        (*root_vd).vnode_handle = root_vh;
-
-        (*mp).root_vnode = root_vh;
-
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[VFS] Mounted saltyfs root_ino=");
-            _lb.hex(root_ino);
-            _lb.str(b"\n");
-        });
-
         Ok(())
     }
 }
 
-// =========================================================================
-// Unmount
-// =========================================================================
-
-pub(super) unsafe fn saltyfs_unmount(mp: *mut Mount, _force: bool) -> VfsResult<()> {
+/// Return the cached root vnode handle. `begin_mount`
+/// installs it before `finalize_mount_tail` runs and never
+/// clears it while the mount is reachable, so seeing
+/// `VnodeHandle::INVALID` here means a teardown ran ahead of the
+/// vops dispatch — surfacing as `VfsError::Io` lets callers fall
+/// back without dereferencing the empty slot.
+pub(crate) unsafe fn saltyfs_root(ctx: &mut OwnerMountCtx<'_>) -> Result<VnodeHandle, VfsError> {
     unsafe {
-        (*mp).root_vnode = VnodeHandle::INVALID;
-        (*mp).data = core::ptr::null_mut();
+        let root = (*ctx.mount).root;
+        if root.is_valid() {
+            Ok(root)
+        } else {
+            Err(VfsError::Io)
+        }
+    }
+}
+
+/// Look up a vnode by inode number. The vdata pool acts as the
+/// per-mount inode → vnode cache; on a miss we issue a synchronous
+/// `BACKEND_GETINFO` against the daemon to materialise the inode's
+/// type / mode / parent and allocate a fresh `Vnode`.
+pub(crate) unsafe fn saltyfs_vget(
+    ctx: &mut OwnerMountCtx<'_>,
+    ino: u64,
+) -> Result<VnodeHandle, VfsError> {
+    unsafe {
+        let md = (*ctx.mount).data as *mut SaltyfsMountData;
+        if md.is_null() {
+            return Err(VfsError::Io);
+        }
+        let backend_id = BackendNodeId::new(ino, 0);
+        // First check the per-mount vdata cache — a hot path that
+        // avoids a backend round-trip for already-resolved inodes.
+        let cached = super::pool::find_vdata_by_node(md, ino, 0);
+        if !cached.is_null()
+            && (*cached).vnode_handle.is_valid()
+            && ctx.state.vnodes.raw_ptr((*cached).vnode_handle).is_some()
+        {
+            return Ok((*cached).vnode_handle);
+        }
+
+        // Cache miss — query the daemon. `BACKEND_GETINFO` regs[0]
+        // = inode number; reply carries (mode, nlink, size,
+        // parent_ino, mtime, blocks).
+        let send_cap = saltyfs_send_cap_for(ctx)?;
+        let resp = saltyfs_sync_backend_call(send_cap, BACKEND_GETINFO, &[ino])?;
+        let mode = resp.regs[0] as u32;
+        let nlink = resp.regs[1] as u32;
+        let size = resp.regs[2];
+        let parent_ino = resp.regs[3];
+
+        let vdata = if !cached.is_null() {
+            cached
+        } else {
+            let fresh = super::pool::alloc_vdata(md);
+            if fresh.is_null() {
+                return Err(VfsError::NoMem);
+            }
+            fresh
+        };
+        (*vdata).active = 1;
+        (*vdata).mode = mode;
+        (*vdata).remote_ino = ino;
+        (*vdata).parent_ino = parent_ino;
+        (*vdata).nlink = nlink;
+        (*vdata).size = size;
+        (*vdata).ftype = mode_to_vtype(mode);
+
+        let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let mount_handle = ctx.mount_handle;
+        let fs_instance_id = (*ctx.mount).fs_instance_id;
+        (*vnode_ptr).kind = crate::core::vnode::vtype_to_kind((*vdata).ftype);
+        (*vnode_ptr).key = VnodeKey {
+            fs_instance_id,
+            backend_id,
+        };
+        (*vnode_ptr).backend_seq = 0;
+        (*vnode_ptr).data = vdata as *mut u8;
+        (*vnode_ptr).nlink = (*vdata).nlink;
+        (*vnode_ptr).mount = mount_handle;
+        (*vnode_ptr).fs_instance_id = fs_instance_id;
+        (*vnode_ptr).ops = &raw const super::SALTYFS_VOPS;
+        (*vdata).vnode_handle = vnode_h;
+        Ok(vnode_h)
+    }
+}
+
+/// POSIX mode → VnodeKind byte. Mirrors the bit layout of the
+/// `S_IFMT` mask. Unknown encodings fall through to
+/// `VnodeKind::Empty` rather than guessing — the namei layer
+/// surfaces the malformed inode as `VfsError::Io`.
+fn mode_to_vtype(mode: u32) -> u8 {
+    use crate::core::vnode::{VT_BAD, VT_BLK, VT_CHR, VT_DIR, VT_FIFO, VT_LNK, VT_REG, VT_SOCK};
+    match mode & 0o170000 {
+        0o100000 => VT_REG,
+        0o040000 => VT_DIR,
+        0o120000 => VT_LNK,
+        0o010000 => VT_FIFO,
+        0o140000 => VT_SOCK,
+        0o020000 => VT_CHR,
+        0o060000 => VT_BLK,
+        _ => VT_BAD,
+    }
+}
+
+/// Filesystem-wide statistics. Issues `BACKEND_GETINFO` with
+/// `regs[0] = 0` (mount-level form) and parses the reply into a
+/// `VStatfs`. The daemon's reply layout for the mount-level form
+/// echoes the (block_size, total_blocks, free_blocks,
+/// total_inodes, free_inodes, fsid, namemax) tuple.
+pub(crate) unsafe fn saltyfs_statfs(
+    ctx: &mut OwnerMountCtx<'_>,
+    out: *mut VStatfs,
+) -> Result<(), VfsError> {
+    unsafe {
+        let send_cap = saltyfs_send_cap_for(ctx)?;
+        let resp = saltyfs_sync_backend_call(send_cap, BACKEND_GETINFO, &[0])?;
+        let bsize = resp.regs[0] as u32;
+        let blocks = resp.regs[1];
+        let bfree = resp.regs[2];
+        let files = resp.regs[3];
+        let ffree = resp.regs[4];
+        let fsid = resp.regs[5];
+        let namemax = resp.regs[6] as u32;
+        (*out).bsize = bsize;
+        (*out).frsize = bsize;
+        (*out).blocks = blocks;
+        (*out).bfree = bfree;
+        (*out).bavail = bfree;
+        (*out).files = files;
+        (*out).ffree = ffree;
+        (*out).favail = ffree;
+        (*out).fsid = fsid;
+        (*out).flag = 0;
+        (*out).namemax = namemax;
+        (*out).set_fs_name(b"saltyfs");
+        (*out).set_volume_label(b"saltyfs");
         Ok(())
     }
 }
 
-// =========================================================================
-// Root
-// =========================================================================
-
-pub(super) unsafe fn saltyfs_root(mp: *mut Mount) -> VfsResult<VnodeHandle> {
+/// Flush dirty state to backing storage. SaltyFS has its own
+/// commit pipeline (intent log + B-tree write-out); the daemon
+/// drives the actual disk I/O when `BACKEND_DRAIN` lands. The
+/// daemon's response indicates the drain has reached the on-disk
+/// log; per-fd `fsync(2)` paths use `BACKEND_FSYNC` instead.
+pub(crate) unsafe fn saltyfs_sync(ctx: &mut OwnerMountCtx<'_>) -> Result<(), VfsError> {
     unsafe {
-        let root = (*mp).root_vnode;
-        if !root.is_valid() {
-            return Err(VfsError::Io);
-        }
-        Ok(root)
+        let send_cap = saltyfs_send_cap_for(ctx)?;
+        saltyfs_sync_backend_call(send_cap, BACKEND_DRAIN, &[])?;
+        Ok(())
     }
 }
 
-// =========================================================================
-// Vget
-// =========================================================================
-
-pub(super) unsafe fn saltyfs_vget(mp: *mut Mount, id: u64) -> VfsResult<VnodeHandle> {
-    unsafe {
-        let md = (*mp).data as *mut SaltyfsMountData;
-
-        // Check if vdata already exists for this remote inode
-        let existing_vd = pool::find_vdata_by_ino(md, id);
-        if !existing_vd.is_null() {
-            if (*existing_vd).vnode_handle.is_valid()
-                && crate::vfs_core::mount_ctl::vnode_resolve_trampoline((*existing_vd).vnode_handle)
-                    .is_some()
-            {
-                return Ok((*existing_vd).vnode_handle);
-            }
-            // Allocate a new arena vnode pointing to the existing vdata
-            let (vh, vp) = mount_ctl::trampoline_alloc_vnode().ok_or(VfsError::NoSpace)?;
-            let mount_handle = mount_ctl::trampoline_mount_handle_from_slot((*mp).id as u32)
-                .ok_or(VfsError::Io)?;
-            (*vp).id = id;
-            (*vp).vtype = (*existing_vd).ftype;
-            (*vp).data = existing_vd as *mut u8;
-            (*vp).nlink = (*existing_vd).nlink;
-            (*vp).mount = mount_handle;
-            (*vp).ops = &raw const super::SALTYFS_VOPS;
-            (*existing_vd).vnode_handle = vh;
-            return Ok(vh);
-        }
-
-        // Stat the remote inode to populate a new vnode
-        match rpc::saltyfs_ipc_stat(md, id) {
-            Some((size, mode, nlink, mtime, blocks, uid, gid)) => {
-                let vd = pool::alloc_vdata(md);
-                if vd.is_null() {
-                    return Err(VfsError::NoSpace);
-                }
-                let ftype = match mode & S_IFMT_L {
-                    S_IFDIR_L => VT_DIR,
-                    S_IFLNK_L => crate::vfs_core::vnode::VT_LNK,
-                    _ => crate::vfs_core::vnode::VT_REG,
-                };
-                (*vd).active = 1;
-                (*vd).ftype = ftype;
-                (*vd).mode = mode;
-                (*vd).remote_ino = id;
-                (*vd).size = size;
-                (*vd).nlink = nlink;
-                (*vd).uid = uid;
-                (*vd).gid = gid;
-                (*vd).mtime = mtime;
-                (*vd).blocks = blocks;
-
-                let (vh, vp) = mount_ctl::trampoline_alloc_vnode().ok_or(VfsError::NoSpace)?;
-                let mount_handle = mount_ctl::trampoline_mount_handle_from_slot((*mp).id as u32)
-                    .ok_or(VfsError::Io)?;
-                (*vp).id = id;
-                (*vp).vtype = ftype;
-                (*vp).data = vd as *mut u8;
-                (*vp).nlink = nlink;
-                (*vp).mount = mount_handle;
-                (*vp).ops = &raw const super::SALTYFS_VOPS;
-                (*vd).vnode_handle = vh;
-                Ok(vh)
-            }
-            None => Err(VfsError::NotFound),
-        }
-    }
-}
-
-// =========================================================================
-// Statfs
-// =========================================================================
-
-pub(super) unsafe fn saltyfs_statfs(mp: *mut Mount, out: *mut VStatfs) -> VfsResult<()> {
-    unsafe {
-        let md = (*mp).data as *mut SaltyfsMountData;
-        match rpc::saltyfs_ipc_getinfo(md) {
-            Some((total_blocks, used_blocks, block_size)) => {
-                (*out).bsize = block_size;
-                (*out).blocks = total_blocks;
-                (*out).bfree = total_blocks.saturating_sub(used_blocks);
-                (*out).bavail = (*out).bfree;
-                (*out).files = 0;
-                (*out).ffree = 0;
-                let ft = &mut (*out).fs_type;
-                ft[..7].copy_from_slice(b"saltyfs");
-                (*out).flags = (*mp).flags;
-                (*out).name_max = 255;
-                Ok(())
-            }
-            None => Err(VfsError::Io),
-        }
-    }
-}
-
-// =========================================================================
-// Sync
-// =========================================================================
-
-pub(super) unsafe fn saltyfs_sync(_mp: *mut Mount) -> VfsResult<()> {
-    Ok(())
-}
-
-// =========================================================================
-// Helpers
-// =========================================================================
-
-/// Resolve the "saltyfs" endpoint via namesrv.
-unsafe fn resolve_saltyfs_endpoint() -> VfsResult<u64> {
-    unsafe {
-        let slot = match trona::slot_alloc::slot_alloc() {
-            Some(s) => s,
-            None => return Err(VfsError::NoSpace),
-        };
-        let _ = invoke::cnode_delete(CAP_SELF_CSPACE, slot);
-        ipc::set_receive_slot_ctx(crate::ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
-
-        let mut ns_req = TronaMsg::zeroed();
-        ns_req.label = NS_LOOKUP;
-        let name = b"saltyfs";
-        ns_req.regs[0] = name.len() as u64;
-        ns_req.length = 1 + (name.len() as u64 + 7) / 8;
-        let ns_dst = &raw mut ns_req.regs[1] as *mut u8;
-        for i in 0..name.len() {
-            *ns_dst.add(i) = name[i];
-        }
-
-        let mut ns_reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
-            crate::ipc_ctx(),
-            trona::caps::namesrv_ep(),
-            &raw const ns_req,
-            &raw mut ns_reply,
-        );
-
-        if err != 0 || ns_reply.label != TRONA_OK {
-            trona::udebug!(|_lb| {
-                _lb.str(b"[VFS] saltyfs not found in namesrv\n");
-            });
-            return Err(VfsError::NotFound);
-        }
-
-        Ok(slot)
-    }
-}
-
-/// Set up VFS-SaltyFS SHM for bulk data transport.
-unsafe fn setup_shm(md: *mut SaltyfsMountData, fs_cap: u64) {
-    unsafe {
-        let mut shm_create = TronaMsg::zeroed();
-        shm_create.label = MM_SHM_CREATE;
-        shm_create.length = 2;
-        shm_create.regs[0] = VFS_SALTYFS_SHM_ID;
-        shm_create.regs[1] = VFS_SALTYFS_SHM_PAGES;
-
-        let mut shm_reply = TronaMsg::zeroed();
-        let serr = ipc::call_ctx(
-            crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
-            &raw const shm_create,
-            &raw mut shm_reply,
-        );
-        if serr != 0 || (shm_reply.label != 0 && shm_reply.label != TRONA_ALREADY_EXISTS) {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[VFS] saltyfs SHM create failed (non-fatal)\n");
-            });
-            return;
-        }
-
-        let mut shm_map = TronaMsg::zeroed();
-        shm_map.label = MM_SHM_MAP;
-        shm_map.length = 4;
-        shm_map.regs[0] = VFS_SALTYFS_SHM_ID;
-        shm_map.regs[1] = 0;
-        shm_map.regs[2] = VFS_SALTYFS_SHM_VADDR;
-        shm_map.regs[3] = 0x3; // RW
-
-        let mut map_reply = TronaMsg::zeroed();
-        let merr = ipc::call_ctx(
-            crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
-            &raw const shm_map,
-            &raw mut map_reply,
-        );
-        if merr != 0 || map_reply.label != 0 {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[VFS] saltyfs SHM map failed (non-fatal)\n");
-            });
-            return;
-        }
-
-        let mut setup_msg = TronaMsg::zeroed();
-        setup_msg.label = SALTYFS_SHM_SETUP;
-        setup_msg.regs[0] = VFS_SALTYFS_SHM_ID;
-        setup_msg.length = 1;
-
-        let mut setup_reply = TronaMsg::zeroed();
-        let serr2 = ipc::call_ctx(
-            crate::ipc_ctx(),
-            fs_cap,
-            &raw const setup_msg,
-            &raw mut setup_reply,
-        );
-        if serr2 == 0 && setup_reply.label == TRONA_OK {
-            trona::uinfo!(|_lb| {
-                _lb.str(b"[VFS] saltyfs SHM transport established\n");
-            });
-            (*md).shm_active = true;
-            (*md).shm_vaddr = VFS_SALTYFS_SHM_VADDR;
-            (*md).shm_size = VFS_SALTYFS_SHM_PAGES * 4096;
-
-            *(&raw mut crate::VFS_SHM_ACTIVE) = true;
-        } else {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
-            });
-            let mut shm_unmap = TronaMsg::zeroed();
-            shm_unmap.label = MM_SHM_UNMAP;
-            shm_unmap.length = 3;
-            shm_unmap.regs[0] = VFS_SALTYFS_SHM_ID;
-            shm_unmap.regs[1] = 0;
-            shm_unmap.regs[2] = VFS_SALTYFS_SHM_VADDR;
-            let mut unmap_reply = TronaMsg::zeroed();
-            let _ = ipc::call_ctx(
-                crate::ipc_ctx(),
-                trona::caps::mmsrv_ep(),
-                &raw const shm_unmap,
-                &raw mut unmap_reply,
-            );
-        }
-    }
-}
+/// SaltyFS mount-level VfsOps. Pinned on every saltyfs mount via
+/// `Mount.vfsops`; `begin_mount` stamps it once the
+/// session attach + SHM + pager handshake have all succeeded.
+pub(crate) static SALTYFS_VFSOPS: VfsOps = VfsOps {
+    mount: saltyfs_mount,
+    unmount: saltyfs_unmount,
+    root: saltyfs_root,
+    vget: saltyfs_vget,
+    statfs: saltyfs_statfs,
+    sync: saltyfs_sync,
+};

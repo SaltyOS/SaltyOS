@@ -75,7 +75,7 @@ The SaltyOS targets encode OS-specific defaults so that every compilation does n
 | PIC/PIE | enabled |
 | Math errno | disabled |
 | Runtime lib | compiler-rt |
-| Dynamic linker | `/lib/ld-trona.so` |
+| Dynamic linker | `/lib/ldtrona-elf.so` |
 | Page size | 4096 |
 | Hash style | GNU |
 | Preprocessor | `__saltyos__`, `__SaltyOS__`, `__ELF__` |
@@ -205,8 +205,8 @@ echo | clang --target=aarch64-unknown-saltyos -E -dM - | grep -i salty
 
 # Driver defaults (ld.lld, -pie, dynamic linker)
 clang --target=x86_64-unknown-saltyos -### /dev/null 2>&1 \
-  | grep -oE '(ld\.lld|pie|ld-trona\.so)'
-# Expected: ld.lld, -pie, /lib/ld-trona.so
+  | grep -oE '(ld\.lld|pie|ldtrona-elf\.so)'
+# Expected: ld.lld, -pie, /lib/ldtrona-elf.so
 ```
 
 ## Step 4: Build and Install Rust (Stage 1)
@@ -352,7 +352,7 @@ When you pass `--target=x86_64-unknown-saltyos` (or `aarch64-unknown-saltyos`) t
 -fPIC                   (position-independent code)
 -fuse-ld=lld            (LLD linker)
 -pie                    (position-independent executable)
---dynamic-linker=/lib/ld-trona.so
+--dynamic-linker=/lib/ldtrona-elf.so
 -z max-page-size=4096
 --hash-style=gnu
 --build-id

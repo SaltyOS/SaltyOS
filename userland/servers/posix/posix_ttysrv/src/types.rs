@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! PTY data structures: ring buffers, termios settings, and PTY instances.
 
-// Capability layout: system roles flow through `trona::caps::*` (populated by
+// Capability layout: system roles flow through `trona_runtime::client::caps::*` (populated by
 // libtrona's `__trona_cap_*` weak symbols). The service-local
-// `Require=dispdrv:dispdrv_ep` flows through the build-generated `svc_caps`
-// crate. TTY-specific runtime-allocated slots (VFS notification, display ring
-// notification) are kept as plain constants.
-pub const CAP_VFS_NTFN: u64 = 66;
-pub const CAP_DISPLAY_RING_NTFN: u64 = 69;
-
+// `Require=dispdrv-ep.socket` is resolved through the `trona_runtime::local_cap!`
+// macro in `main.rs` (see `crate::dispdrv_ep`).
+//
 // Buffer sizes and limits
 pub const RING_SIZE: usize = 16384;
 pub const LINE_BUF_SIZE: usize = 256;
@@ -51,7 +48,7 @@ pub const VSUSP: usize = 10;
 
 pub const B38400: u32 = 38400;
 
-// POLLIN/POLLOUT/POLLHUP from trona::consts::posix (via trona_posix::consts)
+// POLLIN/POLLOUT/POLLHUP come from trona_posix::consts.
 
 // Actual terminal dimensions (queried from display server at startup)
 pub static mut WINSIZE_ROWS: u32 = 24;
@@ -65,21 +62,33 @@ pub struct RingBuf {
 
 impl RingBuf {
     pub const fn new() -> Self {
-        RingBuf { buf: [0; RING_SIZE], head: 0, tail: 0 }
+        RingBuf {
+            buf: [0; RING_SIZE],
+            head: 0,
+            tail: 0,
+        }
     }
 
-    pub fn is_empty(&self) -> bool { self.head == self.tail }
-    pub fn is_full(&self) -> bool { ((self.head + 1) % RING_SIZE) == self.tail }
+    pub fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+    pub fn is_full(&self) -> bool {
+        ((self.head + 1) % RING_SIZE) == self.tail
+    }
 
     pub fn push(&mut self, c: u8) -> bool {
-        if self.is_full() { return false; }
+        if self.is_full() {
+            return false;
+        }
         self.buf[self.head] = c;
         self.head = (self.head + 1) % RING_SIZE;
         true
     }
 
     pub fn pop(&mut self) -> Option<u8> {
-        if self.is_empty() { return None; }
+        if self.is_empty() {
+            return None;
+        }
         let c = self.buf[self.tail];
         self.tail = (self.tail + 1) % RING_SIZE;
         Some(c)
@@ -89,7 +98,10 @@ impl RingBuf {
         (self.head + RING_SIZE - self.tail) % RING_SIZE
     }
 
-    pub fn clear(&mut self) { self.head = 0; self.tail = 0; }
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+    }
 }
 
 pub struct InputLineBuf {
@@ -99,23 +111,32 @@ pub struct InputLineBuf {
 
 impl InputLineBuf {
     pub const fn new() -> Self {
-        InputLineBuf { buf: [0; LINE_BUF_SIZE], len: 0 }
+        InputLineBuf {
+            buf: [0; LINE_BUF_SIZE],
+            len: 0,
+        }
     }
 
     pub fn push(&mut self, c: u8) -> bool {
-        if self.len >= LINE_BUF_SIZE { return false; }
+        if self.len >= LINE_BUF_SIZE {
+            return false;
+        }
         self.buf[self.len] = c;
         self.len += 1;
         true
     }
 
     pub fn pop(&mut self) -> bool {
-        if self.len == 0 { return false; }
+        if self.len == 0 {
+            return false;
+        }
         self.len -= 1;
         true
     }
 
-    pub fn clear(&mut self) { self.len = 0; }
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 pub struct PtyTermios {
@@ -131,15 +152,15 @@ pub struct PtyTermios {
 impl PtyTermios {
     pub const fn default() -> Self {
         let mut c_cc = [0u8; 32];
-        c_cc[VINTR] = 3;     // Ctrl-C
-        c_cc[VQUIT] = 28;    // Ctrl-backslash
-        c_cc[VERASE] = 127;  // DEL
-        c_cc[VKILL] = 21;    // Ctrl-U
-        c_cc[VEOF] = 4;      // Ctrl-D
+        c_cc[VINTR] = 3; // Ctrl-C
+        c_cc[VQUIT] = 28; // Ctrl-backslash
+        c_cc[VERASE] = 127; // DEL
+        c_cc[VKILL] = 21; // Ctrl-U
+        c_cc[VEOF] = 4; // Ctrl-D
         c_cc[VMIN] = 1;
-        c_cc[VSTART] = 17;   // Ctrl-Q
-        c_cc[VSTOP] = 19;    // Ctrl-S
-        c_cc[VSUSP] = 26;    // Ctrl-Z
+        c_cc[VSTART] = 17; // Ctrl-Q
+        c_cc[VSTOP] = 19; // Ctrl-S
+        c_cc[VSUSP] = 26; // Ctrl-Z
         PtyTermios {
             c_iflag: ICRNL | IXON,
             c_oflag: OPOST | ONLCR,
@@ -168,11 +189,29 @@ pub struct PtyInstance {
     pub has_ctty: bool,
     pub ctty_session_id: u64,
     pub fg_pgid: u32,
-    // Whether VFS has a pending read for this PTY (needs notification on data)
-    pub vfs_pending: bool,
-    // State tracking
-    pub master_closed: bool,
-    pub slave_closed: bool,
+    // Whether VFS has a pending read for each PTY side (needs
+    // VFS_PTY_READY on data). The ready wire is keyed by pty_id; VFS
+    // fans out to the parked read ops and preserves the side there.
+    pub vfs_pending_slave: bool,
+    pub vfs_pending_master: bool,
+    // Open-reference counts per side. A matching
+    // `POSIX_TTYSRV_PTY_CLOSE` (issued by VFS's `release_backing` on
+    // the last OFD reference for that side) decrements the matching
+    // counter. The PTY slot is reset only when both counts reach
+    // zero; PTY 0 is never reset so the console path stays alive.
+    //
+    // `handle_pty_alloc` initialises both counts to `1`, which
+    // matches the legacy `master_closed=false, slave_closed=false`
+    // semantics while letting `release_backing` notify exactly once
+    // per side on last reference.
+    pub master_open_count: u32,
+    pub slave_open_count: u32,
+    /// Monotonic generation counter incremented on every
+    /// `reset_allocated_pty` call. VFS records the generation at
+    /// `POSIX_TTYSRV_PTY_LOOKUP` time and passes it back on
+    /// `POSIX_TTYSRV_PTY_OPEN_SLAVE` so stale vdata that points at a
+    /// reallocated slot is rejected cleanly.
+    pub generation: u32,
 }
 
 impl PtyInstance {
@@ -187,9 +226,11 @@ impl PtyInstance {
             has_ctty: false,
             ctty_session_id: 0,
             fg_pgid: 0,
-            vfs_pending: false,
-            master_closed: false,
-            slave_closed: false,
+            vfs_pending_slave: false,
+            vfs_pending_master: false,
+            master_open_count: 0,
+            slave_open_count: 0,
+            generation: 0,
         }
     }
 }

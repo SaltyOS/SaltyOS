@@ -1,19 +1,25 @@
 [Service]
 Name=posix_ttysrv
 Binary=/bin/posix_ttysrv
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
-After=console namesrv rsrcsrv procmgr vfs saltyfs dispdrv
+After=console namesrv rsrcsrv vfs saltyfs dispdrv
 Before=posix_getty
+Requires=namesrv.socket dispdrv-ep.socket
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# CopyCap=138:66 delivers the VFS notification cap into child slot 66 via
-# the spawner-private CopyCap mechanism (referenced as `CAP_VFS_NTFN` in
-# src/types.rs). System + service-local roles flow through the cap_table.
-CopyCap=138:66
-Require=procmgr
-Require=namesrv
-Require=mmsrv
-Require=dispdrv:dispdrv_ep
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

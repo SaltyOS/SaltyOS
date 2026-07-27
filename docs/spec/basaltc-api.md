@@ -357,7 +357,7 @@ with the VFS server via IPC.
 | `mkdir` | F | Via VFS |
 | `link` | S | Returns ENOSYS (no hard links) |
 | `symlink` | S | Returns ENOSYS (no symlinks) |
-| `readlink` | S | Returns ENOSYS |
+| `readlink` | F | Via VFS (`VFS_READLINK`, inline reply) |
 | `mkfifo` | F | Creates named pipe via VFS |
 
 ### Stat Family
@@ -386,7 +386,7 @@ with the VFS server via IPC.
 | `fchownat` | F | No-op (single user) |
 | `linkat` | S | Returns ENOSYS |
 | `symlinkat` | S | Returns ENOSYS |
-| `readlinkat` | S | Returns ENOSYS |
+| `readlinkat` | F | Via VFS (`VFS_READLINK`, inline reply) |
 | `utimensat` | F | Via VFS; UTIME_NOW supported |
 | `futimens` | F | Via VFS |
 
@@ -527,7 +527,7 @@ Source: `process.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `waitpid` | F | Via procmgr IPC; supports WNOHANG |
+| `waitpid` | F | Via init IPC; supports WNOHANG |
 | `wait` | F | `waitpid(-1, status, 0)` |
 | `wait3` | F | `waitpid(-1, status, options)` — rusage ignored |
 | `wait4` | F | `waitpid(pid, status, options)` — rusage ignored |
@@ -543,8 +543,8 @@ Encoding: bits 7:0 = signal (0 if exited normally), bits 15:8 = exit code.
 
 Source: `signal.rs`
 
-Notification-based signal delivery. 32 signals maximum. Signal handlers are
-stored in shared `trona` globals and dispatched from a notification-polling
+MessagePipe-based signal delivery. 32 signals maximum. Signal handlers are
+stored in shared `trona` globals and dispatched from a MessagePipe-polling
 trampoline.
 
 | Function | St | Notes |
@@ -560,7 +560,7 @@ trampoline.
 | `sigdelset` | F | |
 | `sigismember` | F | |
 | `siginterrupt` | S | Returns 0 (no-op) |
-| `kill` | F | Via procmgr IPC |
+| `kill` | F | Via init IPC |
 | `killpg` | F | `kill(-pgrp, sig)` |
 | `raise` | F | `kill(getpid(), sig)` |
 
@@ -612,9 +612,11 @@ monotonic clock starts at zero on boot (not wall-clock time).
 
 Source: `math.rs`
 
-All math functions use x87 FPU inline assembly. Both `double` and `float`
-variants provided where applicable. No SSE/AVX (target is
-`x86_64-unknown-none`).
+Math policy is implemented in Rust, but ISA instructions are isolated in
+per-architecture `.S` files. On x86_64, sqrt uses SSE/SSE2 stubs and
+transcendental operations use x87 stubs. On aarch64, sqrt and rounding use
+FP instruction stubs, while transcendental operations use scalar Rust
+fallbacks. Rust inline assembly is not used.
 
 ### Classification
 
@@ -1061,13 +1063,16 @@ will need alternatives (e.g., recursive `opendir`/`readdir`).
 
 Source: `compat/freebsd/mntent.rs`
 
-Empty mount table stubs for programs that enumerate mounted filesystems.
+Enumerates mounted filesystems via `VFS_MOUNT_LIST`. `setmntent`
+snapshots the active mount table into a heap buffer grown to the
+mount count; `getmntent` walks it; the option string is rendered from
+the mount flags.
 
 | Function | St | Notes |
 |---|---|---|
-| `setmntent` | S | Returns non-null sentinel |
-| `getmntent` | S | Always returns NULL (empty mount table) |
-| `endmntent` | S | Returns 1 (success) |
+| `setmntent` | F | Snapshots the active mount table (`VFS_MOUNT_LIST`) |
+| `getmntent` | F | Returns each mount entry in turn, NULL at end |
+| `endmntent` | F | Resets the cursor, returns 1 |
 | `hasmntopt` | S | Always returns NULL |
 
 ---
@@ -1201,7 +1206,7 @@ Source: `misc.rs`
 | `utimes` | F | Delegates to utimensat via VFS (converts usec to nsec) |
 | `user_from_uid` | F | Looks up username via getpwuid; falls back to decimal string |
 | `group_from_gid` | F | Looks up group name via getgrgid; falls back to decimal string |
-| `getentropy` | P | xorshift64 PRNG seeded from clock+PID+counter; **NOT cryptographically secure** |
+| `getentropy` | F | Fills buffer from `KernelRng`; rejects buffers larger than 256 bytes |
 | `copy_file_range` | S | Returns -1 / ENOSYS |
 | `sem_init` | S | Returns -1 / ENOSYS |
 | `sem_wait` | S | Returns -1 / ENOSYS |
@@ -1253,14 +1258,14 @@ Source: `crt.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `__libc_start_main` | F | CRT entry point; parses auxv for AT_TRONA_* tags, initializes IPC context and memory manager, calls main |
+| `__libc_start_main` | F | CRT entry point; parses the standard auxv plus `AT_SALTYOS_STARTUP`, initializes IPC context and memory manager, calls main |
 
-Custom auxiliary vector tags (set by init/rtld):
-- `AT_TRONA_SLOT_BASE` (0x1007) — Slot allocator pool base
-- `AT_TRONA_SLOT_COUNT` (0x1008) — Slot allocator pool size
-- `AT_TRONA_CSPACE_NTFN` (0x100A) — CSpace notification cap
-- `AT_TRONA_MM_EP` (0x100B) — Memory manager (mmsrv) endpoint cap slot
-- `AT_TRONA_IPC_BUFFER` (0x100C) — IPC buffer address
+SaltyOS process-private startup state now lives behind a single validated
+pointer in `AT_SALTYOS_STARTUP`. The referenced `SaltyOSStartupLayoutV1` carries
+the IPC buffer address, CSpace layout pointer, capability table pointer,
+dynamic-loader window, and main-image metadata. Bootstrap untyped / sched-
+context / other per-process caps are derived from the cap table and shared
+layout rather than ad-hoc auxv fields.
 
 ---
 
@@ -1355,18 +1360,21 @@ BSD aliases: `__inet_pton`, `__inet_ntop`, `__inet_aton`, `__inet_ntoa`,
 
 ## dlfcn.h
 
-Source: `dlfcn.rs`
+Source: `dlfcn.rs` (thin shim — see `docs/spec/rtld-loader.md` § 11)
 
 | Function | St | Notes |
 |---|---|---|
-| `dlopen` | P | Limited: walks rtld link map for already-loaded libraries |
-| `dlsym` | P | Symbol lookup in loaded libraries via link map |
-| `dlclose` | P | Decrements refcount, no actual unloading |
-| `dlerror` | F | Returns last error string |
-| `dladdr` | F | Address-to-symbol lookup |
+| `dlopen` | F | Loads new DSOs at runtime; deduplicates against the dlopen chain and startup objects |
+| `dlsym` | F | Resolves via per-handle / RTLD_DEFAULT / RTLD_NEXT scope (caller PC captured by per-arch trampoline) |
+| `dlfunc` | F | BSD function-pointer variant of `dlsym` |
+| `dlclose` | F | Refcount + DT_FINI_ARRAY/DT_FINI + munmap for runtime objects; no-op for STARTUP / RTLD_NODELETE |
+| `dlerror` | F | Per-thread buffer (lazy-allocated in `ThreadLocalBlock::dlerror_msg`); read-and-clear semantics |
+| `dladdr` | F | Address-to-symbol lookup across the seed array and runtime chain |
+| `dl_iterate_phdr` | F | Iterates seed objects then chain; passes `dl_phdr_info` to caller callback |
 
-No runtime loading of new shared objects; only pre-loaded libraries (via rtld)
-can be found.
+All functions dispatch into the rtld through the `RtldDlfcnV1` table installed
+via `trona_loader_runtime_install`. RTLD_NEXT, RTLD_DEFAULT, RTLD_GLOBAL,
+RTLD_LOCAL, RTLD_NOLOAD, and RTLD_NODELETE are all implemented.
 
 ---
 
@@ -1390,7 +1398,7 @@ Source: `getrandom.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `getentropy` | F | Fills buffer from kernel RDRAND/RNDR via SYS_GETRANDOM |
+| `getentropy` | F | Fills buffer from `KernelRng`; rejects buffers larger than 256 bytes |
 | `getrandom` | F | Same as getentropy with flags parameter (flags ignored) |
 | `arc4random` | F | Returns 32-bit random value |
 | `arc4random_buf` | F | Fills buffer with random bytes |
@@ -1456,4 +1464,3 @@ Functions not yet implemented that may be needed by additional ported programs:
 - Real timezone/DST support
 - `AF_INET6` support in socket/inet functions
 - `gethostbyname2` / `gethostbyaddr` (currently stubs)
-- Runtime `dlopen` of new shared objects (only pre-loaded libraries supported)

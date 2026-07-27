@@ -1,37 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! SaltyFS feature flag negotiation.
+//
+//! SaltyFS backend-session feature negotiation.
 //!
-//! At mount time, the SaltyFS server reports its superblock feature flags.
-//! This module checks incompat/compat_ro flags and decides whether to mount,
-//! mount read-only, or refuse.
+//! The daemon validates on-disk superblock incompat / compat_ro
+//! flags before `BACKEND_OPEN_SESSION` succeeds. VFS validates the
+//! transport features it needs for the per-mount-instance session:
+//! async completions, incarnation sequences, and SHM transfer for
+//! bulk directory / xattr traffic.
 
-/// Incompatible feature flags the VFS client understands.
-const SALTYFS_INCOMPAT_XATTR: u32 = 1 << 0;
-const SALTYFS_INCOMPAT_CASEFOLD: u32 = 1 << 1;
-const SALTYFS_INCOMPAT_SUPPORTED: u32 = SALTYFS_INCOMPAT_XATTR | SALTYFS_INCOMPAT_CASEFOLD;
+use trona_protocol::vfs::backend::{
+    BACKEND_FEATURE_ASYNC_V1, BACKEND_FEATURE_INCARNATION_SEQ, BACKEND_FEATURE_SHM_TRANSFER,
+};
 
-/// Compat-RO feature flags the VFS client understands.
-const SALTYFS_COMPAT_RO_SUPPORTED: u32 = 0;
+/// Features required by the current SaltyFS VFS client.
+const SALTYFS_BACKEND_REQUIRED: u64 =
+    BACKEND_FEATURE_ASYNC_V1 | BACKEND_FEATURE_INCARNATION_SEQ | BACKEND_FEATURE_SHM_TRANSFER;
 
 /// Mount-time feature flag result.
-pub(super) enum FeatureResult {
-    /// Mount read-write — all flags understood.
-    ReadWrite,
-    /// Mount read-only — unknown compat_ro flags present.
-    ReadOnly,
-    /// Refuse to mount — unknown incompat flags present.
+pub(crate) enum FeatureResult {
+    /// Mount may proceed.
+    Supported,
+    /// Refuse to mount — the backend is missing a required
+    /// session feature.
     Reject,
 }
 
-/// Check feature flags returned by SALTYFS_MOUNT or SALTYFS_GETINFO.
-pub(super) fn check_features(incompat_flags: u32, compat_ro_flags: u32) -> FeatureResult {
-    // Unknown incompat bits → refuse.
-    if (incompat_flags & !SALTYFS_INCOMPAT_SUPPORTED) != 0 {
+/// Check feature flags returned by `BACKEND_OPEN_SESSION`.
+pub(crate) fn check_features(feature_bits: u64) -> FeatureResult {
+    if (feature_bits & SALTYFS_BACKEND_REQUIRED) != SALTYFS_BACKEND_REQUIRED {
         return FeatureResult::Reject;
     }
-    // Unknown compat_ro bits → force read-only.
-    if (compat_ro_flags & !SALTYFS_COMPAT_RO_SUPPORTED) != 0 {
-        return FeatureResult::ReadOnly;
-    }
-    FeatureResult::ReadWrite
+    FeatureResult::Supported
 }

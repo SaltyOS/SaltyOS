@@ -21,5 +21,9 @@ configure =
     -DCMAKE_RANLIB=${TOOLCHAIN_PREFIX}/bin/llvm-ranlib
     -DBUILD_SHARED_LIBS=OFF
 
-[install]
-libz.a = _build/libz.a
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/man
+usr/share/doc

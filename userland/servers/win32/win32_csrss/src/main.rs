@@ -4,40 +4,126 @@
 //! Minimal Win32 subsystem server providing:
 //! - Import resolution for PE binaries (kernel32.dll functions)
 //!
-//! Registers as "win32/csrss" with namesrv so procmgr can look up
-//! the endpoint and pass it to PE processes via AT_SALTYOS_WIN32SRV.
+//! Registers as "win32/csrss" with namesrv so PE processes can receive the
+//! subsystem endpoint through the startup cap table.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
-use trona::consts::kernel::*;
-use trona::consts::posix::O_RDONLY;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::namesrv::*;
-use trona::protocol::procmgr::*;
-use trona::protocol::server::*;
-use trona::protocol::vfs::*;
-use trona::protocol::win32::*;
-use trona::types::core::*;
-use trona::types::pe::*;
+use trona_kernel::core_types::*;
+use trona_kernel::ipc;
+use trona_protocol::common::{TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_OK};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::win32::W32_RESOLVE_IMPORT;
 
-// ======================================================================
-// Capability slot layout (set by .service file)
-// ======================================================================
-
-const CAP_SELF_CSPACE: u64 = 2;
-
-// All system roles flow through the substrate `trona::caps::*` getters
-// (populated by procmgr's populate_cap_table for post-procmgr services).
+// All system roles flow through the substrate `trona_runtime::client::caps::*` getters
+// populated from the supervisor-built startup cap table.
 const KERNEL32_PATH: &[u8] = b"/Windows/System32/kernel32.dll";
 const MAX_IMPORT_NAME: usize = 144;
 const MAX_EXPORT_NAME: usize = 128;
 const MAX_PE_SECTIONS: usize = 64;
 
+const PE_DOS_MAGIC: u16 = 0x5A4D; // "MZ"
+const PE_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
+const PE_OPT_MAGIC_PE32PLUS: u16 = 0x020B;
 const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DosHeader {
+    e_magic: u16,
+    e_cblp: u16,
+    e_cp: u16,
+    e_crlc: u16,
+    e_cparhdr: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    e_ss: u16,
+    e_sp: u16,
+    e_csum: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_lfarlc: u16,
+    e_ovno: u16,
+    e_res: [u16; 4],
+    e_oemid: u16,
+    e_oeminfo: u16,
+    e_res2: [u16; 10],
+    e_lfanew: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CoffHeader {
+    machine: u16,
+    number_of_sections: u16,
+    time_date_stamp: u32,
+    pointer_to_symbol_table: u32,
+    number_of_symbols: u32,
+    size_of_optional_header: u16,
+    characteristics: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DataDirectory {
+    virtual_address: u32,
+    size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OptionalHeader64 {
+    magic: u16,
+    major_linker_version: u8,
+    minor_linker_version: u8,
+    size_of_code: u32,
+    size_of_initialized_data: u32,
+    size_of_uninitialized_data: u32,
+    address_of_entry_point: u32,
+    base_of_code: u32,
+    image_base: u64,
+    section_alignment: u32,
+    file_alignment: u32,
+    major_os_version: u16,
+    minor_os_version: u16,
+    major_image_version: u16,
+    minor_image_version: u16,
+    major_subsystem_version: u16,
+    minor_subsystem_version: u16,
+    win32_version_value: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    checksum: u32,
+    subsystem: u16,
+    dll_characteristics: u16,
+    size_of_stack_reserve: u64,
+    size_of_stack_commit: u64,
+    size_of_heap_reserve: u64,
+    size_of_heap_commit: u64,
+    loader_flags: u32,
+    number_of_rva_and_sizes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SectionHeader {
+    name: [u8; 8],
+    virtual_size: u32,
+    virtual_address: u32,
+    size_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+    pointer_to_relocations: u32,
+    pointer_to_linenumbers: u32,
+    number_of_relocations: u16,
+    number_of_linenumbers: u16,
+    characteristics: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -60,99 +146,30 @@ struct ExportDirectory {
 // ======================================================================
 
 fn ipc_ctx() -> *mut IpcContext {
-    trona::current_ipc_ctx()
+    trona_runtime::current_ipc_ctx()
 }
 
 fn max_u32(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a
-    } else {
-        b
-    }
-}
-
-unsafe fn pack_path(msg: *mut TronaMsg, offset: usize, path: &[u8]) -> u8 {
-    unsafe {
-        let avail = (20usize.saturating_sub(offset + 1)) * 8;
-        let limit = if path.len() < avail {
-            path.len()
-        } else {
-            avail
-        };
-        let path_len = limit as u8;
-        (*msg).regs[offset] = path_len as u64;
-        for i in (offset + 1)..20 {
-            (*msg).regs[i] = 0;
-        }
-        let dst = &raw mut (*msg).regs[offset + 1] as *mut u8;
-        for (i, byte) in path[..limit].iter().enumerate() {
-            *dst.add(i) = *byte;
-        }
-        path_len
-    }
+    if a >= b { a } else { b }
 }
 
 unsafe fn vfs_open_readonly(path: &[u8]) -> i32 {
-    unsafe {
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_POSIX_OPEN;
-        msg.regs[0] = 0;
-        msg.regs[1] = O_RDONLY as u64;
-        let path_len = pack_path(&raw mut msg, 2, path);
-        msg.length = 3 + ((path_len as u64 + 7) / 8);
-
-        let err = ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != TRONA_OK {
-            return -1;
-        }
-        reply.regs[0] as i32
+    match unsafe {
+        trona_runtime::client::vfs::nt_open_existing_readonly(path.as_ptr(), path.len())
+    } {
+        Ok(fd) => fd,
+        Err(_) => -1,
     }
 }
 
 unsafe fn vfs_close(fd: i32) {
-    unsafe {
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_CLOSE;
-        msg.length = 1;
-        msg.regs[0] = fd as u64;
-        let _ = ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-    }
+    let _ = unsafe { trona_runtime::client::vfs::nt_close(fd) };
 }
 
 unsafe fn vfs_pread_exact(fd: i32, offset: u64, buf: &mut [u8]) -> bool {
     unsafe {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let remaining = buf.len() - done;
-            let chunk = if remaining > 152 { 152 } else { remaining };
-            let mut msg = TronaMsg::zeroed();
-            let mut reply = TronaMsg::zeroed();
-            msg.label = VFS_PREAD;
-            msg.length = 3;
-            msg.regs[0] = fd as u64;
-            msg.regs[1] = chunk as u64;
-            msg.regs[2] = offset + done as u64;
-
-            let err =
-                ipc::call_ctx(ipc_ctx(), trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-            if err != 0 || reply.label != TRONA_OK {
-                return false;
-            }
-
-            let actual = reply.regs[0] as usize;
-            if actual == 0 || actual > chunk {
-                return false;
-            }
-
-            let src = &reply.regs[1] as *const u64 as *const u8;
-            for i in 0..actual {
-                buf[done + i] = *src.add(i);
-            }
-            done += actual;
-        }
-        true
+        trona_runtime::client::vfs::nt_read_exact_at(fd, offset, buf.as_mut_ptr(), buf.len() as u64)
+            .is_ok()
     }
 }
 
@@ -429,10 +446,6 @@ unsafe fn resolve_kernel32_export_rva(name: &[u8], ordinal: u16) -> Option<u32> 
     }
 }
 
-fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
-}
-
 /// Handle import resolution: look up a Win32 API function name and return
 /// the exported RVA within kernel32.dll. The PE rtld adds the client's
 /// mapped kernel32 base locally.
@@ -463,137 +476,190 @@ unsafe fn handle_resolve_import(msg: *const TronaMsg, reply: *mut TronaMsg) {
 // Entry point
 // ======================================================================
 
+/// Cookie for the single service-pipe `STATE_READABLE` Watch (kind 0, slot 0,
+/// generation 1). win32_csrss has one event source, so the cookie is constant.
+const WIN32_CSRSS_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+
+/// Single-source reactor dispatcher: the only armed event is `STATE_READABLE`
+/// on the service pipe; routes by label and replies on the same pipe
+/// (txid-correlated).
+struct Win32CsrssDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    scratch: Cap,
+}
+
+impl trona_server::event_loop::EqDispatcher for Win32CsrssDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
+    }
+
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        let mut reply = TronaMsg::zeroed();
+        match msg.label {
+            W32_RESOLVE_IMPORT => unsafe {
+                handle_resolve_import(msg as *const TronaMsg, &raw mut reply)
+            },
+            _ => reply.label = TRONA_INVALID_OPERATION,
+        }
+        // SAFETY: `ipc_ctx()` is this thread's IPC context; the reply rides the
+        // service pipe correlated to the just-read request's txid.
+        let _ = unsafe { ipc::mp_write_reply_ctx(ipc_ctx(), self.recv_ep, &raw const reply) };
+        0
+    }
+
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        // SAFETY: re-arm the sticky cap-receive scratch before each MP_READ.
+        unsafe {
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                ipc_ctx(),
+                trona_kernel::uapi::KERNITE_CAP_SELF_CSPACE as u64,
+                self.scratch,
+                0,
+            );
+        }
+        true
+    }
+
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+            WIN32_CSRSS_SERVICE_COOKIE,
+        )
+    }
+
+    fn handle_overflow(&mut self, _dropped: u64) {}
+
+    fn handle_timer(&mut self, _cookie: u64) {}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[WIN32_CSRSS] Win32 subsystem server starting\n");
     });
 
     // Register with namesrv as "win32/csrss"
-    register_with_namesrv();
-    register_with_procmgr();
+    if !register_with_namesrv() {
+        return 1;
+    }
 
-    signal_ready();
-
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[WIN32_CSRSS] ready, entering dispatch loop\n");
     });
 
-    // Main IPC dispatch loop
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-
-    // Initial recv
-    let err = unsafe {
-        ipc::recv_ctx(
-            ipc_ctx(),
-            trona::caps::service_ep(),
-            &raw mut msg,
-            &raw mut badge,
-        )
-    };
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[WIN32_CSRSS] initial recv failed\n");
-        });
-        idle();
-    }
-
-    loop {
-        let mut reply = TronaMsg::zeroed();
-
-        match msg.label {
-            W32_RESOLVE_IMPORT => {
-                unsafe { handle_resolve_import(&raw const msg, &raw mut reply) };
-            }
-            _ => {
-                reply.label = TRONA_INVALID_OPERATION;
-            }
-        }
-
-        let err = unsafe {
-            ipc::reply_recv_ctx(
-                ipc_ctx(),
-                trona::caps::service_ep(),
-                &raw const reply,
-                &raw mut msg,
-                &raw mut badge,
-            )
-        };
-        if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[WIN32_CSRSS] reply_recv failed\n");
+    // Single-source EventLoop reactor: block on a self-allocated EventQueue
+    // (rsrcsrv-minted) with a Watch on the service pipe's READABLE edge, then
+    // drain + dispatch. Replaces the former mp_write_reply_read loop, which
+    // spun on WOULD_BLOCK once MP_READ became non-blocking.
+    let ctx = ipc_ctx();
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+    let eq = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_EVENT_QUEUE as u64,
+        4,
+    );
+    let watch = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_WATCH as u64,
+        0,
+    );
+    let (eq, watch) = match (eq, watch) {
+        (Some(eq), Some(watch)) => (eq, watch),
+        _ => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[WIN32_CSRSS] reactor EventQueue/Watch alloc failed\n");
             });
-            break;
+            idle();
+        }
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+    let scratch = trona_runtime::core::slot_alloc::slot_alloc_or_idle(b"win32_csrss recv scratch");
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+        WIN32_CSRSS_SERVICE_COOKIE,
+    );
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+    let mut reactor = trona_server::event_loop::EventLoop::new(
+        eq_cap,
+        Win32CsrssDispatcher {
+            recv_ep,
+            watch_cap,
+            eq_cap,
+            scratch,
+        },
+    );
+    loop {
+        // SAFETY: `ctx` is this thread's IPC context; arm the cap-receive
+        // scratch, then block on the EQ and dispatch one ready event.
+        unsafe {
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                ctx,
+                trona_kernel::uapi::KERNITE_CAP_SELF_CSPACE as u64,
+                scratch,
+                0,
+            );
+            let _ = reactor.run_iteration(ctx);
         }
     }
-
-    idle();
 }
+fn register_with_namesrv() -> bool {
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
 
-fn register_with_namesrv() {
     let mut reg_msg = TronaMsg::zeroed();
     let mut reg_reply = TronaMsg::zeroed();
-    let svc_name = b"win32/csrss";
-    reg_msg.label = NS_REGISTER;
+    let svc_name = b"win32_csrss";
+    reg_msg.label = NAMESRV_REGISTER;
     reg_msg.regs[0] = svc_name.len() as u64;
-    reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
     let ns_dst = &raw mut reg_msg.regs[1] as *mut u8;
     unsafe {
         for i in 0..svc_name.len() {
             *ns_dst.add(i) = svc_name[i];
         }
     }
+    reg_msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    reg_msg.length = (REGISTER_FLAGS_REG + 1) as u64;
 
+    let publish_tc = trona_runtime::client::caps::service_client_ep_for_transfer();
     unsafe {
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
-        let err = ipc::call_ctx(
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.as_ref().map_or(0, |t| t.slot()));
+        let err = ipc::mp_call_ctx(
             ipc_ctx(),
-            trona::caps::namesrv_ep(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
             &raw const reg_msg,
             &raw mut reg_reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
+        drop(publish_tc);
         if err == 0 && reg_reply.label == TRONA_OK {
-            trona::uinfo!(|_lb| {
+            trona_runtime::uinfo!(|_lb| {
                 _lb.str(b"[WIN32_CSRSS] registered with namesrv\n");
             });
+            true
         } else {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[WIN32_CSRSS] namesrv registration failed\n");
             });
-        }
-    }
-}
-
-fn register_with_procmgr() {
-    let mut reg_msg = TronaMsg::zeroed();
-    let mut reg_reply = TronaMsg::zeroed();
-    reg_msg.label = PM_REGISTER_PERSONALITY_PROVIDER;
-    reg_msg.length = 1;
-    reg_msg.regs[0] = trona::SUBSYSTEM_WIN32 as u64;
-
-    unsafe {
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
-        let err = ipc::call_ctx(
-            ipc_ctx(),
-            trona::caps::procmgr_ep(),
-            &raw const reg_msg,
-            &raw mut reg_reply,
-        );
-        if err == 0 && reg_reply.label == TRONA_OK {
-            trona::uinfo!(|_lb| {
-                _lb.str(b"[WIN32_CSRSS] registered with procmgr personality layer\n");
-            });
-        } else {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[WIN32_CSRSS] procmgr personality registration failed\n");
-            });
+            false
         }
     }
 }
 
 fn idle() -> ! {
     loop {
-        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona_kernel::syscall::yield_now();
     }
 }

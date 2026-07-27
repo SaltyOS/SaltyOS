@@ -1,0 +1,6 @@
+[Unit]
+Name=dispdrv-ep.socket
+
+[Socket]
+Provider=dispdrv
+Alias=dispdrv_ep

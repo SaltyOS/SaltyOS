@@ -3,7 +3,10 @@
 
 use crate::block::{read_block, write_block};
 use crate::consts::BITMAP_CACHE_SLOTS;
-use crate::{SB, BITMAP_CACHE, BITMAP_CACHE_BLOCK, BITMAP_CACHE_DIRTY, BITMAP_BLOCK_COUNT, ALLOC_HINT, READONLY};
+use crate::{
+    ALLOC_HINT, BITMAP_BLOCK_COUNT, BITMAP_CACHE, BITMAP_CACHE_BLOCK, BITMAP_CACHE_DIRTY, READONLY,
+    SB,
+};
 
 /// Initialize bitmap allocator from superblock.
 pub(crate) fn init_bitmap() {
@@ -94,8 +97,7 @@ pub(crate) fn free_block(block_nr: u64) {
         if let Some(slot) = bitmap_load(bitmap_idx) {
             (*(&raw mut BITMAP_CACHE[slot]))[byte_idx] &= !(1 << bit_idx);
             *(&raw mut BITMAP_CACHE_DIRTY[slot]) = true;
-            (*(&raw mut SB)).used_blocks =
-                (*(&raw const SB)).used_blocks.saturating_sub(1);
+            (*(&raw mut SB)).used_blocks = (*(&raw const SB)).used_blocks.saturating_sub(1);
         }
     }
 }

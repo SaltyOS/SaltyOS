@@ -12,8 +12,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::mm::{
-    pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE,
-    PHYS_MAP_OFFSET, SpinLock,
+    PAGE_SIZE, PHYS_MAP_OFFSET, SpinLock, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt,
+    pmm_alloc,
 };
 
 /// Kernel-global root template used for higher-half mappings.
@@ -36,6 +36,27 @@ fn kernel_root() -> u64 {
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
 
+unsafe extern "C" {
+    fn aarch64_paging_read_ttbr0_el1() -> u64;
+    fn aarch64_paging_write_ttbr0_el1_flush_all(value: u64);
+    fn aarch64_paging_dsb_ishst_isb();
+    fn aarch64_paging_invlpg_current_asid(virt: u64);
+    fn aarch64_paging_invlpg_asid(virt: u64, asid: u64);
+    fn aarch64_paging_invlpg_all_asid(virt: u64);
+    fn aarch64_paging_flush_tlb_all();
+    fn aarch64_paging_flush_asid(asid: u64);
+    fn aarch64_paging_flush_icache_all();
+    fn aarch64_paging_dc_cvau(addr: u64);
+    fn aarch64_paging_dc_cvac(addr: u64);
+    fn aarch64_paging_dsb_ish();
+    fn aarch64_paging_dsb_ish_isb();
+    fn aarch64_paging_dsb_ishst();
+    fn aarch64_paging_write_mair_el1_isb(value: u64);
+    fn aarch64_paging_read_mair_el1() -> u64;
+    fn aarch64_paging_read_tcr_el1() -> u64;
+    fn aarch64_paging_read_sctlr_el1() -> u64;
+}
+
 /// QEMU virt guest RAM starts at 1 GB on aarch64.
 const QEMU_VIRT_RAM_BASE: u64 = 0x4000_0000;
 
@@ -56,6 +77,7 @@ const LOGICAL_WRITABLE: u64 = 1 << 1;
 const LOGICAL_USER: u64 = 1 << 2;
 const LOGICAL_WRITE_THROUGH: u64 = 1 << 3;
 const LOGICAL_CACHE_DISABLE: u64 = 1 << 4;
+const LOGICAL_ACCESSED: u64 = 1 << 5;
 const LOGICAL_HUGE_PAGE: u64 = 1 << 7;
 const LOGICAL_COW: u64 = 1 << 9;
 const LOGICAL_DEMAND: u64 = 1 << 10;
@@ -73,7 +95,8 @@ const HW_AP1_USER: u64 = 1 << 6;
 const HW_AP2_RO: u64 = 1 << 7;
 /// SH[1:0] = Inner Shareable (bits 9:8 = 0b11).
 const HW_SH_IS: u64 = 3 << 8;
-/// Access Flag (bit 10). Must always be set for valid descriptors.
+/// Access Flag (bit 10). User mappings start with AF clear and are promoted to
+/// AF=1 on first touch by the access-fault fast path.
 const HW_AF: u64 = 1 << 10;
 /// PXN — Privileged Execute-Never (bit 53).
 #[allow(dead_code)]
@@ -125,8 +148,9 @@ fn encode_pte(logical: u64) -> u64 {
             hw |= HW_VALID | HW_TABLE_OR_PAGE;
         }
 
-        // Access Flag must always be set for valid descriptors.
-        hw |= HW_AF;
+        if logical & LOGICAL_ACCESSED != 0 {
+            hw |= HW_AF;
+        }
 
         // Inner Shareable for all normal memory.
         hw |= HW_SH_IS;
@@ -231,6 +255,9 @@ fn decode_pte(hw: u64) -> u64 {
         if hw & HW_UXN != 0 {
             logical |= LOGICAL_NO_EXECUTE;
         }
+        if hw & HW_AF != 0 {
+            logical |= LOGICAL_ACCESSED;
+        }
     } else {
         // Not present — recover access flags stored in logical bit positions
         // by encode_pte (hardware ignores all bits when Valid=0).
@@ -309,6 +336,22 @@ impl PageTable {
         // stores relative to subsequent TLB invalidation.
         unsafe { core::ptr::write_volatile(&mut self.entries[index], hw) }
     }
+
+    /// Atomically swap entry `index` to `value` (logical format), returning
+    /// the previous entry in logical format. The atomic swap observes any
+    /// hardware-managed dirty (DBM/AP[2]) state set up to the swap point, so
+    /// page eviction can detect a write that dirtied the page concurrently
+    /// with the unmap (which a plain read-then-write would lose).
+    pub fn swap_entry(&self, index: usize, value: u64) -> u64 {
+        let hw_new = encode_pte(value);
+        // SAFETY: `entries` is `[u64; 512]` inside a 4K-aligned struct, so
+        // each element is 8-byte aligned — a valid `AtomicU64` view, coherent
+        // with the hardware page walker's dirty-state RMW.
+        let slot = unsafe {
+            &*(&self.entries[index] as *const u64 as *const core::sync::atomic::AtomicU64)
+        };
+        decode_pte(slot.swap(hw_new, core::sync::atomic::Ordering::AcqRel))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,21 +360,13 @@ impl PageTable {
 
 #[inline(always)]
 fn read_boot_root() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_paging_read_ttbr0_el1() }
 }
 
 /// Read the current active host TTBR0 value.
 pub fn read_cr3() -> u64 {
-    let val: u64;
     // SAFETY: Reading the active host TTBR0 is always safe from privileged code.
-    unsafe {
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_paging_read_ttbr0_el1() }
 }
 
 /// Write the active host TTBR0 value with an embedded ASID.
@@ -352,26 +387,7 @@ pub unsafe fn write_cr3(value: u64) {
     // page tables.  Without this barrier the walker may see stale zero
     // entries in freshly-allocated child page tables after fork.
     unsafe {
-        core::arch::asm!(
-            "dsb ish",
-            "msr TTBR0_EL1, {}",
-            "isb",
-            in(reg) value,
-            options(nostack),
-        );
-
-        // HVF can retain stale EL0 translations across TTBR0+ASID switches
-        // when multiple processes reuse the same low VA ranges (for example,
-        // the shared 0x3f8000..0x418000 user stack window). Flush after every
-        // user-root switch so execution never depends on hypervisor ASID
-        // correctness.
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nostack),
-        );
+        aarch64_paging_write_ttbr0_el1_flush_all(value);
     }
 }
 
@@ -385,31 +401,13 @@ fn emit_kernel_pte_barriers() {
     // page-table entry so the hardware table walker sees the store and any
     // previously speculated invalid translation is discarded.
     unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "isb",
-            options(nostack),
-        );
+        aarch64_paging_dsb_ishst_isb();
     }
 }
 
 pub fn invlpg(virt: u64) {
     unsafe {
-        // Read current TTBR0 to get the active ASID.
-        let ttbr0 = read_cr3();
-        let asid = (ttbr0 >> 48) & 0xFFFF;
-        // TLBI operand: bits [63:48] = ASID, bits [43:0] = VA >> 12.
-        // Mask VA to 44 bits to prevent kernel addresses (0xFFFF_xxxx...)
-        // from overflowing into the ASID field.
-        let operand = (asid << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vae1is, {}",
-            "dsb ish",
-            "isb",
-            in(reg) operand,
-            options(nostack),
-        );
+        aarch64_paging_invlpg_current_asid(virt);
     }
 }
 
@@ -417,15 +415,7 @@ pub fn invlpg(virt: u64) {
 /// specific ASID (inner-shareable).
 pub fn invlpg_asid(virt: u64, asid: u16) {
     unsafe {
-        let operand = ((asid as u64) << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vae1is, {}",
-            "dsb ish",
-            "isb",
-            in(reg) operand,
-            options(nostack),
-        );
+        aarch64_paging_invlpg_asid(virt, asid as u64);
     }
 }
 
@@ -434,15 +424,7 @@ pub fn invlpg_asid(virt: u64, asid: u16) {
 /// invalidating kernel mappings.
 pub fn invlpg_all_asid(virt: u64) {
     unsafe {
-        let va_shifted = (virt >> 12) & 0x0000_0FFF_FFFF_FFFF;
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vaae1is, {}",
-            "dsb ish",
-            "isb",
-            in(reg) va_shifted,
-            options(nostack),
-        );
+        aarch64_paging_invlpg_all_asid(virt);
     }
 }
 
@@ -450,13 +432,7 @@ pub fn invlpg_all_asid(virt: u64) {
 pub fn flush_tlb_all() {
     // SAFETY: Full TLB invalidation is always safe from privileged code.
     unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nostack),
-        );
+        aarch64_paging_flush_tlb_all();
     }
 }
 
@@ -465,15 +441,7 @@ pub fn flush_asid(asid: u16) {
     // SAFETY: TLBI is always safe from privileged code. The ASID operand
     // occupies bits [63:48] of the register passed to TLBI ASIDE1IS.
     unsafe {
-        let val = (asid as u64) << 48;
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi aside1is, {}",
-            "dsb ish",
-            "isb",
-            in(reg) val,
-            options(nostack),
-        );
+        aarch64_paging_flush_asid(asid as u64);
     }
 }
 
@@ -488,13 +456,7 @@ pub fn flush_icache_all() {
     // SAFETY: IC IALLUIS is always safe from EL1. It broadcasts I-cache
     // invalidation to all CPUs in the inner-shareable domain.
     unsafe {
-        core::arch::asm!(
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack),
-        );
+        aarch64_paging_flush_icache_all();
     }
 }
 
@@ -510,10 +472,10 @@ pub fn flush_dcache_pou_page(kva: u64) {
         let mut addr = kva;
         let end = kva + 4096;
         while addr < end {
-            core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack));
+            aarch64_paging_dc_cvau(addr);
             addr += 64; // ARMv8 minimum cache line size
         }
-        core::arch::asm!("dsb ish", options(nostack));
+        aarch64_paging_dsb_ish();
     }
 }
 
@@ -530,10 +492,10 @@ pub fn flush_dcache_poc_page(kva: u64) {
         let mut addr = kva;
         let end = kva + 4096;
         while addr < end {
-            core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack));
+            aarch64_paging_dc_cvac(addr);
             addr += 64; // ARMv8 minimum cache line size
         }
-        core::arch::asm!("dsb ish", options(nostack));
+        aarch64_paging_dsb_ish();
     }
 }
 
@@ -578,7 +540,7 @@ pub fn clean_kernel_page_tables_to_poc() {
     // this routine is only called once the direct map is active.
     unsafe {
         clean_page_table_tree_to_poc(root, 0);
-        core::arch::asm!("dsb ish", "isb", options(nostack));
+        aarch64_paging_dsb_ish_isb();
     }
 }
 
@@ -684,12 +646,7 @@ pub unsafe fn asid_free(asid: u16) {
 pub fn init() {
     // Step 1: Configure the active host MAIR.
     unsafe {
-        core::arch::asm!(
-            "msr MAIR_EL1, {}",
-            "isb",
-            in(reg) MAIR_VALUE,
-            options(nomem, nostack),
-        );
+        aarch64_paging_write_mair_el1_isb(MAIR_VALUE);
     }
 
     // Step 2: Reuse the shared Stage 3 root as the kernel root template.
@@ -739,7 +696,7 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
         return;
     }
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[PAGING] Direct map range: ");
         _g.hex(QEMU_VIRT_RAM_BASE);
         _g.puts("..");
@@ -761,13 +718,16 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
     // SAFETY: l0_virt points to the bootloader L0 table via identity map.
     let l0e = unsafe { core::ptr::read_volatile(l0_virt.add(l0_idx)) };
     let l1_phys = if l0e & HW_VALID == 0 {
-        let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate L1 table for direct map");
+        let frame = pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::PageTable,
+        })
+        .expect("Failed to allocate L1 table for direct map");
         // SAFETY: frame is a freshly allocated page reachable via identity map.
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
             // DSB ensures zeroing is globally visible before the page walker
             // can follow the parent descriptor into this table.
-            core::arch::asm!("dsb ishst", options(nostack));
+            aarch64_paging_dsb_ishst();
         }
         // L0 table descriptor: valid + table (0b11) + AF
         let desc = frame | HW_VALID | HW_TABLE_OR_PAGE;
@@ -792,13 +752,16 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
         // SAFETY: l1_virt points to an L1 table via identity map.
         let l1e = unsafe { core::ptr::read_volatile(l1_virt.add(l1_idx)) };
         let l2_phys = if l1e & HW_VALID == 0 {
-            let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate L2 table for direct map");
+            let frame = pmm_alloc(&FrameOwner::KernelPrivate {
+                subkind: KernelMetaKind::PageTable,
+            })
+            .expect("Failed to allocate L2 table for direct map");
             // SAFETY: Freshly allocated, identity-mapped.
             unsafe {
                 core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
                 // DSB ensures zeroing is globally visible before the page walker
                 // can follow the parent descriptor into this table.
-                core::arch::asm!("dsb ishst", options(nostack));
+                aarch64_paging_dsb_ishst();
             }
             let desc = frame | HW_VALID | HW_TABLE_OR_PAGE;
             // SAFETY: Writing to L1 entry via identity map.
@@ -865,7 +828,10 @@ unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'stat
         return raw & HW_ADDR_MASK;
     }
 
-    let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
+    let frame = pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::PageTable,
+    })
+    .expect(context);
 
     // SAFETY: `frame` is a freshly allocated page-table frame reachable via
     // the direct map. Zeroing initializes all entries to empty.
@@ -873,7 +839,7 @@ unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'stat
         core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE);
         // DSB ensures zeroing is globally visible before the page walker
         // can follow the parent descriptor into this table.
-        core::arch::asm!("dsb ishst", options(nostack));
+        aarch64_paging_dsb_ishst();
     }
 
     // Write a table descriptor: Valid + Table (0b11).
@@ -1026,27 +992,15 @@ pub fn read_ttbr1() -> u64 {
 
 /// Read MAIR_EL1 (Memory Attribute Indirection Register).
 pub fn read_mair() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, MAIR_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_paging_read_mair_el1() }
 }
 
 /// Read TCR_EL1 (Translation Control Register).
 pub fn read_tcr() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, TCR_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_paging_read_tcr_el1() }
 }
 
 /// Read SCTLR_EL1 (System Control Register).
 pub fn read_sctlr() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    unsafe { aarch64_paging_read_sctlr_el1() }
 }

@@ -1,5 +1,6 @@
-# SaltyOS VFS Server Build (Rust)
 # SPDX-License-Identifier: GPL-2.0-only
+#
+# SaltyOS VFS Server Build (Rust)
 
 vfs_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 
@@ -9,29 +10,27 @@ if 'vfs' in userland_debug_list
   _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
 endif
 
-# Worker pool mode
-if get_option('vfs_worker_pool')
-  _prog_rust_args += ['--cfg', 'vfs_worker_pool']
-  _prog_rust_args += ['--cfg', 'vfs_cpus_' + get_option('max_cpus').to_string()]
-endif
-
 # Step 1: Rust -> .o
 vfs_obj = custom_target('vfs_obj',
   input: files('src/main.rs'),
   output: 'vfs.o',
   depfile: 'vfs.d',
   command: ['env',
-    'VFS_WORKER_COUNT_OVERRIDE=' + get_option('vfs_worker_count_override').to_string(),
     rustc,
     _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=vfs',
     '--crate-type=lib',
-    '--extern', 'trona=' + trona_rmeta,
+    '--extern', 'uapi=' + trona_uapi_rmeta,
+    '--extern', 'trona_kernel=' + trona_kernel_rmeta,
+    '--extern', 'trona_runtime=' + trona_runtime_rmeta,
+    '--extern', 'trona_protocol=' + trona_protocol_rmeta,
+    '--extern', 'trona_server=' + trona_server_rmeta,
+    '--extern', 'trona_posix=' + trona_posix_rmeta,
     '--extern', 'trona_loader=' + trona_loader_rmeta,
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libtrona_rust, trona_loader],
+  depends: [core, compiler_builtins, trona_kernel, trona_protocol, trona_server, trona_runtime, trona_posix, trona_loader],
   build_by_default: true,
 )
 

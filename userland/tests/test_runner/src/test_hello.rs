@@ -2,10 +2,8 @@
 //! Ported from userland/hello/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
-use trona_posix::proc as posix;
+use trona_posix::consts::*;
+use trona_runtime::debug::serial;
 
 pub fn run() -> bool {
     serial::serial_puts(b"[TEST_HELLO] starting\n");

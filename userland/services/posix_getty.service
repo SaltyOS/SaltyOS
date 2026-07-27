@@ -1,9 +1,27 @@
 [Service]
 Name=posix_getty
 Binary=/bin/posix_getty
-Type=simple
-Restart=always
+Type=notify
+Restart=on-failure
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
 
 [Dependencies]
-After=console namesrv procmgr vfs posix_ttysrv saltyfs rootfs.target
-Before=test_runner
+After=console namesrv vfs posix_ttysrv saltyfs rootfs.target
+Before=
+RequiresInterface=vfs:process-client mmsrv:process-client
+
+[Capabilities]
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

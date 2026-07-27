@@ -12,12 +12,37 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
-use trona_posix::consts::*;
+use trona_kernel::core_types::*;
+use trona_kernel::ipc;
+use trona_protocol::posix::*;
+use trona_protocol::posix_abi::file::*;
+use trona_protocol::posix_abi::mm::*;
+use trona_runtime::core::server_consts::*;
+use uapi::*;
+
+/// Iterate program headers (from raw bytes) to find PT_PHDR and return its p_vaddr.
+/// Falls back to `e_phoff` if no PT_PHDR exists.
+unsafe fn elf_get_phdr_load_offset_inline(
+    phdrs_ptr: *const u8,
+    phnum: usize,
+    phentsz: usize,
+    buf_len: usize,
+    e_phoff: u64,
+) -> Option<u64> {
+    unsafe {
+        for i in 0..phnum {
+            let off = i * phentsz;
+            if off + core::mem::size_of::<Elf64Phdr>() > buf_len {
+                break;
+            }
+            let ph = &*(phdrs_ptr.add(off) as *const Elf64Phdr);
+            if ph.p_type == PT_PHDR {
+                return Some(ph.p_vaddr);
+            }
+        }
+        Some(e_phoff)
+    }
+}
 
 /// Maximum file size we will attempt to load from VFS (128 MiB).
 const MAX_VFS_FILE_SIZE: usize = 128 * 1024 * 1024;
@@ -36,6 +61,16 @@ const READ_CHUNK_SIZE: u64 = 152;
 static mut BULK_SHM_ADDR: u64 = 0;
 static mut BULK_SHM_READY: bool = false;
 
+#[inline]
+fn vfs_self_ep() -> Cap {
+    crate::base::cap_helpers::vfs_self_client_ep()
+}
+
+#[inline]
+fn vfs_provider_ep() -> Cap {
+    crate::base::cap_helpers::vfs_provider_ep()
+}
+
 /// Result of a successful VFS load.
 pub struct VfsLoadResult {
     pub data: *const u8,
@@ -51,7 +86,7 @@ pub struct VfsStreamExec {
     pub file_size: usize,
     pub elf_span: u64,
     pub is_dynamic: bool,
-    pub needed: trona_loader::elf_dynamic::NeededLibs,
+    pub needed: super::NeededLibs,
     pub interp_name: [u8; MAX_STREAM_INTERP_LEN],
     pub interp_name_len: usize,
     /// PHDR address relative to the chosen image load base.
@@ -95,9 +130,9 @@ pub(crate) unsafe fn mint_badged_vfs_cap(client_badge: u64) -> Option<Cap> {
     unsafe {
         let alloc = &mut *(&raw mut crate::ALLOCATOR);
         let slot = alloc.alloc_single_slot()?;
-        let err = trona::invoke::cnode_mint(
+        let err = trona_kernel::invoke::cnode_mint(
             crate::CAP_SELF_CSPACE,
-            trona::caps::vfs_ep(),
+            vfs_provider_ep(),
             crate::CAP_SELF_CSPACE,
             slot,
             client_badge,
@@ -112,7 +147,7 @@ pub(crate) unsafe fn mint_badged_vfs_cap(client_badge: u64) -> Option<Cap> {
 
 pub(crate) unsafe fn release_badged_vfs_cap(slot: Cap) {
     unsafe {
-        let _ = trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, slot);
+        let _ = trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, slot);
         (&mut *(&raw mut crate::ALLOCATOR)).free_single_slot(slot);
     }
 }
@@ -164,7 +199,7 @@ unsafe fn stream_va_to_file_offset(
 unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsLoadResult> {
     unsafe {
         let alloc_size = ((file_size + 0xFFF) & !0xFFF) as u64;
-        let buf = trona_posix::mm::posix_mmap(
+        let buf = trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             alloc_size,
             PROT_READ | PROT_WRITE,
@@ -174,9 +209,10 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
-        );
+        )
+        .unwrap_or(usize::MAX as *mut u8);
         if buf as usize == usize::MAX {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: scratch mmap failed\n");
             });
             return None;
@@ -191,12 +227,20 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             vfs_legacy_read_all(fd, buf, file_size, alloc_size)?
         };
 
-        if total_read == 0 {
-            trona_posix::mm::posix_munmap(buf, alloc_size);
+        if total_read == 0 || total_read != file_size {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] VFS: short read got=");
+                _lb.hex(total_read as u64);
+                _lb.str(b" expect=");
+                _lb.hex(file_size as u64);
+                _lb.str(b"\n");
+            });
+            vfs_close(fd);
+            let _ = trona_runtime::client::mm::munmap(buf, alloc_size);
             return None;
         }
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS: loaded ");
             _lb.hex(total_read as u64);
             _lb.str(b" bytes\n");
@@ -219,11 +263,11 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
 /// Returns `None` if the file cannot be found or loaded.
 pub unsafe fn try_load_from_vfs(name: &[u8], name_len: usize) -> Option<VfsLoadResult> {
     unsafe {
-        if trona::caps::vfs_ep() == 0 {
+        if vfs_self_ep() == 0 {
             return None;
         }
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS load: ");
             _lb.bytes(&name[..name_len]);
             _lb.str(b"\n");
@@ -240,7 +284,7 @@ pub unsafe fn try_load_from_vfs(name: &[u8], name_len: usize) -> Option<VfsLoadR
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: bad file size ");
                 _lb.hex(file_size as u64);
                 _lb.str(b"\n");
@@ -265,7 +309,7 @@ unsafe fn ensure_bulk_shm_local() -> bool {
         if *(&raw const BULK_SHM_ADDR) != 0 {
             return true;
         }
-        if trona::caps::mmsrv_ep() == 0 {
+        if trona_runtime::client::caps::mmsrv_ep() == 0 {
             return false;
         }
 
@@ -281,7 +325,12 @@ unsafe fn ensure_bulk_shm_local() -> bool {
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
-        ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply);
+        ipc::call_ctx(
+            ctx,
+            trona_runtime::client::caps::mmsrv_ep(),
+            &raw const msg,
+            &raw mut reply,
+        );
         if reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS {
             return false;
         }
@@ -295,7 +344,12 @@ unsafe fn ensure_bulk_shm_local() -> bool {
         msg.regs[2] = 0; // auto-place
         msg.regs[3] = 0x3; // RW
         msg.length = 4;
-        ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply);
+        ipc::call_ctx(
+            ctx,
+            trona_runtime::client::caps::mmsrv_ep(),
+            &raw const msg,
+            &raw mut reply,
+        );
         if reply.label != TRONA_OK {
             return false;
         }
@@ -329,14 +383,14 @@ unsafe fn ensure_bulk_shm() -> bool {
         if *(&raw const BULK_SHM_READY) {
             return true;
         }
-        if trona::caps::vfs_ep() == 0 {
+        if vfs_self_ep() == 0 {
             return false;
         }
-        if !register_bulk_shm_with_vfs(trona::caps::vfs_ep()) {
+        if !register_bulk_shm_with_vfs(vfs_self_ep()) {
             return false;
         }
         *(&raw mut BULK_SHM_READY) = true;
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS: SHM bulk setup OK\n");
         });
         true
@@ -345,7 +399,7 @@ unsafe fn ensure_bulk_shm() -> bool {
 
 unsafe fn ensure_bulk_shm_on(ep: Cap) -> bool {
     unsafe {
-        if ep == trona::caps::vfs_ep() {
+        if ep == vfs_self_ep() {
             return ensure_bulk_shm();
         }
         register_bulk_shm_with_vfs(ep)
@@ -353,7 +407,7 @@ unsafe fn ensure_bulk_shm_on(ep: Cap) -> bool {
 }
 
 /// Read an entire file using the bulk SHM path.
-/// Returns total bytes read on success, None if bulk path unavailable.
+/// Returns total bytes read on success, None on short read or IPC failure.
 unsafe fn vfs_bulk_read_all(fd: i32, buf: *mut u8, file_size: usize) -> Option<usize> {
     unsafe {
         if !ensure_bulk_shm() {
@@ -377,11 +431,8 @@ unsafe fn vfs_bulk_read_all(fd: i32, buf: *mut u8, file_size: usize) -> Option<u
             msg.regs[2] = 0; // shm_offset
             msg.length = 3;
 
-            let err = ipc::call_ctx(ctx, trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+            let err = ipc::call_ctx(ctx, vfs_self_ep(), &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
-                if total_read > 0 {
-                    return Some(total_read);
-                }
                 return None;
             }
 
@@ -399,7 +450,11 @@ unsafe fn vfs_bulk_read_all(fd: i32, buf: *mut u8, file_size: usize) -> Option<u
             }
         }
 
-        Some(total_read)
+        if total_read == file_size {
+            Some(total_read)
+        } else {
+            None
+        }
     }
 }
 
@@ -428,13 +483,13 @@ unsafe fn vfs_legacy_read_all(
             let got = match vfs_read(fd, buf.add(total_read), chunk) {
                 Some(n) => n,
                 None => {
-                    trona::uerror!(|_lb| {
+                    trona_runtime::uerror!(|_lb| {
                         _lb.str(b"[PROCMGR] VFS: read failed at offset ");
                         _lb.hex(total_read as u64);
                         _lb.str(b"\n");
                     });
                     vfs_close(fd);
-                    trona_posix::mm::posix_munmap(buf, alloc_size);
+                    let _ = trona_runtime::client::mm::munmap(buf, alloc_size);
                     return None;
                 }
             };
@@ -473,7 +528,7 @@ unsafe fn vfs_bulk_read_exact_at(fd: i32, buf: *mut u8, count: usize, offset: us
             msg.regs[2] = 0;
             msg.length = 3;
 
-            let err = ipc::call_ctx(ctx, trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+            let err = ipc::call_ctx(ctx, vfs_self_ep(), &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
                 return None;
             }
@@ -594,8 +649,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
         let mut max_vaddr_end = 0u64;
         let mut is_dynamic = false;
         let mut interp_name = [0u8; MAX_STREAM_INTERP_LEN];
-        let mut interp_name_len =
-            trona_loader::elf_dynamic::resolve_interp_to_cpio_path(&[], &mut interp_name);
+        let mut interp_name_len = super::resolve_interp_to_cpio_path(&[], &mut interp_name);
         let mut dyn_file_off = 0usize;
         let mut dyn_size = 0usize;
 
@@ -627,7 +681,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                         len += 1;
                     }
                     if len > 0 {
-                        let resolved = trona_loader::elf_dynamic::resolve_interp_to_cpio_path(
+                        let resolved = super::resolve_interp_to_cpio_path(
                             &interp_buf[..len],
                             &mut interp_name,
                         );
@@ -646,7 +700,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             return None;
         }
 
-        let phdr_runtime_vaddr = trona_loader::elf_dynamic::elf_get_phdr_load_offset(
+        let phdr_runtime_vaddr = elf_get_phdr_load_offset_inline(
             phdr_bytes.as_ptr(),
             phnum,
             phentsz,
@@ -654,12 +708,12 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             ehdr.e_phoff,
         )?;
 
-        let mut needed = trona_loader::elf_dynamic::NeededLibs::new();
+        let mut needed = super::NeededLibs::new();
 
         if dyn_size != 0 {
             let dyn_count = dyn_size / core::mem::size_of::<Elf64Dyn>();
             let mut strtab_va = 0u64;
-            let mut needed_offsets = [0u64; trona_loader::elf_dynamic::MAX_NEEDED_LIBS];
+            let mut needed_offsets = [0u64; super::MAX_NEEDED_LIBS];
             let mut needed_count = 0usize;
 
             for i in 0..dyn_count {
@@ -691,7 +745,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                 let strtab_file_off =
                     stream_va_to_file_offset(phdr_bytes, phnum, phentsz, strtab_va)?;
                 for i in 0..needed_count {
-                    let mut name_buf = [0u8; trona_loader::elf_dynamic::MAX_NEEDED_NAME];
+                    let mut name_buf = [0u8; super::MAX_NEEDED_NAME];
                     let name_len = read_c_string_at(
                         fd,
                         strtab_file_off + needed_offsets[i] as usize,
@@ -700,9 +754,8 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                     if name_len == 0 {
                         continue;
                     }
-                    let copy_len =
-                        core::cmp::min(name_len, trona_loader::elf_dynamic::MAX_NEEDED_NAME);
-                    if needed.count < trona_loader::elf_dynamic::MAX_NEEDED_LIBS {
+                    let copy_len = core::cmp::min(name_len, super::MAX_NEEDED_NAME);
+                    if needed.count < super::MAX_NEEDED_LIBS {
                         for j in 0..copy_len {
                             needed.names[needed.count][j] = name_buf[j];
                         }
@@ -711,7 +764,6 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                     }
                 }
             }
-
         }
 
         Some(VfsStreamExec {
@@ -746,11 +798,11 @@ pub struct VfsExecStatResult {
 /// Returns `None` if the file cannot be found or loaded.
 pub unsafe fn try_open_exec_source_from_vfs(name: &[u8], name_len: usize) -> Option<VfsExecSource> {
     unsafe {
-        if trona::caps::vfs_ep() == 0 {
+        if vfs_self_ep() == 0 {
             return None;
         }
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS load: ");
             _lb.bytes(&name[..name_len]);
             _lb.str(b"\n");
@@ -766,7 +818,7 @@ pub unsafe fn try_open_exec_source_from_vfs(name: &[u8], name_len: usize) -> Opt
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: bad file size ");
                 _lb.hex(file_size as u64);
                 _lb.str(b"\n");
@@ -824,7 +876,7 @@ unsafe fn vfs_open(path: &[u8], path_len: usize) -> Option<i32> {
 
         let err = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            vfs_self_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -853,7 +905,7 @@ unsafe fn vfs_fstat(fd: i32) -> Option<usize> {
 
         let err = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            vfs_self_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -880,7 +932,7 @@ unsafe fn vfs_lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
 
         let err = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            vfs_self_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -907,7 +959,7 @@ unsafe fn vfs_read(fd: i32, buf: *mut u8, count: u64) -> Option<usize> {
 
         let err = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            vfs_self_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -949,7 +1001,7 @@ unsafe fn vfs_close(fd: i32) {
 
         let _ = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            vfs_self_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -965,9 +1017,9 @@ unsafe fn vfs_close(fd: i32) {
 /// Must only be called after the ELF data has been fully processed
 /// (loaded into the child's address space).
 pub unsafe fn cleanup_vfs_load(data: *const u8, alloc_size: u64) {
-    // SAFETY: Unmapping a region we previously mapped via posix_mmap.
+    // SAFETY: Unmapping a region we previously mapped via mmap.
     unsafe {
-        trona_posix::mm::posix_munmap(data as *mut u8, alloc_size);
+        let _ = trona_runtime::client::mm::munmap(data as *mut u8, alloc_size);
     }
 }
 
@@ -986,6 +1038,29 @@ pub unsafe fn cleanup_exec_source(source: &mut VfsExecSource) {
             }
         }
         *source = VfsExecSource::None;
+    }
+}
+
+/// Inspect a shared object available through the default VFS endpoint.
+///
+/// Returns the page-aligned PT_LOAD span and DT_NEEDED list without keeping the
+/// underlying file open or buffered past the call.
+pub unsafe fn inspect_shared_object_from_vfs(
+    path: &[u8],
+    path_len: usize,
+) -> Option<(u64, super::NeededLibs)> {
+    unsafe {
+        let mut source = try_open_exec_source_from_vfs(path, path_len)?;
+        let result = match &source {
+            VfsExecSource::None => None,
+            VfsExecSource::Buffered(buf) => Some((
+                super::elf_compute_load_span(buf.data, buf.data_len),
+                super::elf_get_needed(buf.data, buf.data_len),
+            )),
+            VfsExecSource::Streamed(exec) => Some((exec.elf_span, exec.needed)),
+        };
+        cleanup_exec_source(&mut source);
+        result
     }
 }
 
@@ -1245,9 +1320,6 @@ unsafe fn vfs_bulk_read_all_on(ep: Cap, fd: i32, buf: *mut u8, file_size: usize)
 
             let err = ipc::call_ctx(ctx, ep, &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
-                if total_read > 0 {
-                    return Some(total_read);
-                }
                 return None;
             }
 
@@ -1263,7 +1335,11 @@ unsafe fn vfs_bulk_read_all_on(ep: Cap, fd: i32, buf: *mut u8, file_size: usize)
             }
         }
 
-        Some(total_read)
+        if total_read == file_size {
+            Some(total_read)
+        } else {
+            None
+        }
     }
 }
 
@@ -1322,14 +1398,15 @@ unsafe fn read_open_vfs_file_to_buffer_on(
 ) -> Option<VfsLoadResult> {
     unsafe {
         let alloc_size = ((file_size + 0xFFF) & !0xFFF) as u64;
-        let buf = trona_posix::mm::posix_mmap(
+        let buf = trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             alloc_size,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
-        );
+        )
+        .unwrap_or(usize::MAX as *mut u8);
         if buf as usize == usize::MAX {
             return None;
         }
@@ -1338,13 +1415,20 @@ unsafe fn read_open_vfs_file_to_buffer_on(
             Some(n) => n,
             None => {
                 vfs_close_on(ep, fd);
-                trona_posix::mm::posix_munmap(buf, alloc_size);
+                let _ = trona_runtime::client::mm::munmap(buf, alloc_size);
                 return None;
             }
         };
         if total_read != file_size {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] VFS(on): short read got=");
+                _lb.hex(total_read as u64);
+                _lb.str(b" expect=");
+                _lb.hex(file_size as u64);
+                _lb.str(b"\n");
+            });
             vfs_close_on(ep, fd);
-            trona_posix::mm::posix_munmap(buf, alloc_size);
+            let _ = trona_runtime::client::mm::munmap(buf, alloc_size);
             return None;
         }
 
@@ -1411,8 +1495,7 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
         let mut max_vaddr_end = 0u64;
         let mut is_dynamic = false;
         let mut interp_name = [0u8; MAX_STREAM_INTERP_LEN];
-        let mut interp_name_len =
-            trona_loader::elf_dynamic::resolve_interp_to_cpio_path(&[], &mut interp_name);
+        let mut interp_name_len = super::resolve_interp_to_cpio_path(&[], &mut interp_name);
         let mut dyn_file_off = 0usize;
         let mut dyn_size = 0usize;
 
@@ -1444,7 +1527,7 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
                         len += 1;
                     }
                     if len > 0 {
-                        let resolved = trona_loader::elf_dynamic::resolve_interp_to_cpio_path(
+                        let resolved = super::resolve_interp_to_cpio_path(
                             &interp_buf[..len],
                             &mut interp_name,
                         );
@@ -1463,7 +1546,7 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
             return None;
         }
 
-        let phdr_runtime_vaddr = trona_loader::elf_dynamic::elf_get_phdr_load_offset(
+        let phdr_runtime_vaddr = elf_get_phdr_load_offset_inline(
             phdr_bytes.as_ptr(),
             phnum,
             phentsz,
@@ -1471,12 +1554,12 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
             ehdr.e_phoff,
         )?;
 
-        let mut needed = trona_loader::elf_dynamic::NeededLibs::new();
+        let mut needed = super::NeededLibs::new();
 
         if dyn_size != 0 {
             let dyn_count = dyn_size / core::mem::size_of::<Elf64Dyn>();
             let mut strtab_va = 0u64;
-            let mut needed_offsets = [0u64; trona_loader::elf_dynamic::MAX_NEEDED_LIBS];
+            let mut needed_offsets = [0u64; super::MAX_NEEDED_LIBS];
             let mut needed_count = 0usize;
 
             for i in 0..dyn_count {
@@ -1509,7 +1592,7 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
                 let strtab_file_off =
                     stream_va_to_file_offset(phdr_bytes, phnum, phentsz, strtab_va)?;
                 for i in 0..needed_count {
-                    let mut name_buf = [0u8; trona_loader::elf_dynamic::MAX_NEEDED_NAME];
+                    let mut name_buf = [0u8; super::MAX_NEEDED_NAME];
                     let name_len = read_c_string_at_on(
                         ep,
                         fd,
@@ -1519,9 +1602,8 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
                     if name_len == 0 {
                         continue;
                     }
-                    let copy_len =
-                        core::cmp::min(name_len, trona_loader::elf_dynamic::MAX_NEEDED_NAME);
-                    if needed.count < trona_loader::elf_dynamic::MAX_NEEDED_LIBS {
+                    let copy_len = core::cmp::min(name_len, super::MAX_NEEDED_NAME);
+                    if needed.count < super::MAX_NEEDED_LIBS {
                         for j in 0..copy_len {
                             needed.names[needed.count][j] = name_buf[j];
                         }
@@ -1530,7 +1612,6 @@ unsafe fn inspect_streamed_vfs_elf_on(ep: Cap, fd: i32, file_size: usize) -> Opt
                     }
                 }
             }
-
         }
 
         Some(VfsStreamExec {

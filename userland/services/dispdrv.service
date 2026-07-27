@@ -1,15 +1,24 @@
 [Service]
 Name=dispdrv
 Binary=/bin/dispdrv
-Type=notify
+Type=broker
 Restart=no
 
 [Dependencies]
-After=console namesrv procmgr saltyfs vfs
+After=console namesrv saltyfs vfs
+Requires=namesrv.socket fb_untyped.cap
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# Cap-table delivery (option 5): system roles via trona::caps::*.
-# No service-local Require= (dispdrv has no cross-service dependencies beyond system roles).
-Require=namesrv
-Require=mmsrv
-Require=fb_untyped
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

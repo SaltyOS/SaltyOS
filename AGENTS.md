@@ -1,166 +1,67 @@
-# AGENTS.md
+# Repository Guidelines
 
-This file defines how **Codex** and other general agents operates in this repository.  
-It is intentionally strict and executable as policy.
+SaltyOS is a capability-based microkernel OS. Kernel in Rust (`kernite/`), system library in Rust (`lib/trona/`), C/C++ libc in C++ (`lib/basalt/`), all userland servers in Rust (`userland/`), 3-stage bootloader in C/asm (`boot/`).
 
-## Project Information
-- Project name: `SaltyOS`
-- Primary language: `Rust 2024` (kernel/userland), plus `C` and `Assembly` (boot/runtime)
-- System type: microkernel OS + CLI-driven build/test workflow (Meson + QEMU)
-- Main responsibilities:
-  - Implement requested changes safely
-  - Preserve kernel/boot correctness
-  - Validate via repository test/build commands
-  - Report exact commands, outcomes, and residual risks
+## Build & Run
 
-## 1. Overview
-### Purpose
-The agent must deliver code changes end-to-end: analyze request, edit all affected files, run targeted validation, and produce auditable results.
+`just` is the only entry point. Default arch is `x86_64`; switch with `just arch=aarch64 …`. Build dirs are arch-qualified (`build-x86_64/`, `build-aarch64/`) — treat as generated.
 
-### High-Level Architecture
-Single-agent staged loop:
+- `just setup` — runs `meson setup` (writes `build-<arch>/toolchain.ini` from `$SALTYOS_TOOLCHAIN_PREFIX`).
+- `just build` — `meson compile`.
+- `just run [--smp N --mem SIZE --uefi --headless --gdb --debug --utm]` — boot in QEMU. `--gdb` waits for `just gdb`. Flags are passed through to `tools/run-qemu.sh`. Always test SMP with `--smp 2+` when touching sched/IPC/mm/cap — single-CPU masks races.
+- `just rr` — quick rebuild + run.
+- `just reconfigure -D<opt>=<v>` — change build options. Options live in `meson.options` (`kernel_log_level`, `userland_log_level`, `kernel_debug_modules=mm,ipc,…`, `userland_aslr`, `max_cpus`, `kernel_stack_size`, `build_libcxx`).
+- `just image` / `just image-uefi` / `just mkrootfs` / `just mksaltyfs` — disk/rootfs/test images.
 
-`Request Intake -> Discovery -> Edit -> Validate -> Report`
+## Toolchain (custom build, not system clang/rustc)
 
-No hidden background agents are assumed. Every action is attributable to the agent.
+Submodules under `toolchain/{llvm-project,rust}` and `lib/{trona,basalt,rust-lang/libc}` — init with `git submodule update --init --recursive` first.
 
-## 2. Agent Role
-| Name | Responsibility | Inputs | Outputs | Allowed tools | Forbidden actions |
-|---|---|---|---|---|---|
-| `The Agent` | End-to-end task execution for SaltyOS changes | User request, repository files, command outputs, existing git state | File diffs, validation results, final summary | `exec_command`, `write_stdin`, `apply_patch`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` | Destructive git/file actions without explicit user request; secret access; network-dependent actions not required by task |
+The build expects `clang`, `rustc`, `llvm-objcopy`, `lld-link`, `llvm-strip`, `llvm-ar` on disk at `$SALTYOS_TOOLCHAIN_PREFIX/bin/` (default `build-toolchain/prefix/bin/`). `setup` errors out if missing — either build with `just tc setup && just tc build host llvm && just tc build host rust` (long, ~30 min for LLVM) or set `SALTYOS_TOOLCHAIN_PREFIX`/`CC`/`RUSTC` to point at prebuilt binaries. `eval "$(just toolchain-env)"` exports the layout for an interactive shell. On macOS, `setup` auto-sets `SDKROOT` for the custom clang's Meson sanity check.
 
-## 3. Control Flow
-### Main Loop
-1. Parse request and constraints.
-2. Discover impacted files using fast search (`rg`, `rg --files`) and focused reads (`sed -n`, `cat`).
-3. Apply complete patch(es) to all affected files — do not stop at the smallest possible diff.
-4. Run the smallest sufficient validation set.
-5. If validation fails, iterate Edit -> Validate (max 3 loops).
-6. Return final status with changed files and command results.
+## No Cargo for in-tree code
 
-### Task State Model
-- `NEW -> DISCOVERING -> EDITING -> VALIDATING -> DONE`
-- `VALIDATING -> EDITING` on fixable failure
-- `* -> BLOCKED` when permission or missing dependency prevents progress
-- `BLOCKED -> DONE` only after user decision or approved escalation
+Rust is compiled by Meson directly via rustc. Do not add `Cargo.toml` files in `kernite/`, `lib/`, or `userland/` (ports under `ports/` are an explicit exception). `cargo build` will not work.
 
-### Task Queue
-- One active task at a time per conversation turn.
-- Follow-up user requests create a new task; do not silently merge unrelated work.
+## Source layout (high-signal only)
 
-## 4. Tool Access Policy
-### Allowed by Default
-- Read/search: `rg`, `rg --files`, `ls`, `cat`, `sed`, `git status`, `git diff`
-- Edit: `apply_patch` (preferred for manual source edits)
-- Build/test: `just build`, `just test-integration`, `just test-smp`, `just test-all`, `just fmt`, `just fmt-check`
+- `kernite/src/{cap,ipc,mm,sched,syscall,console,event,task,object}/` — kernel subsystems.
+- `kernite/src/arch/{x86_64,aarch64}/` — arch-specific code; x86_64 supports both BIOS and UEFI, aarch64 is UEFI-only.
+- `kernite/include/uapi/` — bindgen-generated kernel uAPI headers (`invoke.h`, `ipc.h`, `vmem.h`, …); consult before touching ABI.
+- `lib/trona/{kernel,protocol,server,runtime,posix,loader}/` — Rust system library (six crates). `win32/` holds the kernel32 PE shim; `arch/` holds fork stubs. ABI constants are generated by bindgen from `kernite/include/uapi/*.h`; `runtime/` resolves role-based caps via `AT_SALTYOS_STARTUP` + `SALTYOS_CAP_ROLE_*`.
+- `lib/basalt/{c,cpp}/` — libc.so and (optional) libc++.so.
+- `userland/core/{init,mmsrv,namesrv,rsrcsrv,vfs,logsrv}/` — core servers. `init` owns spawn/exit/waitpid/lifecycle. `procmgr/` is archived (not built); do not extend it. `vfs_old/`, `vfs_old1/` exist during the in-progress VFS rewrite — do not extend them.
+- `userland/{drivers,servers,services}/` — device drivers, network/login servers, systemd-like unit files (`.service`, `.socket`, `.cap`).
+- `userland/tests/{test_runner,hello_pe}/` — runtime tests; `test_runner` boots in QEMU and prints `PASS`/`FAIL` per case via serial.
+- `tools/{port,toolchain,lint}/` — port builder, toolchain helpers, capability-discipline lint.
+- `docs/design/` (architecture) and `docs/spec/` (ABI/syscalls) — read these before changing syscall or ABI surfaces.
 
-### Permission Boundaries
-- Current sandbox mode is `workspace-write`.
-- Writable roots: repository root and `/tmp`.
-- If a necessary command is blocked by sandbox, rerun with explicit escalation request.
-- Never bypass sandbox constraints using alternative side effects.
+## Verification (run the smallest relevant set)
 
-### Explicit Deny Rules
-- No `git reset --hard`, `git checkout --`, or equivalent destructive rollback unless user explicitly asks.
-- Do not revert unrelated working tree changes.
-- Do not modify generated artifacts in `build/` except through normal build/test execution.
+- `just fmt-check` — runs `rustfmt --check` AND `just lint-cap-discipline`. The latter enforces cap-table invariants:
+  - No legacy `AT_TRONA_<EP|UNTYPED|IOPORT>` auxv tag references (14 named tags; the surviving tag is `AT_SALTYOS_STARTUP`).
+  - No `ROLE_PROCMGR_EXPAND_EP` (removed bridge role).
+  - `__trona_cap_*` weak-symbol access is allowed only inside `lib/trona/runtime/`, `lib/trona/loader/` (rtld), and `userland/core/init/`. Everywhere else must use `trona::caps::*()` fn getters.
+  - No literal `const CAP_<WELL_KNOWN>: u64 = N` declarations in userland.
+  - No `fn CAP_*()` shim wrappers in userland runtime code.
+  - No `CAP_UNTYPED_START` outside `userland/core/init/`; child-side consumers must resolve bootstrap untyped at runtime via `trona::runtime_get_bootstrap_untyped()` or `SpawnConfig::for_runtime_bootstrap_untyped()`.
+- `just warn` — runs `just layering-check` (mmsrv policy files must call `crate::kernel_vm::*`, not raw `invoke::*`; `kernel_vm.rs` must not reference `MmRegion`/`MmClient`) plus a `ninja -t clean` + full recompile. Slow — use it before opening a PR, not every iteration.
+- `just run --headless` — boot smoke test. Watch serial output for `KERNEL PANIC`.
+- `just cross-hello` / `just cross-hello-cpp` — required after sysroot/ABI/toolchain changes (`bash tests/cross/build.sh`).
+- New runtime tests go in `userland/tests/<program>/src/test_<name>.rs` and are wired up by the existing test_runner harness.
 
-## 5. Context Management
-### Context Inputs
-- Required: user request, `AGENTS.md`, relevant source/docs, current git working tree status.
-- Optional: `CLAUDE.md`, design/spec docs when architecture-sensitive changes are requested.
+## Ports (`ports/<name>/<name>.port`)
 
-### Short-Term Context
-- Keep only:
-  - directly affected files,
-  - latest command outputs,
-  - current patch intent.
+Build via `just port NAME` after `just reconfigure -Dbuild_ports=true`. Available: bash, bzip2, curl, freebsd-utils, htop, make, nano, nasm, ncurses, ninja, openpam, openssl, perl, python, sudo-rs, wget, xz, zlib, zstd. `just fetch-ports` downloads sources; `just clean-ports` removes per-port `work-<arch>/` and `stage-<arch>/` dirs.
 
-### Long-Term Context
-- Treat repository files as source of truth.
-- Do not rely on unstated memory across turns; re-read files if ambiguity exists.
+## Style
 
-### Trimming Rules
-- Prefer targeted excerpts over full-file dumps.
-- Default to reading only needed ranges (`sed -n start,endp`).
-- Avoid loading large logs fully; extract relevant segments.
+Rust 2024, freestanding `#![no_std]` in kernel. Standard `rustfmt` for `.rs`; `clang-format` for `boot/*.c|*.h`. `snake_case` modules/functions/dirs; `PascalCase` types/enums. Add `// SAFETY:` on every `unsafe` block and `# Safety` on every `unsafe fn`. Prefer explicit error enums over stringly-typed failures. Kernel stack defaults to 16 KiB — keep call chains shallow.
 
-## 6. Failure Handling
-### Tool/Command Failures
-- Classify failure:
-  - transient (timeout, resource contention),
-  - deterministic (compile error, test failure, missing symbol),
-  - permission/sandbox.
+## Commits & PRs
 
-### Retry Policy
-- Transient: retry up to 2 times.
-- Deterministic: do not blind-retry; fix root cause first.
-- Permission failure: request escalation and rerun only if task-critical.
+Conventional Commits with scope: `feat(<scope>): …`, `fix(<scope>): …`, `chore(<scope>): …`. Keep unrelated refactors out of one commit. PRs should summarize the affected subsystem, the architecture (`x86_64`, `aarch64`, or both), the commands run, and the QEMU mode used. Include logs/screenshots only when they clarify boot, console, or other user-visible behavior.
 
-### Escalation Rules
-- Escalate to user when:
-  - command requires out-of-sandbox privileges,
-  - requirements are conflicting/underspecified,
-  - unrelated repo changes appear unexpectedly during execution.
+## Per-session operating rules
 
-## 7. Security Boundaries
-### Filesystem
-- Read: repository files as needed.
-- Write: only files needed for requested task.
-- Never write outside allowed roots.
-
-### Command Execution
-- Allowed for local build/test/inspection required by task.
-- Disallow arbitrary network-dependent workflows unless explicitly required and approved.
-
-### Code Modification
-- Must cover all affected code paths — do not limit changes to the smallest possible diff.
-- Preserve existing license headers and project style conventions.
-- Respect Rust 2024 rules (`unsafe_op_in_unsafe_fn`, no `static mut` references, etc.).
-- For x86_64 paging/TLB paths, do not use `options(nomem)` on inline asm that must be ordered with page-table updates (for example `invlpg`, `mov cr3`, shootdown-related sequences).
-- Rationale: `nomem` can allow compiler reordering of PTE stores past TLB flush operations and mask bugs as timing-dependent behavior.
-- Prefer `options(nostack[, preserves_flags])` for these instructions; keep explicit fences when they document ordering intent.
-
-### Secrets
-- Do not read or exfiltrate secrets (`~/.ssh`, tokens, key files, secret env vars).
-- If secret access is required, stop and ask user.
-
-## 8. Determinism & Reproducibility
-- Prefer deterministic command ordering and explicit file paths.
-- Report exact commands run and meaningful outputs.
-- Avoid unrelated formatting churn, but do not artificially shrink diffs — include every logically related change.
-- For validation, run targeted checks first, then broader checks when required.
-- In final response, include:
-  - changed files,
-  - validation commands executed,
-  - pass/fail status,
-  - remaining risks or unrun checks.
-
-## 9. Extension Guidelines
-When introducing an additional agent role in this file, include all required fields:
-
-`AgentSpec { name, responsibility, inputs, outputs, allowed_tools, forbidden_actions, read_scope, write_scope, retry_policy, escalation_rules }`
-
-Constraints:
-1. New roles must map to real executable behavior in the current agent workflow.
-2. Least privilege by default.
-3. No overlap without explicit precedence rules.
-4. Must define clear handoff/state transition points.
-5. Must define failure and escalation policy.
-
-## Repository Quick Reference
-### Structure
-- `boot/`: 3-stage bootloader
-- `kernel/src/`: Rust microkernel
-- `userland/`: servers/apps (`init`, `console`, `procmgr`, `vfs`, `nameserv`, tests)
-- `lib/`: shared userspace libraries (`libsalty`, `libc`)
-- `tools/`: build/image/test scripts
-- `docs/`: architecture/design/spec
-- `build/`: generated artifacts
-
-### Common Commands
-- `just setup`
-- `just build`
-- `just run`, `just run-smp`, `just run-uefi`
-- `just reconfigure -Dkernel_log_level=debug`
-- `just fmt`, `just fmt-check`
+The repository's `CLAUDE.md` (and `claude-agent-kit` if linked) overrides generic system defaults — read it once per session. Anything project-wide that conflicts with the system prompt (verification-before-completion reporting, scope integrity, write-capable delegate gate, observation-not-suppression) is governed there, not here.

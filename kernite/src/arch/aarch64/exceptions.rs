@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! AArch64 exception vector table and dispatch handlers.
 //!
-//! Provides the active host vector table (via `global_asm!`) and Rust-side
+//! Provides the active host vector table (via `exceptions.S`) and Rust-side
 //! handlers for synchronous exceptions (SVC, data/instruction aborts) and
 //! IRQs from both EL1 and EL0.
 
-use core::arch::global_asm;
+unsafe extern "C" {
+    fn aarch64_exceptions_read_esr_el1() -> u64;
+    fn aarch64_exceptions_read_far_el1() -> u64;
+    fn aarch64_exceptions_read_daif() -> u64;
+    fn aarch64_exceptions_write_vbar_el1(vbar: u64);
+}
 
 // ---------------------------------------------------------------------------
 // Exception frame
@@ -52,21 +57,23 @@ const EC_SPALIGN: u64 = 0x26;
 const EC_FP_TRAP: u64 = 0x07;
 
 #[inline(always)]
+fn is_access_flag_fault(fsc: u64) -> bool {
+    (0x08..=0x0B).contains(&fsc)
+}
+
+#[inline(always)]
+fn is_permission_fault(fsc: u64) -> bool {
+    (0x0C..=0x0F).contains(&fsc)
+}
+
+#[inline(always)]
 fn read_exception_esr() -> u64 {
-    let esr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
-    }
-    esr
+    unsafe { aarch64_exceptions_read_esr_el1() }
 }
 
 #[inline(always)]
 fn read_exception_far() -> u64 {
-    let far: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
-    }
-    far
+    unsafe { aarch64_exceptions_read_far_el1() }
 }
 
 /// Spurious interrupt ID (no pending interrupt).
@@ -86,6 +93,7 @@ unsafe fn save_el0_frame_to_current_tcb(frame: *const ExceptionFrame) {
             ctx.x[i] = (*frame).regs[i];
             i += 1;
         }
+        ctx.x[18] = (*current).abi_tp_base;
         ctx.user_sp = (*frame).sp_el0;
         ctx.return_elr = (*frame).elr_el1;
         ctx.return_spsr = (*frame).spsr_el1;
@@ -106,6 +114,7 @@ unsafe fn restore_el0_frame_from_current_tcb(frame: *mut ExceptionFrame, x0: u64
             (*frame).regs[i] = ctx.x[i];
             i += 1;
         }
+        (*frame).regs[18] = (*current).abi_tp_base;
         (*frame).sp_el0 = ctx.user_sp;
         (*frame).elr_el1 = ctx.return_elr;
         (*frame).spsr_el1 = ctx.return_spsr;
@@ -126,7 +135,7 @@ unsafe fn sync_el0_ttbr0_from_current_tcb(frame: *const ExceptionFrame) {
         let active = crate::arch::paging::read_cr3();
         if active != expected {
             let f = &*frame;
-            let s = crate::SerialGuard::acquire();
+            let s = crate::kernel::printk::SerialGuard::acquire();
             s.puts("[A64] TTBR0 mismatch on EL0 resume: active=");
             s.hex(active);
             s.puts(" expected=");
@@ -139,158 +148,7 @@ unsafe fn sync_el0_ttbr0_from_current_tcb(frame: *const ExceptionFrame) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Vector table + save/restore macros (assembly)
-// ---------------------------------------------------------------------------
-
-global_asm!(
-    r#"
-// ---- Register save macro ----
-// Pushes x0-x30, SP_EL0, ELR_EL1, SPSR_EL1 onto the kernel stack.
-// Frame size: 288 bytes (272 payload + 16 padding for alignment).
-.macro SAVE_REGS
-    sub     sp, sp, #288
-    stp     x0, x1, [sp, #0]
-    stp     x2, x3, [sp, #16]
-    stp     x4, x5, [sp, #32]
-    stp     x6, x7, [sp, #48]
-    stp     x8, x9, [sp, #64]
-    stp     x10, x11, [sp, #80]
-    stp     x12, x13, [sp, #96]
-    stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
-    stp     x18, x19, [sp, #144]
-    stp     x20, x21, [sp, #160]
-    stp     x22, x23, [sp, #176]
-    stp     x24, x25, [sp, #192]
-    stp     x26, x27, [sp, #208]
-    stp     x28, x29, [sp, #224]
-    str     x30, [sp, #240]
-    mrs     x0, SP_EL0
-    str     x0, [sp, #248]
-    mrs     x0, ELR_EL1
-    str     x0, [sp, #256]
-    mrs     x0, SPSR_EL1
-    str     x0, [sp, #264]
-.endm
-
-// ---- Register restore macro ----
-// Pops the saved state and returns via ERET.
-.macro RESTORE_REGS
-    ldr     x0, [sp, #264]
-    msr     SPSR_EL1, x0
-    ldr     x0, [sp, #256]
-    msr     ELR_EL1, x0
-    ldr     x0, [sp, #248]
-    msr     SP_EL0, x0
-    ldp     x28, x29, [sp, #224]
-    ldr     x30, [sp, #240]
-    ldp     x26, x27, [sp, #208]
-    ldp     x24, x25, [sp, #192]
-    ldp     x22, x23, [sp, #176]
-    ldp     x20, x21, [sp, #160]
-    ldp     x18, x19, [sp, #144]
-    ldp     x16, x17, [sp, #128]
-    ldp     x14, x15, [sp, #112]
-    ldp     x12, x13, [sp, #96]
-    ldp     x10, x11, [sp, #80]
-    ldp     x8, x9, [sp, #64]
-    ldp     x6, x7, [sp, #48]
-    ldp     x4, x5, [sp, #32]
-    ldp     x2, x3, [sp, #16]
-    ldp     x0, x1, [sp, #0]
-    add     sp, sp, #288
-    eret
-.endm
-
-// ---- Vector table ----
-// Must be 2048-byte aligned (VBAR_EL1 requirement).
-// 16 entries, each 128 bytes (32 instructions max).
-
-    .section .text
-    .balign 2048
-    .global exception_vectors
-exception_vectors:
-
-    // ---- Group 0: Current EL with SP0 (not used) ----
-    .balign 128
-    b       .                   // Sync
-    .balign 128
-    b       .                   // IRQ
-    .balign 128
-    b       .                   // FIQ
-    .balign 128
-    b       .                   // SError
-
-    // ---- Group 1: Current EL with SPx (kernel exceptions) ----
-    .balign 128
-    b       el1_sync            // Sync
-    .balign 128
-    b       el1_irq             // IRQ
-    .balign 128
-    b       .                   // FIQ (unused)
-    .balign 128
-    b       el1_serror          // SError
-
-    // ---- Group 2: Lower EL using AArch64 (user exceptions) ----
-    .balign 128
-    b       el0_sync            // Sync (SVC, data abort, etc.)
-    .balign 128
-    b       el0_irq             // IRQ
-    .balign 128
-    b       .                   // FIQ (unused)
-    .balign 128
-    b       el0_serror          // SError
-
-    // ---- Group 3: Lower EL using AArch32 (not supported) ----
-    .balign 128
-    b       .
-    .balign 128
-    b       .
-    .balign 128
-    b       .
-    .balign 128
-    b       .
-
-// ---- Handler stubs ----
-
-el1_sync:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el1_sync_handler
-    RESTORE_REGS
-
-el1_irq:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el1_irq_handler
-    RESTORE_REGS
-
-el0_sync:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el0_sync_handler
-    RESTORE_REGS
-
-el0_irq:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el0_irq_handler
-    RESTORE_REGS
-
-el1_serror:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el1_serror_handler
-    RESTORE_REGS
-
-el0_serror:
-    SAVE_REGS
-    mov     x0, sp
-    bl      el0_serror_handler
-    RESTORE_REGS
-"#,
-);
+// The vector table and register save/restore stubs live in `exceptions.S`.
 
 // ---------------------------------------------------------------------------
 // Rust exception handlers
@@ -317,10 +175,30 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
             // instruction can be retried via ERET.
             let dfsc = esr & 0x3F;
             let is_write = esr & (1 << 6) != 0;
-            let is_permission_fault = dfsc >= 0x0D && dfsc <= 0x0F;
             let is_user_va = far < 0x0001_0000_0000_0000;
 
-            if is_user_va && is_permission_fault && is_write {
+            if is_user_va && is_access_flag_fault(dfsc) {
+                let fault = crate::mm::PageFaultInfo {
+                    present: true,
+                    write: is_write,
+                    user: true,
+                };
+                let handled = unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        vspace.handle_accessed_fault(far, &fault).unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if handled {
+                    return;
+                }
+            }
+
+            if is_user_va && is_permission_fault(dfsc) && is_write {
                 let fault = crate::mm::PageFaultInfo {
                     present: true,
                     write: true,
@@ -366,9 +244,11 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
                 }
             }
 
-            panic!(
-                "EL1 data abort: FAR={:#018x} ESR={:#010x} ELR={:#018x}",
-                far, esr, elr,
+            crate::kernel::panic::fatal_exception_context(
+                "aarch64 EL1 data abort",
+                format_args!("FAR={:#018x} ESR={:#010x} ELR={:#018x}", far, esr, elr),
+                aarch64_panic_context(frame, esr, Some(far)),
+                || dump_aarch64_exception(frame, esr, Some(far)),
             );
         }
         EC_IABT_CURRENT => {
@@ -376,22 +256,31 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
             let far = read_exception_far();
             // SAFETY: frame was set up by SAVE_REGS and is valid.
             let elr = unsafe { (*frame).elr_el1 };
-            panic!(
-                "EL1 instruction abort: FAR={:#018x} ESR={:#010x} ELR={:#018x}",
-                far, esr, elr,
+            crate::kernel::panic::fatal_exception_context(
+                "aarch64 EL1 instruction abort",
+                format_args!("FAR={:#018x} ESR={:#010x} ELR={:#018x}", far, esr, elr),
+                aarch64_panic_context(frame, esr, Some(far)),
+                || dump_aarch64_exception(frame, esr, Some(far)),
             );
         }
         EC_FP_TRAP => {
             // EL1 hit a trapped FP/SIMD instruction.
             let elr = unsafe { (*frame).elr_el1 };
-            panic!("EL1 FP/ASIMD trap: ESR={:#010x} ELR={:#018x}", esr, elr);
+            crate::kernel::panic::fatal_exception_context(
+                "aarch64 EL1 FP/ASIMD trap",
+                format_args!("ESR={:#010x} ELR={:#018x}", esr, elr),
+                aarch64_panic_context(frame, esr, None),
+                || dump_aarch64_exception(frame, esr, None),
+            );
         }
         _ => {
             // SAFETY: frame was set up by SAVE_REGS and is valid.
             let elr = unsafe { (*frame).elr_el1 };
-            panic!(
-                "Unexpected EL1 sync exception: EC={:#04x} ESR={:#010x} ELR={:#018x}",
-                ec, esr, elr,
+            crate::kernel::panic::fatal_exception_context(
+                "aarch64 EL1 sync exception",
+                format_args!("EC={:#04x} ESR={:#010x} ELR={:#018x}", ec, esr, elr),
+                aarch64_panic_context(frame, esr, None),
+                || dump_aarch64_exception(frame, esr, None),
             );
         }
     }
@@ -400,9 +289,13 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
 /// Handle IRQs taken from EL1 (kernel context).
 ///
 /// Acknowledges the interrupt via the GIC, dispatches based on INTID,
-/// and sends EOI.
+/// and sends EOI. `frame.spsr_el1` still provides the interrupted-mode hint
+/// for the scheduler's timer API shape; precise user/kernel runtime
+/// attribution itself happens in the common entry/exit hooks.
 #[unsafe(no_mangle)]
-extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
+extern "C" fn el1_irq_handler(frame: *const ExceptionFrame) {
+    // SPSR_EL1.M[3:0] == 0 → EL0t (user). Any other value is an EL1 mode.
+    let interrupted_user_mode = unsafe { ((*frame).spsr_el1 & 0xF) == 0 };
     let intid = super::gic::acknowledge_irq();
 
     match intid {
@@ -411,7 +304,7 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             // before timer_tick (which may context-switch).
             super::timer::rearm();
             super::gic::eoi(intid);
-            crate::sched::timer_tick();
+            crate::event::timer::dispatch_tick(interrupted_user_mode);
         }
         0..=INTID_SGI_MAX => {
             // Software Generated Interrupt (IPI).
@@ -430,7 +323,7 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             // after EOI, but dispatch_irq runs with IRQs disabled so the
             // re-trigger is deferred until after the handler completes.
             super::gic::eoi(intid);
-            crate::ipc::irq::dispatch_irq(intid as usize);
+            crate::event::irq::dispatch_irq(intid as usize);
         }
     }
 }
@@ -472,35 +365,65 @@ fn dispatch_sgi(intid: u32) {
 
 /// Handle VSpace teardown IPI.
 ///
-/// When a VSpace is being destroyed, all CPUs that have it loaded in
-/// TTBR0 must switch away before the page tables can be freed.
-/// This handler checks if the current CPU has the target VSpace loaded
-/// and if so, processes the pending deactivation.
+/// Switch away from a dying user VSpace on this CPU, then drive the scheduler
+/// epilogue so the remote active-count decrement is observed promptly.
 fn handle_vspace_teardown_ipi() {
-    // Trigger the scheduler's pending-deactivate check for this CPU.
-    // The scheduler's `with_lock` calls `kernel_exit_epilogue` which
-    // processes pending VSpace deactivates.
+    let cpu_id = super::current_cpu();
+    let current_tracking = crate::mm::vspace::current_vspace_tracking();
+    let kernel_tracking = crate::mm::vspace::kernel_vspace_tracking();
+
+    if current_tracking.is_null() || current_tracking == kernel_tracking {
+        return;
+    }
+
+    // SAFETY: current_tracking is this CPU's current VSpace tracking pointer
+    // and was checked for null above.
+    unsafe {
+        if (*current_tracking).state() == crate::mm::vspace::VSpaceState::Active {
+            return;
+        }
+    }
+
+    let kernel_root = crate::mm::vspace::kernel_vspace_root();
+    // SAFETY: kernel_root is the kernel VSpace root and is valid to install in
+    // TTBR0 while handling the teardown IPI.
+    unsafe {
+        crate::arch::paging::write_cr3(kernel_root);
+    }
+
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    crate::mm::vspace::set_current_vspace_tracking(kernel_tracking);
+
+    // SAFETY: this runs on cpu_id in an interrupt handler with IRQs disabled;
+    // current_vspace_tracking has already been moved to the kernel VSpace.
+    unsafe {
+        crate::mm::vspace::set_pending_deactivate(cpu_id, current_tracking);
+    }
+
+    // Process the pending deactivate through the scheduler epilogue. This was
+    // the original aarch64 path; the missing piece was recording the pending
+    // VSpace before entering it.
     crate::sched::scheduler::scheduler().with_lock(|_| {});
 }
 
-/// Block on a userspace fault handler when configured, otherwise retire the
-/// current thread so the exception does not immediately recur forever.
-fn finish_el0_fault(msg: &crate::ipc::Message) {
+/// Deliver an EL0 fault to the bound fault `MessagePipe` via the
+/// reply-to-resume protocol. `deliver_fault` parks the thread on the
+/// bound fault pipe and reschedules; on wake we return here with
+/// `true` (handler replied `KERNITE_OK` — return to user mode at the
+/// faulting ELR for instruction retry) or `false` (no handler, fault
+/// pipe full / closed, or non-OK reply — destroy the thread so the
+/// exception does not loop).
+fn finish_el0_fault(record: crate::ipc::message_pipe::MpRecord) {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
         let current = scheduler.current();
 
-        if !current.is_null() && !(*current).fault_handler.is_null() {
-            let fault_ep = &mut *((*current).fault_handler as *mut crate::ipc::Endpoint);
-            fault_ep.deliver_fault(current, msg);
-            scheduler.reschedule();
+        if !current.is_null() {
+            if crate::ipc::fault::deliver_fault(current, record) {
+                return; // handler consumed → retry instruction
+            }
+            crate::task::quiesce::begin_destroy_on_fault(current);
             return;
-        } else if !current.is_null() {
-            (*current).state = crate::sched::thread::ThreadState::Inactive;
-            (*current).blocked_reason = None;
-            (*current).blocked_endpoint = core::ptr::null_mut();
-            (*current).blocked_notification = core::ptr::null_mut();
-            crate::sched::thread::Tcb::release_tcb_ref((*current).clear_reply_tcb());
         }
 
         scheduler.reschedule();
@@ -518,10 +441,10 @@ fn log_el0_sync_state(
     esr: u64,
     far: Option<u64>,
 ) {
-    crate::serial_puts(prefix);
+    crate::kernel::printk::serial_puts(prefix);
     unsafe {
         let f = &*frame;
-        let s = crate::SerialGuard::acquire();
+        let s = crate::kernel::printk::SerialGuard::acquire();
         if let Some(ec) = ec {
             s.puts(" EC=");
             s.hex(ec);
@@ -561,7 +484,8 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             // AArch64 SVC convention:
             //   x8  = syscall number
             //   x0  = cap_ptr
-            //   x1-x5 = arg0-arg4
+            //   x1  = invoke label
+            //   x2-x5 = arg0-arg3
             // SAFETY: frame was set up by SAVE_REGS and is a valid pointer
             // to a fully-initialized ExceptionFrame on the kernel stack.
             // syscall_handle_rust and the fastpath functions are unsafe
@@ -571,44 +495,35 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
                 let f = &*frame;
                 let syscall_num = f.regs[8];
 
-                // IPC fastpath: Call (2), ReplyRecv (3), and ReplyRecvAny (24).
-                // Mirrors x86_64 syscall.S fastpath dispatch. The AAPCS64
-                // calling convention matches the register layout exactly
-                // (x0-x5 → first 6 arguments), so no remapping is needed.
-                if syscall_num == 2 || syscall_num == 3 || syscall_num == 24 {
-                    let fp_result = if syscall_num == 2 {
-                        crate::syscall::fastpath::fastpath_call_rust(
-                            f.regs[0], f.regs[1], f.regs[2],
-                            f.regs[3], f.regs[4], f.regs[5],
-                        )
-                    } else if syscall_num == 3 {
-                        crate::syscall::fastpath::fastpath_reply_recv_rust(
-                            f.regs[0], f.regs[1], f.regs[2],
-                            f.regs[3], f.regs[4], f.regs[5],
-                        )
-                    } else {
-                        crate::syscall::fastpath::fastpath_reply_recv_any_rust(
-                            f.regs[0], f.regs[1], f.regs[2],
-                            f.regs[3], f.regs[4], f.regs[5],
-                        )
-                    };
-                    if fp_result.status != 0 {
-                        restore_el0_frame_from_current_tcb(frame, 0, fp_result.value);
-                        sync_el0_ttbr0_from_current_tcb(frame);
-                        return;
-                    }
-                }
-
-                // Slowpath: full syscall dispatch.
-                let result = crate::syscall::syscall_handle_rust(
+                // Try the inline fastpath first; on a miss the helper
+                // returns 0 with no observable side effect and we fall
+                // through to the full dispatch. Mirror of the x86_64
+                // dispatch in `arch/x86_64/syscall.S`.
+                let mut fast_out = crate::syscall::SyscallResult::ok(0);
+                let handled = crate::syscall::fastpath::kernite_try_sys_invoke_fastpath(
                     syscall_num,
-                    f.regs[0],  // cap_ptr (x0)
-                    f.regs[1],  // arg0 (x1)
-                    f.regs[2],  // arg1 (x2)
-                    f.regs[3],  // arg2 (x3)
-                    f.regs[4],  // arg3 (x4)
-                    f.regs[5],  // arg4 (x5)
+                    f.regs[0], // cap_ptr (x0)
+                    f.regs[1], // invoke label (x1)
+                    f.regs[2], // arg0 (x2)
+                    f.regs[3], // arg1 (x3)
+                    f.regs[4], // arg2 (x4)
+                    f.regs[5], // arg3 (x5)
+                    &mut fast_out as *mut _,
                 );
+                let result = if handled != 0 {
+                    fast_out
+                } else {
+                    // Slowpath: full syscall dispatch.
+                    crate::syscall::syscall_handle_rust(
+                        syscall_num,
+                        f.regs[0],
+                        f.regs[1],
+                        f.regs[2],
+                        f.regs[3],
+                        f.regs[4],
+                        f.regs[5],
+                    )
+                };
                 // Write return values back into the saved frame so RESTORE_REGS
                 // delivers them to userspace.
                 restore_el0_frame_from_current_tcb(frame, result.error, result.value);
@@ -633,39 +548,86 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             // Kernel fast-path fault handling: COW, demand paging, stack growth.
             // Construct arch-neutral PageFaultInfo from AArch64 ESR_EL1:
             //   - Translation Fault (DFSC 0x04..0x07): page not present
-            //   - Permission Fault (DFSC 0x0D..0x0F): page present, wrong perms
+            //   - Access Flag Fault (DFSC 0x08..0x0B): first touch on AF=0 page
+            //   - Permission Fault (DFSC 0x0C..0x0F): page present, wrong perms
             //   - WnR (bit 6): write access
             //   - Always user mode (EL0 data abort)
+            let is_write = esr & (1 << 6) != 0;
+            if is_access_flag_fault(dfsc) {
+                let access_fault = crate::mm::PageFaultInfo {
+                    present: true,
+                    write: is_write,
+                    user: true,
+                };
+                let handled = unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        vspace
+                            .handle_accessed_fault(far, &access_fault)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if handled {
+                    return;
+                }
+            }
             let fault = crate::mm::PageFaultInfo {
-                present: dfsc >= 0x0D && dfsc <= 0x0F,
-                write: esr & (1 << 6) != 0,
+                present: is_permission_fault(dfsc),
+                write: is_write,
                 user: true,
             };
+            let elr = unsafe { (*frame).elr_el1 };
             let handled = unsafe {
                 let scheduler = crate::sched::scheduler::scheduler();
                 let current = scheduler.current();
                 if !current.is_null() && !(*current).vspace_root.is_null() {
                     let vspace = &mut *(*current).vspace_root;
 
-                    let resolved =
-                        vspace.handle_cow_fault_pooled(far, &fault).unwrap_or(false)
-                        || vspace.handle_cow_fault(far, &fault).unwrap_or(false)
-                        || vspace.handle_demand_fault(far, &fault).unwrap_or(false)
-                        || vspace.handle_stack_growth_fault(
-                            far,
-                            &fault,
-                            (*frame).sp_el0,
-                            (*current).user_stack_top,
-                            (*current).user_stack_min,
-                        ).unwrap_or(false);
-
-                    if resolved
-                        && (*current).state
-                            == crate::sched::thread::ThreadState::Inactive
-                    {
-                        scheduler.reschedule();
+                    let cow_pooled_result = vspace.handle_cow_fault_pooled(far, &fault);
+                    if let Ok(true) = cow_pooled_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
                     }
-                    resolved
+                    let cow_result = vspace.handle_cow_fault(far, &fault);
+                    if let Ok(true) = cow_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
+                    }
+
+                    let demand_result = vspace.handle_demand_fault(far, &fault);
+                    if let Ok(true) = demand_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
+                    }
+                    // Stack growth is handled by the demand fault path —
+                    // the full-span stack reserve carries a single
+                    // REGION_KIND_STACK VmArea + DEMAND PTEs, so any
+                    // stack miss is just a demand fault. Guard-hole
+                    // accesses have no VmArea and drop through to
+                    // SIGSEGV below.
+                    if matches!(
+                        cow_pooled_result,
+                        Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                    ) || matches!(cow_result, Err(crate::mm::vspace::VSpaceError::OutOfMemory))
+                        || matches!(
+                            demand_result,
+                            Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                        )
+                    {
+                        finish_el0_fault(crate::ipc::fault::oom_record(far, elr, 0));
+                        return;
+                    }
+                    false
                 } else {
                     false
                 }
@@ -676,9 +638,20 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
 
             // Fast-path didn't resolve — deliver the recoverable VM fault to
             // userspace without logging it as a fatal-looking exception.
-            let elr = unsafe { (*frame).elr_el1 };
+            if fault.present {
+                unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        let _ = vspace.note_present_fault_activity(far);
+                    }
+                }
+            }
             let ipc_ec = fault.to_ipc_error_code(false);
-            finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, false));
+            finish_el0_fault(crate::ipc::fault::page_fault_record(
+                far, ipc_ec, elr, false,
+            ));
         }
         EC_IABT_LOWER => {
             // Instruction abort from EL0.
@@ -689,29 +662,75 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             // Kernel fast-path fault handling (mirrors data abort path).
             // Instruction fetches are never writes; no stack growth check
             // needed since instruction faults don't hit the stack guard page.
+            if is_access_flag_fault(ifsc) {
+                let access_fault = crate::mm::PageFaultInfo {
+                    present: true,
+                    write: false,
+                    user: true,
+                };
+                let handled = unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        vspace
+                            .handle_accessed_fault(far, &access_fault)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if handled {
+                    return;
+                }
+            }
             let fault = crate::mm::PageFaultInfo {
-                present: ifsc >= 0x0D && ifsc <= 0x0F,
+                present: is_permission_fault(ifsc),
                 write: false,
                 user: true,
             };
+            let elr = unsafe { (*frame).elr_el1 };
             let handled = unsafe {
                 let scheduler = crate::sched::scheduler::scheduler();
                 let current = scheduler.current();
                 if !current.is_null() && !(*current).vspace_root.is_null() {
                     let vspace = &mut *(*current).vspace_root;
 
-                    let resolved =
-                        vspace.handle_cow_fault_pooled(far, &fault).unwrap_or(false)
-                        || vspace.handle_cow_fault(far, &fault).unwrap_or(false)
-                        || vspace.handle_demand_fault(far, &fault).unwrap_or(false);
-
-                    if resolved
-                        && (*current).state
-                            == crate::sched::thread::ThreadState::Inactive
-                    {
-                        scheduler.reschedule();
+                    let cow_pooled_result = vspace.handle_cow_fault_pooled(far, &fault);
+                    if let Ok(true) = cow_pooled_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
                     }
-                    resolved
+                    let cow_result = vspace.handle_cow_fault(far, &fault);
+                    if let Ok(true) = cow_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
+                    }
+
+                    let demand_result = vspace.handle_demand_fault(far, &fault);
+                    if let Ok(true) = demand_result {
+                        if (*current).state() == crate::task::state::ThreadState::Dying {
+                            scheduler.reschedule();
+                        }
+                        return;
+                    }
+                    if matches!(
+                        cow_pooled_result,
+                        Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                    ) || matches!(cow_result, Err(crate::mm::vspace::VSpaceError::OutOfMemory))
+                        || matches!(
+                            demand_result,
+                            Err(crate::mm::vspace::VSpaceError::OutOfMemory)
+                        )
+                    {
+                        finish_el0_fault(crate::ipc::fault::oom_record(far, elr, 0));
+                        return;
+                    }
+                    false
                 } else {
                     false
                 }
@@ -722,28 +741,64 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
 
             // Fast-path didn't resolve — deliver the recoverable VM fault to
             // userspace without logging it as a fatal-looking exception.
-            let elr = unsafe { (*frame).elr_el1 };
+            if fault.present {
+                unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        let _ = vspace.note_present_fault_activity(far);
+                    }
+                }
+            }
             let ipc_ec = fault.to_ipc_error_code(true);
-            finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, true));
+            finish_el0_fault(crate::ipc::fault::page_fault_record(far, ipc_ec, elr, true));
         }
         EC_PCALIGN => {
-            log_el0_sync_state("[EXCEPTION] EL0 PC alignment fault:", frame, Some(ec), esr, None);
+            log_el0_sync_state(
+                "[EXCEPTION] EL0 PC alignment fault:",
+                frame,
+                Some(ec),
+                esr,
+                None,
+            );
             let f = unsafe { &*frame };
-            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
+            finish_el0_fault(crate::ipc::fault::user_exception_record(
+                ec, esr, f.elr_el1, f.sp_el0,
+            ));
         }
         EC_SPALIGN => {
-            log_el0_sync_state("[EXCEPTION] EL0 SP alignment fault:", frame, Some(ec), esr, None);
+            log_el0_sync_state(
+                "[EXCEPTION] EL0 SP alignment fault:",
+                frame,
+                Some(ec),
+                esr,
+                None,
+            );
             let f = unsafe { &*frame };
-            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
+            finish_el0_fault(crate::ipc::fault::user_exception_record(
+                ec, esr, f.elr_el1, f.sp_el0,
+            ));
         }
         EC_FP_TRAP => {
-            // FPU/NEON access trap — lazy context switching.
-            super::fpu::handle_trap();
+            // FPU/NEON access trap must not occur in eager FPU mode —
+            // CPACR_EL1.FPEN is held at 0b11 throughout, so any access
+            // is allowed without trapping. Reaching here means CPACR_EL1
+            // was clobbered after init or hardware misbehaved; treat as
+            // a fatal regression.
+            crate::kernel::panic::fatal_exception_context(
+                "aarch64 EL0 FP/ASIMD trap",
+                format_args!("unexpected FP/SIMD trap in eager FPU mode ESR={:#x}", esr),
+                aarch64_panic_context(frame, esr, None),
+                || dump_aarch64_exception(frame, esr, None),
+            );
         }
         _ => {
             log_el0_sync_state("[EXCEPTION] Unknown EL0 sync:", frame, Some(ec), esr, None);
             let f = unsafe { &*frame };
-            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
+            finish_el0_fault(crate::ipc::fault::user_exception_record(
+                ec, esr, f.elr_el1, f.sp_el0,
+            ));
         }
     }
 }
@@ -768,11 +823,14 @@ extern "C" fn el1_serror_handler(frame: *const ExceptionFrame) {
     let f = unsafe { &*frame };
     let iss = esr & 0x01FF_FFFF;
     let dfsc = iss & 0x3F;
-    crate::serial_puts("[SERROR] SError from EL1\n");
-    dump_serror_state(f, esr);
-    panic!(
-        "SError (EL1): ESR={:#010x} ISS={:#09x} DFSC={:#04x} ELR={:#018x}",
-        esr, iss, dfsc, f.elr_el1,
+    crate::kernel::panic::fatal_exception_context(
+        "aarch64 EL1 SError",
+        format_args!(
+            "ESR={:#010x} ISS={:#09x} DFSC={:#04x} ELR={:#018x}",
+            esr, iss, dfsc, f.elr_el1
+        ),
+        aarch64_panic_context(frame, esr, None),
+        || dump_aarch64_exception(frame, esr, None),
     );
 }
 
@@ -786,20 +844,18 @@ extern "C" fn el0_serror_handler(frame: *const ExceptionFrame) {
     let esr = read_exception_esr();
     let f = unsafe { &*frame };
     let iss = esr & 0x01FF_FFFF;
-    let dfsc = iss & 0x3F;
-    crate::serial_puts("[SERROR] SError from EL0\n");
+    let _dfsc = iss & 0x3F;
+    crate::kernel::printk::serial_puts("[SERROR] SError from EL0\n");
     dump_serror_state(f, esr);
-    finish_el0_fault(&crate::ipc::user_exception_message(
+    finish_el0_fault(crate::ipc::fault::user_exception_record(
         0x2F, // EC for SError (synthetic — real EC field is zero for SError)
-        esr,
-        f.elr_el1,
-        f.sp_el0,
+        esr, f.elr_el1, f.sp_el0,
     ));
 }
 
 /// Dump register state for SError diagnostics.
 fn dump_serror_state(f: &ExceptionFrame, esr: u64) {
-    let s = crate::SerialGuard::acquire();
+    let s = crate::kernel::printk::SerialGuard::acquire();
     s.puts("  ESR=");
     s.hex(esr);
     s.puts(" ELR=");
@@ -820,6 +876,71 @@ fn dump_serror_state(f: &ExceptionFrame, esr: u64) {
     s.puts("\n");
 }
 
+fn dump_aarch64_exception(frame: *const ExceptionFrame, esr: u64, far: Option<u64>) {
+    use crate::kernel::printk::{serial_dec_raw, serial_hex_raw, serial_putc_hw, serial_puts_raw};
+
+    let f = unsafe { &*frame };
+    let ec = (esr >> 26) & 0x3F;
+    let iss = esr & 0x01FF_FFFF;
+    let fsc = iss & 0x3F;
+    serial_puts_raw("ESR: ");
+    serial_hex_raw(esr);
+    serial_puts_raw(" EC=");
+    serial_hex_raw(ec);
+    serial_puts_raw(" ISS=");
+    serial_hex_raw(iss);
+    serial_puts_raw(" FSC=");
+    serial_hex_raw(fsc);
+    serial_puts_raw(" WnR=");
+    serial_dec_raw(((esr >> 6) & 1) as u64);
+    serial_putc_hw(b'\n');
+    if let Some(far) = far {
+        serial_puts_raw("FAR: ");
+        serial_hex_raw(far);
+        serial_putc_hw(b'\n');
+    }
+    serial_puts_raw("ELR: ");
+    serial_hex_raw(f.elr_el1);
+    serial_puts_raw(" SPSR: ");
+    serial_hex_raw(f.spsr_el1);
+    serial_puts_raw(" SP_EL0: ");
+    serial_hex_raw(f.sp_el0);
+    serial_putc_hw(b'\n');
+
+    let mut i = 0usize;
+    while i < 31 {
+        serial_puts_raw("x");
+        serial_dec_raw(i as u64);
+        serial_puts_raw("=");
+        serial_hex_raw(f.regs[i]);
+        if i % 4 == 3 || i == 30 {
+            serial_putc_hw(b'\n');
+        } else {
+            serial_puts_raw(" ");
+        }
+        i += 1;
+    }
+}
+
+fn aarch64_panic_context(
+    frame: *const ExceptionFrame,
+    esr: u64,
+    far: Option<u64>,
+) -> crate::kernel::stacktrace::ArchPanicContext {
+    let f = unsafe { &*frame };
+    crate::kernel::stacktrace::ArchPanicContext {
+        kind: crate::kernel::stacktrace::ContextKind::Exception,
+        elr: f.elr_el1,
+        sp: frame as u64,
+        x29: f.regs[29],
+        x30: f.regs[30],
+        daif: unsafe { aarch64_exceptions_read_daif() },
+        esr_el1: esr,
+        far_el1: far.unwrap_or_else(read_exception_far),
+        ttbr0_el1: crate::arch::paging::read_cr3(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VBAR installation
 // ---------------------------------------------------------------------------
@@ -832,19 +953,14 @@ pub fn init() {
     unsafe extern "C" {
         static exception_vectors: u8;
     }
-    // SAFETY: exception_vectors is defined in the global_asm! block above
+    // SAFETY: exception_vectors is defined in exceptions.S
     // and is guaranteed to be 2048-byte aligned.
     let vbar = core::ptr::addr_of!(exception_vectors) as u64;
     // SAFETY: Writing VBAR_EL1 is safe during single-threaded boot.
     // The ISB ensures the new vector table address is visible before any
     // subsequent exception can be taken.
     unsafe {
-        core::arch::asm!(
-            "msr VBAR_EL1, {}",
-            "isb",
-            in(reg) vbar,
-            options(nomem, nostack),
-        );
+        aarch64_exceptions_write_vbar_el1(vbar);
     }
 }
 
@@ -854,7 +970,6 @@ pub fn init() {
 
 /// DFSC value: Synchronous External Abort, not on translation table walk.
 const DFSC_SYNC_EXTERNAL_ABORT: u64 = 0x10;
-
 
 /// Attempt to fixup a Synchronous External Abort from EL0.
 ///
@@ -872,14 +987,10 @@ fn try_fixup_device_load(frame: *mut ExceptionFrame) -> bool {
     let f = unsafe { &mut *frame };
     let elr = f.elr_el1;
 
-    // Read the faulting instruction from user text via the current TTBR0
-    // mapping. ELR_EL1 holds the user VA of the faulting instruction.
-    // SAFETY: The user page tables are still active (we haven't switched
-    // TTBR0 during exception entry). The instruction page must be mapped
-    // readable if the CPU fetched and executed it. PAN must be temporarily
-    // cleared to allow EL1 access to the user-mapped page.
-    let _guard = crate::arch::uaccess::UserAccessGuard::new();
-    let instr = unsafe { core::ptr::read_volatile(elr as *const u32) };
+    let instr = match unsafe { crate::arch::uaccess::copy_from_user::<u32>(elr) } {
+        Some(instr) => instr,
+        None => return false,
+    };
 
     // --- LDR (immediate, unsigned offset) ---
     // Encoding: size(2) | 111 | V(1) | 01 | opc(2) | imm12(12) | Rn(5) | Rt(5)

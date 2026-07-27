@@ -1,8 +1,9 @@
-/* SaltyOS VFS server - dynamically linked PIE linker script
- * SPDX-License-Identifier: GPL-2.0-only
+/* SPDX-License-Identifier: GPL-2.0-only
+ *
+ * SaltyOS VFS server - dynamically linked PIE linker script.
  *
  * Produces ET_DYN (PIE) ELF with base address 0.
- * Includes PLT/GOT sections for dynamic linking via ld-trona.so.
+ * Includes PLT/GOT sections for dynamic linking via ldtrona-elf.so.
  *
  * SIZEOF_HEADERS ensures the ELF header and program headers are placed
  * inside the first PT_LOAD segment, making them accessible at runtime
@@ -34,12 +35,18 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    .data ALIGN(4K) : {
+    .data.rel.ro ALIGN(8) : {
+        *(.data.rel.ro .data.rel.ro.*)
+    }
+    .got      : { *(.got) }
+    .dynamic  : { *(.dynamic) }
+
+    . = ALIGN(4K);
+
+    .data : {
         *(.data .data.*)
     }
 
-    .got      : { *(.got) }
-    .dynamic  : { *(.dynamic) }
     .got.plt  : { *(.got.plt) }
 
     .bss ALIGN(4K) : {

@@ -1,314 +1,404 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Tmpfs VopVector implementation — vnode-level operations.
+//
+//! Tmpfs `VopVector` — vnode-level operations.
 //!
-//! Independent from ramfs — reimplements all operations with tmpfs-specific
-//! size/inode accounting (used_bytes, used_inodes enforcement).
+//! Same shape as ramfs but with quota accounting on every mutation
+//! (`pool::check_inodes` / `pool::account_inode_*` / `check_bytes` /
+//! `account_bytes_*`). Truncate / write extend account for the
+//! delta against `used_bytes`; unlink / rmdir / inactive return the
+//! freed bytes to the pool.
 
-use crate::personality::posix::consts::*;
-use crate::server::consts::*;
-use crate::vfs_core::cred::VfsCred;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::{VAttr, VStatfs};
-use crate::vfs_core::vnode::{Vnode, VnodeHandle, VT_CHR, VT_DIR, VT_LNK, VT_REG};
-use crate::vfs_core::vop::ReaddirEmit;
-use crate::vfs_core::vop_context::{VopContext, VopDataContext};
+use crate::core::cred::VfsCred;
+use crate::core::error::VfsError;
+use crate::core::file::{MODE_TYPE_DIR, MODE_TYPE_LNK, MODE_TYPE_REG};
+use crate::core::file::{VAttr, VStatfs};
+use crate::core::identity::{BackendNodeId, VnodeKey};
+use crate::core::outcome::{Parked, Ready, VopOutcome};
+use crate::core::vnode::{VT_CHR, VT_DIR, VT_LNK, VT_REG, Vnode, VnodeHandle, vtype_to_kind};
+use crate::core::vop::ReaddirEmit;
+use crate::core::vop_context::{OwnerVopCtx, VopDataCtx};
+use crate::server::alloc::vfs_alloc_array;
+use crate::server::consts::{INITIAL_DIRENTS, INVALID_WRITABLE_SLOT, MAX_NAME_LEN, WRITABLE_SIZE};
 
 use super::pool;
-use super::types::TmpfsVnodeData;
+use super::types::{Dirent, TmpfsMountData, TmpfsVnodeData};
 
-use trona::types::core::TronaMsg;
-
-// =========================================================================
-// Helpers
-// =========================================================================
-
-/// Get the `TmpfsMountData` from a VopContext's mount_data pointer.
 #[inline]
-unsafe fn mdata(ctx: &VopContext) -> *mut super::types::TmpfsMountData {
-    ctx.mount_data as *mut super::types::TmpfsMountData
+unsafe fn mdata(ctx: &OwnerVopCtx<'_>) -> *mut TmpfsMountData {
+    ctx.mount_data as *mut TmpfsMountData
 }
 
-/// Get the `TmpfsMountData` from a VopDataContext's mount_data pointer.
 #[inline]
-unsafe fn mdata_d(ctx: &VopDataContext) -> *mut super::types::TmpfsMountData {
-    ctx.mount_data as *mut super::types::TmpfsMountData
+unsafe fn mdata_d(ctx: &VopDataCtx) -> *mut TmpfsMountData {
+    ctx.mount_data as *mut TmpfsMountData
 }
 
-/// Get the `TmpfsVnodeData` from a VopContext's data pointer.
 #[inline]
-unsafe fn vdata(ctx: &VopContext) -> *mut TmpfsVnodeData {
+unsafe fn vdata(ctx: &OwnerVopCtx<'_>) -> *mut TmpfsVnodeData {
     ctx.data as *mut TmpfsVnodeData
 }
 
-/// Get the `TmpfsVnodeData` from a VopDataContext's data pointer.
 #[inline]
-unsafe fn vdata_d(ctx: &VopDataContext) -> *mut TmpfsVnodeData {
-    ctx.data as *mut TmpfsVnodeData
-}
-
-/// Map VT_* vnode type to DT_* dirent type for readdir.
-#[inline]
-fn vtype_to_dtype(vtype: u8) -> u8 {
-    match vtype {
-        VT_REG => 8,  // DT_REG
-        VT_DIR => 4,  // DT_DIR
-        VT_LNK => 10, // DT_LNK
-        VT_CHR => 2,  // DT_CHR
-        _ => 0,       // DT_UNKNOWN
+unsafe fn casefold_enabled(ctx: &OwnerVopCtx<'_>) -> bool {
+    unsafe {
+        !ctx.mount.is_null()
+            && matches!(
+                (*ctx.mount).case_fold,
+                crate::ops::CaseFoldPolicy::InsensitivePreserving
+            )
     }
 }
 
-/// Create a new vnode + vdata pair, add to parent directory, and return
-/// a VnodeHandle to the new vnode (allocated via ctx.alloc).
-///
-/// Enforces inode limit before allocation.
+#[inline]
+unsafe fn dir_find_entry_for_mount(
+    ctx: &OwnerVopCtx<'_>,
+    dir_vdata: *mut TmpfsVnodeData,
+    name: *const u8,
+    name_len: u8,
+) -> *mut Dirent {
+    unsafe {
+        if casefold_enabled(ctx) {
+            pool::dir_find_entry_ci(dir_vdata, name, name_len)
+        } else {
+            pool::dir_find_entry(dir_vdata, name, name_len)
+        }
+    }
+}
+
+/// Cached file size in bytes for the tmpfs vnode (`(*vdata).size`).
+/// Owner-thread synchronous; updated on `tmpfs_create`,
+/// `tmpfs_truncate`, `tmpfs_write`, and `tmpfs_setattr`.
+pub(crate) unsafe fn tmpfs_data_size(ctx: &mut OwnerVopCtx<'_>) -> u64 {
+    let vd = unsafe { vdata(&*ctx) };
+    if vd.is_null() {
+        0
+    } else {
+        unsafe { (*vd).size }
+    }
+}
+
+#[inline]
+unsafe fn vdata_d(ctx: &VopDataCtx) -> *mut TmpfsVnodeData {
+    ctx.data as *mut TmpfsVnodeData
+}
+
+#[inline]
+fn vtype_to_dtype_local(vtype: u8) -> u8 {
+    match vtype {
+        x if x == VT_REG => 8,
+        x if x == VT_DIR => 4,
+        x if x == VT_LNK => 10,
+        x if x == VT_CHR => 2,
+        _ => 0,
+    }
+}
+
+#[inline]
+fn mode_type_for_vtype(vtype: u8) -> u32 {
+    match vtype {
+        x if x == VT_REG => MODE_TYPE_REG,
+        x if x == VT_DIR => MODE_TYPE_DIR,
+        x if x == VT_LNK => MODE_TYPE_LNK,
+        _ => 0,
+    }
+}
+
+/// Allocate a fresh vnode + vdata pair, register the dirent on the
+/// parent, and add an inode to the quota counter. Used by `create`
+/// / `mkdir` / `symlink`.
 unsafe fn create_child(
-    ctx: &VopContext,
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     ftype: u8,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
         let md = mdata(ctx);
         let parent_vd = vdata(ctx);
-        let parent_id = (*ctx.vnode).id;
+        let parent_id = (*ctx.vnode).id();
 
-        // Check inode limit
         if !pool::check_inodes(md) {
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
 
-        // Allocate vnode data
-        let vd = pool::alloc_vdata(md);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = pool::alloc_vdata(md);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
         let id = pool::next_id(md);
-        (*vd).id = id;
-        (*vd).parent_id = parent_id;
-        (*vd).ftype = ftype;
-        (*vd).mode = mode;
-        (*vd).nlink = if ftype == VT_DIR { 2 } else { 1 };
-        (*vd).size = 0;
+        (*vdata).id = id;
+        (*vdata).parent_id = parent_id;
+        (*vdata).ftype = ftype;
+        (*vdata).mode = mode_type_for_vtype(ftype) | (mode & 0o7777);
+        (*vdata).nlink = if ftype == VT_DIR { 2 } else { 1 };
+        (*vdata).size = 0;
         if !cred.is_null() {
-            (*vd).uid = (*cred).euid;
-            (*vd).gid = (*cred).egid;
+            (*vdata).uid = (*cred).euid;
+            (*vdata).gid = (*cred).egid;
         }
 
-        // Allocate dirents for directories
         if ftype == VT_DIR {
-            let dirents = crate::vfs_alloc_array::<super::types::Dirent>(INITIAL_DIRENTS);
+            let dirents = vfs_alloc_array::<Dirent>(INITIAL_DIRENTS);
             if dirents.is_null() {
-                (*vd).active = 0;
-                return Err(VfsError::NoSpace);
+                (*vdata).active = 0;
+                return Err(VfsError::NoMem);
             }
-            (*vd).dirents = dirents;
-            (*vd).dirents_cap = INITIAL_DIRENTS as u16;
+            (*vdata).dirents = dirents;
+            (*vdata).dirents_cap = INITIAL_DIRENTS as u16;
         }
 
-        // Allocate vnode via arena callback
-        let (child_vh, child_vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*child_vp).id = id;
-        (*child_vp).vtype = ftype;
-        (*child_vp).data = vd as *mut u8;
-        (*child_vp).nlink = (*vd).nlink;
+        let (child_vh, child_vp) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*child_vp).kind = vtype_to_kind(ftype);
+        (*child_vp).key = VnodeKey {
+            fs_instance_id: fs_id,
+            backend_id: BackendNodeId::new(id, 0),
+        };
+        (*child_vp).backend_seq = 0;
+        (*child_vp).data = vdata as *mut u8;
+        (*child_vp).nlink = (*vdata).nlink;
         (*child_vp).mount = ctx.mount_handle;
+        (*child_vp).fs_instance_id = fs_id;
         (*child_vp).ops = (*ctx.vnode).ops;
-        (*vd).vnode_handle = child_vh;
+        (*vdata).vnode_handle = child_vh;
 
-        // Add dirent to parent
         if pool::dir_add_entry(parent_vd, name, name_len, id) != 0 {
-            (*vd).active = 0;
-            return Err(VfsError::NoSpace);
+            (*vdata).active = 0;
+            return Err(VfsError::NoMem);
         }
 
-        // Bump parent nlink for subdirectory ".."
         if ftype == VT_DIR {
             (*parent_vd).nlink += 1;
             (*ctx.vnode).nlink = (*parent_vd).nlink;
         }
 
-        // Account for new inode
         pool::account_inode_add(md);
-
-        Ok(child_vh)
+        Ok(Ready(child_vh))
     }
 }
 
-// =========================================================================
-// MetaOps function implementations
-// =========================================================================
-
-pub(super) unsafe fn tmpfs_lookup(
-    ctx: &VopContext,
-    name: *const u8,
-    name_len: u8,
-) -> VfsResult<VnodeHandle> {
+unsafe fn dir_is_empty(vdata: *mut TmpfsVnodeData) -> bool {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
-            return Err(VfsError::NotDir);
-        }
-
-        // Handle "."
-        if name_len == 1 && *name == b'.' {
-            return Ok(ctx.handle);
-        }
-
-        // Handle ".."
-        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
-            let parent_id = (*dvd).parent_id;
-            if parent_id == 0 {
-                return Ok(ctx.handle);
+        for i in 0..(*vdata).dirents_cap as usize {
+            if (*(*vdata).dirents.add(i)).active != 0 {
+                return false;
             }
-            let md = mdata(ctx);
-            let parent_vd = pool::find_vdata(md, parent_id);
-            if parent_vd.is_null() {
-                return Ok(VnodeHandle::INVALID);
-            }
-            if (*parent_vd).vnode_handle.is_valid()
-                && (ctx.resolve_vnode)((*parent_vd).vnode_handle).is_some()
-            {
-                return Ok((*parent_vd).vnode_handle);
-            }
-            let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-            (*vp).id = parent_id;
-            (*vp).vtype = (*parent_vd).ftype;
-            (*vp).data = parent_vd as *mut u8;
-            (*vp).nlink = (*parent_vd).nlink;
-            (*vp).mount = ctx.mount_handle;
-            (*vp).ops = (*ctx.vnode).ops;
-            (*parent_vd).vnode_handle = vh;
-            return Ok(vh);
         }
+        true
+    }
+}
 
-        // Normal component lookup
-        let ent = pool::dir_find_entry(dvd, name, name_len);
-        if ent.is_null() {
-            return Ok(VnodeHandle::INVALID);
+/// Tear down per-vnode storage on link-count-zero release. Tracks
+/// the freed bytes against the mount's `used_bytes` counter.
+unsafe fn free_vdata_storage(md: *mut TmpfsMountData, vdata: *mut TmpfsVnodeData) {
+    unsafe {
+        let old_size = (*vdata).size;
+        if (*vdata).ftype == VT_LNK {
+            pool::free_symlink(md, (*vdata).symlink_data);
+            (*vdata).symlink_data = ::core::ptr::null_mut();
+        } else {
+            pool::free_chain(md, (*vdata).writable_head);
+            (*vdata).writable_head = INVALID_WRITABLE_SLOT;
         }
+        if old_size > 0 && (*vdata).ftype != VT_LNK {
+            pool::account_bytes_sub(md, old_size);
+        }
+        (*vdata).size = 0;
+        (*vdata).active = 0;
+    }
+}
 
-        let child_id = (*ent).ino as u64;
+unsafe fn intern_vnode(ctx: &mut OwnerVopCtx<'_>, child_id: u64) -> Result<VnodeHandle, VfsError> {
+    unsafe {
         let md = mdata(ctx);
-
         let child_vd = pool::find_vdata(md, child_id);
         if child_vd.is_null() {
             return Ok(VnodeHandle::INVALID);
         }
+        // Active-only liveness: a Retired slot (closed but not yet reclaimed)
+        // must NOT be reused here — its open_refcount can no longer be bumped
+        // (get_mut is Active-only), so a reclaim sweep would free it under an
+        // open fd. `raw_ptr`/`resolve_vnode` accept Retired, so use `get`.
         if (*child_vd).vnode_handle.is_valid()
-            && (ctx.resolve_vnode)((*child_vd).vnode_handle).is_some()
+            && ctx.state.vnodes.get((*child_vd).vnode_handle).is_some()
         {
             return Ok((*child_vd).vnode_handle);
         }
-
-        let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*vp).id = child_id;
-        (*vp).vtype = (*child_vd).ftype;
-        (*vp).data = child_vd as *mut u8;
-        (*vp).nlink = (*child_vd).nlink;
-        (*vp).mount = ctx.mount_handle;
-        (*vp).ops = (*ctx.vnode).ops;
-        (*child_vd).vnode_handle = vh;
-        Ok(vh)
+        let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*vnode_ptr).kind = vtype_to_kind((*child_vd).ftype);
+        (*vnode_ptr).key = VnodeKey {
+            fs_instance_id: fs_id,
+            backend_id: BackendNodeId::new(child_id, 0),
+        };
+        (*vnode_ptr).backend_seq = 0;
+        (*vnode_ptr).data = child_vd as *mut u8;
+        (*vnode_ptr).nlink = (*child_vd).nlink;
+        (*vnode_ptr).mount = ctx.mount_handle;
+        (*vnode_ptr).fs_instance_id = fs_id;
+        (*vnode_ptr).ops = (*ctx.vnode).ops;
+        (*child_vd).vnode_handle = vnode_h;
+        Ok(vnode_h)
     }
 }
 
-pub(super) unsafe fn tmpfs_create(
-    ctx: &VopContext,
+// =========================================================================
+// MetaOps
+// =========================================================================
+
+pub(crate) unsafe fn tmpfs_lookup(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<VnodeHandle> {
+    unsafe {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
+            return Err(VfsError::NotDir);
+        }
+        if name_len == 1 && *name == b'.' {
+            return Ok(Ready(ctx.handle));
+        }
+        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
+            let parent_id = (*dir_vdata).parent_id;
+            if parent_id == 0 {
+                return Ok(Ready(ctx.handle));
+            }
+            return Ok(Ready(intern_vnode(ctx, parent_id)?));
+        }
+        let ent = pool::dir_find_entry(dir_vdata, name, name_len);
+        if ent.is_null() {
+            return Ok(Ready(VnodeHandle::INVALID));
+        }
+        let child_id = (*ent).ino as u64;
+        Ok(Ready(intern_vnode(ctx, child_id)?))
+    }
+}
+
+pub(crate) unsafe fn tmpfs_lookup_ci(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<VnodeHandle> {
+    unsafe {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
+            return Err(VfsError::NotDir);
+        }
+        if name_len == 1 && *name == b'.' {
+            return Ok(Ready(ctx.handle));
+        }
+        if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
+            let parent_id = (*dir_vdata).parent_id;
+            if parent_id == 0 {
+                return Ok(Ready(ctx.handle));
+            }
+            return Ok(Ready(intern_vnode(ctx, parent_id)?));
+        }
+        let ent = pool::dir_find_entry_ci(dir_vdata, name, name_len);
+        if ent.is_null() {
+            return Ok(Ready(VnodeHandle::INVALID));
+        }
+        let child_id = (*ent).ino as u64;
+        Ok(Ready(intern_vnode(ctx, child_id)?))
+    }
+}
+
+pub(crate) unsafe fn tmpfs_create(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !dir_find_entry_for_mount(ctx, dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
         create_child(ctx, name, name_len, mode, VT_REG, cred)
     }
 }
 
-pub(super) unsafe fn tmpfs_mkdir(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_mkdir(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !dir_find_entry_for_mount(ctx, dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
         create_child(ctx, name, name_len, mode, VT_DIR, cred)
     }
 }
 
-pub(super) unsafe fn tmpfs_symlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_symlink(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     target: *const u8,
     target_len: u8,
     cred: *const VfsCred,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !dir_find_entry_for_mount(ctx, dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
-        let mode = S_IFLNK_L | 0o777;
-        let child_vh = create_child(ctx, name, name_len, mode, VT_LNK, cred)?;
+        let mode = MODE_TYPE_LNK | 0o777;
+        let child_outcome = create_child(ctx, name, name_len, mode, VT_LNK, cred)?;
+        let child_vh = match child_outcome {
+            Ready(vnode_h) => vnode_h,
+            Parked(p) => return Ok(Parked(p)),
+        };
 
-        // Resolve the newly created child to set symlink data.
-        let child_vp = (ctx.resolve_vnode)(child_vh).ok_or(VfsError::Io)? as *mut Vnode;
+        let child_vp = ctx.resolve_vnode(child_vh).ok_or(VfsError::Io)? as *mut Vnode;
         let child_vd = (*child_vp).data as *mut TmpfsVnodeData;
         let md = mdata(ctx);
         let sym_ptr = pool::alloc_symlink(md, target, target_len);
         if sym_ptr.is_null() {
             (*child_vd).active = 0;
-            pool::dir_remove_entry(dvd, name, name_len);
+            pool::dir_remove_entry(dir_vdata, name, name_len);
             pool::account_inode_sub(md);
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
         (*child_vd).symlink_data = sym_ptr;
         (*child_vd).size = target_len as u64;
-        Ok(child_vh)
+        Ok(Ready(child_vh))
     }
 }
 
-pub(super) unsafe fn tmpfs_unlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_unlink(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let ent = pool::dir_find_entry(dvd, name, name_len);
+        let ent = dir_find_entry_for_mount(ctx, dir_vdata, name, name_len);
         if ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*ent).ino as u64;
         let md = mdata(ctx);
-
         let child_vd = pool::find_vdata(md, child_id);
         if !child_vd.is_null() {
             if (*child_vd).ftype == VT_DIR {
@@ -322,63 +412,61 @@ pub(super) unsafe fn tmpfs_unlink(
                 pool::account_inode_sub(md);
             }
         }
-
-        pool::dir_remove_entry(dvd, name, name_len);
-        Ok(())
+        *ent = Dirent::zeroed();
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_rmdir(ctx: &VopContext, name: *const u8, name_len: u8) -> VfsResult<()> {
+pub(crate) unsafe fn tmpfs_rmdir(
+    ctx: &mut OwnerVopCtx<'_>,
+    name: *const u8,
+    name_len: u8,
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let ent = pool::dir_find_entry(dvd, name, name_len);
+        let ent = dir_find_entry_for_mount(ctx, dir_vdata, name, name_len);
         if ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*ent).ino as u64;
         let md = mdata(ctx);
         let child_vd = pool::find_vdata(md, child_id);
         if child_vd.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         if (*child_vd).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
         if !dir_is_empty(child_vd) {
-            return Err(VfsError::Busy);
+            return Err(VfsError::NotEmpty);
         }
-
-        pool::dir_remove_entry(dvd, name, name_len);
-
-        // Decrement parent nlink
-        if (*dvd).nlink > 0 {
-            (*dvd).nlink -= 1;
-            (*ctx.vnode).nlink = (*dvd).nlink;
+        *ent = Dirent::zeroed();
+        if (*dir_vdata).nlink > 0 {
+            (*dir_vdata).nlink -= 1;
+            (*ctx.vnode).nlink = (*dir_vdata).nlink;
         }
-
-        // Free the child directory
         (*child_vd).nlink = 0;
         free_vdata_storage(md, child_vd);
         pool::account_inode_sub(md);
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_link(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_link(
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
     target: VnodeHandle,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let dvd = vdata(ctx);
-        if dvd.is_null() || (*dvd).ftype != VT_DIR {
+        let dir_vdata = vdata(ctx);
+        if dir_vdata.is_null() || (*dir_vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-        let target_vp = (ctx.resolve_vnode)(target).ok_or(VfsError::Inval)? as *mut Vnode;
+        let target_vp = ctx.resolve_vnode(target).ok_or(VfsError::Inval)? as *mut Vnode;
         let tvd = (*target_vp).data as *mut TmpfsVnodeData;
         if tvd.is_null() {
             return Err(VfsError::Inval);
@@ -386,50 +474,47 @@ pub(super) unsafe fn tmpfs_link(
         if (*tvd).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-        let existing = pool::dir_find_entry(dvd, name, name_len);
-        if !existing.is_null() {
-            return Err(VfsError::Exists);
+        if !dir_find_entry_for_mount(ctx, dir_vdata, name, name_len).is_null() {
+            return Err(VfsError::Exist);
         }
-        if pool::dir_add_entry(dvd, name, name_len, (*tvd).id) != 0 {
-            return Err(VfsError::NoSpace);
+        if pool::dir_add_entry(dir_vdata, name, name_len, (*tvd).id) != 0 {
+            return Err(VfsError::NoMem);
         }
         (*tvd).nlink += 1;
         (*target_vp).nlink = (*tvd).nlink;
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_rename(
-    old_ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_rename(
+    ctx: &mut OwnerVopCtx<'_>,
     old_name: *const u8,
     old_len: u8,
-    new_ctx: &VopContext,
+    new_dir: VnodeHandle,
     new_name: *const u8,
     new_len: u8,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let old_dvd = vdata(old_ctx);
-        let new_dvd = vdata(new_ctx);
+        let new_vnode = ctx.resolve_vnode(new_dir).ok_or(VfsError::Inval)? as *mut Vnode;
+        let new_dvd = (*new_vnode).data as *mut TmpfsVnodeData;
+        let old_dvd = vdata(ctx);
         if old_dvd.is_null() || new_dvd.is_null() {
             return Err(VfsError::Inval);
         }
-
-        // Find source entry
-        let src_ent = pool::dir_find_entry(old_dvd, old_name, old_len);
+        let src_ent = dir_find_entry_for_mount(ctx, old_dvd, old_name, old_len);
         if src_ent.is_null() {
-            return Err(VfsError::NotFound);
+            return Err(VfsError::NoEnt);
         }
         let child_id = (*src_ent).ino as u64;
+        let md = mdata(ctx);
 
-        // Check if target name already exists — remove it
-        let dst_ent = pool::dir_find_entry(new_dvd, new_name, new_len);
+        let dst_ent = dir_find_entry_for_mount(ctx, new_dvd, new_name, new_len);
         if !dst_ent.is_null() {
-            let md = mdata(old_ctx);
             let dst_id = (*dst_ent).ino as u64;
             let dst_vd = pool::find_vdata(md, dst_id);
             if !dst_vd.is_null() {
                 if (*dst_vd).ftype == VT_DIR && !dir_is_empty(dst_vd) {
-                    return Err(VfsError::Busy);
+                    return Err(VfsError::NotEmpty);
                 }
                 if (*dst_vd).nlink > 0 {
                     (*dst_vd).nlink -= 1;
@@ -439,117 +524,118 @@ pub(super) unsafe fn tmpfs_rename(
                     pool::account_inode_sub(md);
                 }
             }
-            pool::dir_remove_entry(new_dvd, new_name, new_len);
+            *dst_ent = Dirent::zeroed();
         }
 
-        // Remove from old parent
-        pool::dir_remove_entry(old_dvd, old_name, old_len);
+        *src_ent = Dirent::zeroed();
 
-        // Add to new parent
         if pool::dir_add_entry(new_dvd, new_name, new_len, child_id) != 0 {
-            // Try to restore — best effort
             let _ = pool::dir_add_entry(old_dvd, old_name, old_len, child_id);
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
 
-        // Update parent_id if moved to a different directory
-        let md = mdata(old_ctx);
         let child_vd = pool::find_vdata(md, child_id);
-        if !child_vd.is_null() && (*old_ctx.vnode).id != (*new_ctx.vnode).id {
-            (*child_vd).parent_id = (*new_ctx.vnode).id;
+        if !child_vd.is_null() && (*ctx.vnode).id() != (*new_vnode).id() {
+            (*child_vd).parent_id = (*new_vnode).id();
             if (*child_vd).ftype == VT_DIR {
                 if (*old_dvd).nlink > 0 {
                     (*old_dvd).nlink -= 1;
-                    (*old_ctx.vnode).nlink = (*old_dvd).nlink;
+                    (*ctx.vnode).nlink = (*old_dvd).nlink;
                 }
                 (*new_dvd).nlink += 1;
-                (*new_ctx.vnode).nlink = (*new_dvd).nlink;
+                (*new_vnode).nlink = (*new_dvd).nlink;
             }
         }
-
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_open(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+pub(crate) unsafe fn tmpfs_open(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn tmpfs_close(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+pub(crate) unsafe fn tmpfs_close(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn tmpfs_getattr(ctx: &VopContext, attr: *mut VAttr) -> VfsResult<()> {
+pub(crate) unsafe fn tmpfs_getattr(ctx: &mut OwnerVopCtx<'_>, attr: *mut VAttr) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        (*attr).size = (*vd).size;
-        (*attr).blocks = ((*vd).size + 511) / 512;
-        (*attr).mode = (*vd).mode;
-        (*attr).uid = (*vd).uid;
-        (*attr).gid = (*vd).gid;
-        (*attr).nlink = (*vd).nlink;
-        (*attr).atime = (*vd).atime;
-        (*attr).mtime = (*vd).mtime;
-        (*attr).ctime = (*vd).ctime;
-        (*attr).btime = (*vd).btime;
-        (*attr).dev_id = 0;
-        (*attr).rdev = 0;
-        Ok(())
+        let fs_id = (*ctx.mount).fs_instance_id;
+        (*attr).fs_instance_id = fs_id;
+        (*attr).backend_node_id = (*vdata).id;
+        (*attr).backend_seq = 0;
+        (*attr).kind = vtype_to_kind((*vdata).ftype);
+        (*attr).mode = (*vdata).mode;
+        (*attr).uid = (*vdata).uid;
+        (*attr).gid = (*vdata).gid;
+        (*attr).nlink = (*vdata).nlink;
+        (*attr).size = (*vdata).size;
+        (*attr).blocks = ((*vdata).size + 511) / 512;
+        (*attr).atime = (*vdata).atime;
+        (*attr).mtime = (*vdata).mtime;
+        (*attr).ctime = (*vdata).ctime;
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_setattr(ctx: &VopContext, attr: *const VAttr) -> VfsResult<()> {
+pub(crate) unsafe fn tmpfs_setattr(
+    ctx: &mut OwnerVopCtx<'_>,
+    attr: *const VAttr,
+) -> VopOutcome<()> {
+    use crate::core::file::{
+        VATTR_ATIME, VATTR_CTIME, VATTR_GID, VATTR_MODE, VATTR_MTIME, VATTR_UID,
+    };
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*attr).mode != 0 {
-            (*vd).mode = (*attr).mode;
+        let valid = (*attr).valid;
+        if (valid & VATTR_MODE) != 0 {
+            (*vdata).mode = (*attr).mode;
         }
-        if (*attr).uid != u32::MAX {
-            (*vd).uid = (*attr).uid;
+        if (valid & VATTR_UID) != 0 {
+            (*vdata).uid = (*attr).uid;
         }
-        if (*attr).gid != u32::MAX {
-            (*vd).gid = (*attr).gid;
+        if (valid & VATTR_GID) != 0 {
+            (*vdata).gid = (*attr).gid;
         }
-        if (*attr).atime != 0 {
-            (*vd).atime = (*attr).atime;
+        if (valid & VATTR_ATIME) != 0 {
+            (*vdata).atime = (*attr).atime;
         }
-        if (*attr).mtime != 0 {
-            (*vd).mtime = (*attr).mtime;
+        if (valid & VATTR_MTIME) != 0 {
+            (*vdata).mtime = (*attr).mtime;
         }
-        if (*attr).ctime != 0 {
-            (*vd).ctime = (*attr).ctime;
+        if (valid & VATTR_CTIME) != 0 {
+            (*vdata).ctime = (*attr).ctime;
         }
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_access(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_access(
+    ctx: &mut OwnerVopCtx<'_>,
     mode: u32,
     cred: *const VfsCred,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
         if cred.is_null() {
-            return Ok(());
+            return Ok(Ready(()));
         }
-        if (*cred).euid == 0 {
-            return Ok(());
+        if (*cred).is_root() {
+            return Ok(Ready(()));
         }
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-
-        let file_mode = (*vd).mode;
-        let uid = (*vd).uid;
-        let gid = (*vd).gid;
-
+        let file_mode = (*vdata).mode;
+        let uid = (*vdata).uid;
+        let gid = (*vdata).gid;
         let shift = if (*cred).euid == uid {
             6
         } else if (*cred).in_group(gid) {
@@ -557,227 +643,213 @@ pub(super) unsafe fn tmpfs_access(
         } else {
             0
         };
-
         let perm = (file_mode >> shift) & 0o7;
-
         if (mode & 1) != 0 && (perm & 4) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
         if (mode & 2) != 0 && (perm & 2) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
         if (mode & 4) != 0 && (perm & 1) == 0 {
-            return Err(VfsError::Perm);
+            return Err(VfsError::Acces);
         }
-
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_readlink(
-    ctx: &VopContext,
+pub(crate) unsafe fn tmpfs_readlink(
+    ctx: &mut OwnerVopCtx<'_>,
     buf: *mut u8,
     buf_len: usize,
-    _cred: *const crate::vfs_core::cred::VfsCred,
-) -> VfsResult<usize> {
+    _cred: *const VfsCred,
+) -> VopOutcome<usize> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype != VT_LNK {
+        if (*vdata).ftype != VT_LNK {
             return Err(VfsError::Inval);
         }
-
-        if !(*vd).symlink_data.is_null() {
-            let len = (*vd).size as usize;
+        if !(*vdata).symlink_data.is_null() {
+            let len = (*vdata).size as usize;
             let copy_len = if len < buf_len { len } else { buf_len };
-            core::ptr::copy_nonoverlapping((*vd).symlink_data, buf, copy_len);
-            return Ok(copy_len);
+            ::core::ptr::copy_nonoverlapping((*vdata).symlink_data, buf, copy_len);
+            return Ok(Ready(copy_len));
         }
-
         Err(VfsError::Io)
     }
 }
 
-pub(super) unsafe fn tmpfs_truncate(ctx: &VopContext, new_size: u64) -> VfsResult<()> {
+pub(crate) unsafe fn tmpfs_truncate(ctx: &mut OwnerVopCtx<'_>, new_size: u64) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-
         let md = mdata(ctx);
-        let old_size = (*vd).size;
-
+        let old_size = (*vdata).size;
         if new_size < old_size {
-            // Shrinking — free blocks and account bytes
-            if (*vd).writable_head != INVALID_WRITABLE_SLOT {
-                pool::chain_truncate(md, (*vd).writable_head, new_size);
+            if (*vdata).writable_head != INVALID_WRITABLE_SLOT {
+                pool::chain_truncate(md, (*vdata).writable_head, new_size);
             }
             pool::account_bytes_sub(md, old_size - new_size);
         } else if new_size > old_size {
-            // Extending — check size limit
             let growth = new_size - old_size;
             if !pool::check_bytes(md, growth) {
-                return Err(VfsError::NoSpace);
+                return Err(VfsError::NoMem);
             }
-            if (*vd).writable_head == INVALID_WRITABLE_SLOT {
+            if (*vdata).writable_head == INVALID_WRITABLE_SLOT {
                 let slot = pool::alloc_writable(md);
                 if slot == INVALID_WRITABLE_SLOT {
-                    return Err(VfsError::NoSpace);
+                    return Err(VfsError::NoMem);
                 }
-                (*vd).writable_head = slot;
+                (*vdata).writable_head = slot;
             }
             pool::account_bytes_add(md, growth);
         }
-
-        (*vd).size = new_size;
-        Ok(())
+        (*vdata).size = new_size;
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_inactive(ctx: &VopContext) {
+pub(crate) unsafe fn tmpfs_inactive(ctx: &mut OwnerVopCtx<'_>) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
-        if vd.is_null() {
-            return;
+        crate::owner::pager_rpc::release_mo_binding_for_vnode(ctx.state, ctx.handle);
+        let vdata = vdata(ctx);
+        if vdata.is_null() {
+            return Ok(Ready(()));
         }
-        if (*vd).nlink == 0 {
+        if (*vdata).nlink == 0 {
             let md = mdata(ctx);
-            free_vdata_storage(md, vd);
+            free_vdata_storage(md, vdata);
             pool::account_inode_sub(md);
         }
-        (*ctx.vnode).data = core::ptr::null_mut();
+        // The vnode is being detached from this vdata. Clear the
+        // vdata->vnode backlink as well, so a later vget / intern_vnode
+        // re-allocates a fresh vnode and rebinds `data` instead of
+        // handing back this now-detached (data == null) vnode from the
+        // cache fast-path while the inode still exists (nlink > 0).
+        (*vdata).vnode_handle = VnodeHandle::INVALID;
+        (*ctx.vnode).data = ::core::ptr::null_mut();
+        Ok(Ready(()))
     }
 }
 
 // =========================================================================
-// DataOps function implementations
+// DataOps
 // =========================================================================
 
-pub(super) unsafe fn tmpfs_read(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn tmpfs_read(
+    ctx: &VopDataCtx,
     offset: u64,
     dst: *mut u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype == VT_DIR {
+        if (*vdata).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-
-        let size = (*vd).size;
+        let size = (*vdata).size;
         if offset >= size {
-            return Ok(0);
+            return Ok(Ready(0));
         }
         let avail = size - offset;
         let count = if len < avail { len } else { avail };
-
         let md = mdata_d(ctx);
-        let read = pool::chain_read(md, (*vd).writable_head, offset, dst, count);
-        Ok(read)
+        let read = pool::chain_read(md, (*vdata).writable_head, offset, dst, count);
+        Ok(Ready(read))
     }
 }
 
-pub(super) unsafe fn tmpfs_write(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn tmpfs_write(
+    ctx: &VopDataCtx,
     offset: u64,
     src: *const u8,
     len: u64,
-) -> VfsResult<u64> {
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() {
             return Err(VfsError::Io);
         }
-        if (*vd).ftype == VT_DIR {
+        if (*vdata).ftype == VT_DIR {
             return Err(VfsError::IsDir);
         }
-
         let md = mdata_d(ctx);
-
-        // Check size limit
-        let old_size = (*vd).size;
+        let old_size = (*vdata).size;
         let end = offset + len;
         if end > old_size {
             let growth = end - old_size;
             if !pool::check_bytes(md, growth) {
-                return Err(VfsError::NoSpace);
+                return Err(VfsError::NoMem);
             }
         }
-
-        if (*vd).writable_head == INVALID_WRITABLE_SLOT {
+        if (*vdata).writable_head == INVALID_WRITABLE_SLOT {
             let slot = pool::alloc_writable(md);
             if slot == INVALID_WRITABLE_SLOT {
-                return Err(VfsError::NoSpace);
+                return Err(VfsError::NoMem);
             }
-            (*vd).writable_head = slot;
+            (*vdata).writable_head = slot;
         }
-
-        let written = pool::chain_write(md, (*vd).writable_head, offset, src, len);
+        let written = pool::chain_write(md, (*vdata).writable_head, offset, src, len);
         if written == 0 && len > 0 {
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
-
         let new_end = offset + written;
         if new_end > old_size {
             let growth = new_end - old_size;
             pool::account_bytes_add(md, growth);
-            (*vd).size = new_end;
+            (*vdata).size = new_end;
         }
-
-        Ok(written)
+        Ok(Ready(written))
     }
 }
 
-pub(super) unsafe fn tmpfs_fsync(_ctx: &VopDataContext) -> VfsResult<()> {
-    Ok(())
+pub(crate) unsafe fn tmpfs_fsync(_ctx: &VopDataCtx) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-pub(super) unsafe fn tmpfs_readdir(
-    ctx: &VopDataContext,
+pub(crate) unsafe fn tmpfs_readdir(
+    ctx: &VopDataCtx,
     cookie: *mut u64,
     emit: ReaddirEmit<'_>,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata_d(ctx);
-        if vd.is_null() || (*vd).ftype != VT_DIR {
+        let vdata = vdata_d(ctx);
+        if vdata.is_null() || (*vdata).ftype != VT_DIR {
             return Err(VfsError::NotDir);
         }
-
         let start = *cookie as usize;
         let attr = VAttr::zeroed();
         let md = mdata_d(ctx);
 
-        // Emit "." and ".."
         if start == 0 {
-            if !emit((*vd).id, b".".as_ptr(), 1, 4, &attr) {
+            if !emit((*vdata).id, b".".as_ptr(), 1, 4, &attr) {
                 *cookie = 1;
-                return Ok(());
+                return Ok(Ready(()));
             }
         }
         if start <= 1 {
-            let parent_id = if (*vd).parent_id != 0 {
-                (*vd).parent_id
+            let parent_id = if (*vdata).parent_id != 0 {
+                (*vdata).parent_id
             } else {
-                (*vd).id
+                (*vdata).id
             };
             if !emit(parent_id, b"..".as_ptr(), 2, 4, &attr) {
                 *cookie = 2;
-                return Ok(());
+                return Ok(Ready(()));
             }
         }
 
-        // Real entries start at cookie index 2
         let real_start = if start > 2 { start - 2 } else { 0 };
         let mut idx = 0usize;
-        for i in 0..(*vd).dirents_cap as usize {
-            let ent = (*vd).dirents.add(i);
+        for i in 0..(*vdata).dirents_cap as usize {
+            let ent = (*vdata).dirents.add(i);
             if (*ent).active == 0 {
                 continue;
             }
@@ -788,7 +860,7 @@ pub(super) unsafe fn tmpfs_readdir(
             let child_id = (*ent).ino as u64;
             let child_vd = pool::find_vdata(md, child_id);
             let dtype = if !child_vd.is_null() {
-                vtype_to_dtype((*child_vd).ftype)
+                vtype_to_dtype_local((*child_vd).ftype)
             } else {
                 0
             };
@@ -800,25 +872,24 @@ pub(super) unsafe fn tmpfs_readdir(
                 &attr,
             ) {
                 *cookie = (idx + 3) as u64;
-                return Ok(());
+                return Ok(Ready(()));
             }
             idx += 1;
         }
-
         *cookie = (idx + 2) as u64;
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-pub(super) unsafe fn tmpfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> VfsResult<()> {
+pub(crate) unsafe fn tmpfs_statfs(ctx: &VopDataCtx, out: *mut VStatfs) -> VopOutcome<()> {
     unsafe {
         let md = mdata_d(ctx);
-
-        (*out).bsize = WRITABLE_SIZE as u64;
-        (*out).name_max = MAX_NAME_LEN as u32;
-        let ft = &mut (*out).fs_type;
-        ft[..5].copy_from_slice(b"tmpfs");
-        (*out).flags = 0;
+        (*out).bsize = WRITABLE_SIZE as u32;
+        (*out).frsize = WRITABLE_SIZE as u32;
+        (*out).flag = 0;
+        (*out).namemax = MAX_NAME_LEN as u32;
+        (*out).fsid = ctx.fs_instance_id.0;
+        (*out).set_fs_name(b"tmpfs");
 
         (*out).files = (*md).used_inodes as u64;
         if (*md).max_inodes > 0 {
@@ -826,6 +897,7 @@ pub(super) unsafe fn tmpfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> Vf
         } else {
             (*out).ffree = (*md).vdata_cap as u64 - (*md).used_inodes as u64;
         }
+        (*out).favail = (*out).ffree;
 
         if (*md).max_bytes > 0 {
             (*out).blocks = (*md).max_bytes / WRITABLE_SIZE as u64;
@@ -833,56 +905,11 @@ pub(super) unsafe fn tmpfs_statfs(ctx: &VopDataContext, out: *mut VStatfs) -> Vf
             (*out).bfree = (*out).blocks - used_blocks;
             (*out).bavail = (*out).bfree;
         } else {
-            let mut used_blocks: u64 = 0;
-            for i in 0..(*md).writable_cap {
-                if *(*md).writable_used_ptr.add(i) != 0 {
-                    used_blocks += 1;
-                }
-            }
+            let used_blocks = pool::allocated_file_slot_count(md);
             (*out).blocks = (*md).writable_cap as u64;
             (*out).bfree = (*md).writable_cap as u64 - used_blocks;
             (*out).bavail = (*out).bfree;
         }
-
-        Ok(())
-    }
-}
-
-// =========================================================================
-// Internal helpers
-// =========================================================================
-
-/// Check whether a directory has any active entries.
-unsafe fn dir_is_empty(vd: *mut TmpfsVnodeData) -> bool {
-    unsafe {
-        for i in 0..(*vd).dirents_cap as usize {
-            if (*(*vd).dirents.add(i)).active != 0 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Free storage associated with a vnode-data entry (chain, symlink, etc.).
-unsafe fn free_vdata_storage(md: *mut super::types::TmpfsMountData, vd: *mut TmpfsVnodeData) {
-    unsafe {
-        let old_size = (*vd).size;
-
-        if (*vd).ftype == VT_LNK {
-            pool::free_symlink(md, (*vd).symlink_data);
-            (*vd).symlink_data = core::ptr::null_mut();
-        } else {
-            pool::free_chain(md, (*vd).writable_head);
-            (*vd).writable_head = INVALID_WRITABLE_SLOT;
-        }
-
-        // Account for freed bytes
-        if old_size > 0 && (*vd).ftype != VT_LNK {
-            pool::account_bytes_sub(md, old_size);
-        }
-
-        (*vd).size = 0;
-        (*vd).active = 0;
+        Ok(Ready(()))
     }
 }

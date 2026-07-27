@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O with caching and prefetching.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::ipc;
+use trona_protocol::blk::*;
 
-use crate::btree::btree_find_all_for_ino;
 use crate::consts::*;
 use crate::crc::crc32c_superblock;
 use crate::types::*;
 use crate::{
-    ipc_ctx, BLK_SHM_ID, BLOCK_SIZE, CACHE_AGE, CACHE_BLOCK_NR, CACHE_DIRTY, CACHE_TICK, NEXT_INO,
-    READONLY, SB,
+    BLK_SHM_ID, BLOCK_SIZE, CACHE_AGE, CACHE_BLOCK_NR, CACHE_DIRTY, CACHE_TICK, NEXT_INO, READONLY,
+    SB, SB_DIRTY, ipc_ctx,
 };
 
 /// Filesystem block number 0 is read from this disk LBA offset.
@@ -34,6 +31,20 @@ const MBR_PART_TYPE_LINUX_FS: u8 = 0x83;
 const GPT_HEADER_LBA: u64 = 1;
 const GPT_SIG: [u8; 8] = *b"EFI PART";
 const GPT_SIG_OFF: usize = 0;
+
+const CAP_SELF_CSPACE: u64 = trona_kernel::uapi::KERNITE_CAP_SELF_CSPACE as u64;
+
+fn alloc_receive_cap_slot(label: &'static [u8]) -> Option<u64> {
+    let slot = trona_runtime::core::slot_alloc::slot_alloc_or_idle(label);
+    if slot == 0 { None } else { Some(slot) }
+}
+
+/// # Safety
+/// `slot` is a cap slot the caller solely owns; torn down and its index freed once.
+unsafe fn delete_and_free_cap(slot: u64) {
+    // SAFETY: exclusive ownership of `slot` per this fn's `# Safety`.
+    unsafe { trona_runtime::core::slot_alloc::delete_and_free(slot) };
+}
 const GPT_HEADER_SIZE_OFF: usize = 12;
 const GPT_HEADER_CRC32_OFF: usize = 16;
 const GPT_ENTRIES_LBA_OFF: usize = 72;
@@ -53,7 +64,7 @@ const GPT_PART_TYPE_LINUX_FS_LE: [u8; 16] = [
 ];
 
 const PROBE_BLOCK_SIZE: u64 = DEFAULT_BLOCK_SIZE; // Superblock is always 4KB on disk.
-                                                  // Defensive cap for malformed GPTs; far above normal GPT entry arrays.
+// Defensive cap for malformed GPTs; far above normal GPT entry arrays.
 const GPT_MAX_ENTRY_ARRAY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[inline]
@@ -433,7 +444,15 @@ pub(crate) fn blk_read_sectors(start_sector: u64, count: u64, shm_offset: u64) -
     msg.regs[2] = shm_offset;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::blkdrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     err == 0 && reply.label == 0
 }
 
@@ -447,7 +466,15 @@ pub(crate) fn blk_write_sectors(start_sector: u64, count: u64, shm_offset: u64) 
     msg.regs[2] = shm_offset;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::blkdrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     err == 0 && reply.label == 0
 }
 
@@ -456,7 +483,7 @@ pub(crate) fn blk_write_sectors(start_sector: u64, count: u64, shm_offset: u64) 
 /// before any write path is reached.
 pub(crate) fn write_block(block_nr: u64, data: *const u8) -> bool {
     if unsafe { *(&raw const READONLY) } {
-        trona::uwarn!(|_lb| {
+        trona_runtime::uwarn!(|_lb| {
             _lb.str(b"[saltyfs] write_block refused: read-only mount (block=");
             _lb.dec(block_nr);
             _lb.str(b")\n");
@@ -510,8 +537,13 @@ pub(crate) fn cache_flush_block(block_nr: u64) -> bool {
     true
 }
 
-/// Flush all dirty blocks from the block cache to disk.
-pub(crate) fn cache_flush_all() {
+/// Flush all dirty blocks from the block cache to disk. Returns
+/// `true` if every dirty block was written successfully (or there
+/// were none to write); `false` if at least one write failed. On
+/// failure the corresponding slot retains its `CACHE_DIRTY` bit so a
+/// later flush can retry.
+pub(crate) fn cache_flush_all() -> bool {
+    let mut ok = true;
     unsafe {
         for i in 0..CACHE_SLOTS {
             if *(&raw const CACHE_DIRTY[i]) {
@@ -520,11 +552,17 @@ pub(crate) fn cache_flush_all() {
                     let ptr = (CACHE_VADDR + (i as u64) * CACHE_SLOT_SIZE as u64) as *const u8;
                     if write_block(block_nr, ptr) {
                         *(&raw mut CACHE_DIRTY[i]) = false;
+                    } else {
+                        // Preserve CACHE_DIRTY so a retry sees the
+                        // same slot as dirty. Surface the failure to
+                        // the caller so writeback status propagates.
+                        ok = false;
                     }
                 }
             }
         }
     }
+    ok
 }
 
 /// Remove a block from the cache.
@@ -564,36 +602,67 @@ pub(crate) fn write_superblock() -> bool {
     }
 }
 
-/// Scan the B-tree to find the maximum inode number and set NEXT_INO.
+/// One-time upgrade path for volumes that predate the on-disk
+/// `SB.next_inode_seq` field. Forward-scans every B-tree leaf for the
+/// authoritative maximum `TRONA_INODE_ITEM` object_id and seeds
+/// `NEXT_INO` one past it, then persists the value into
+/// `SB.next_inode_seq` and marks the superblock dirty.
 ///
-/// The tree is ordered by `(object_id, item_type, offset)`, so the last leaf is
-/// not guaranteed to contain the highest `INODE_ITEM` object id once other item
-/// types (extents, xattrs, refs) are interleaved. Walk all inode ids and stop at
-/// the first gap.
-pub(crate) fn discover_max_inode() {
+/// A hole in the ino space (produced by unlink/rmdir of arbitrary
+/// inodes) must not truncate the scan — the tree is ordered by
+/// `(object_id, item_type, offset)` and a deleted ino leaves a gap
+/// while higher live inos may still exist beyond it. The helper in
+/// `btree.rs` walks every leaf so the returned max is independent of
+/// gap topology.
+pub(crate) fn legacy_upgrade_next_inode_seq() {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    let mut max_ino = unsafe { (*(&raw const SB)).root_inode };
-
-    loop {
-        let next_ino = max_ino.saturating_add(1);
-        let mut found = false;
-        btree_find_all_for_ino(
-            root_tree,
-            next_ino,
-            TRONA_INODE_ITEM,
-            |_key, _data_ptr, _size| {
-                found = true;
-                false
-            },
-        );
-        if !found {
-            break;
-        }
-        max_ino = next_ino;
-    }
+    let scanned_max = crate::btree::btree_max_inode_object_id(root_tree);
+    let sb_root = unsafe { (*(&raw const SB)).root_inode };
+    // The root inode is always live by construction; guard against an
+    // empty-scan result on pre-populated volumes where the scan bound
+    // is hit before we reach the root's leaf.
+    let max_ino = if scanned_max >= sb_root {
+        scanned_max
+    } else {
+        sb_root
+    };
 
     unsafe {
         *(&raw mut NEXT_INO) = max_ino.saturating_add(1);
+        (*(&raw mut SB)).next_inode_seq = *(&raw const NEXT_INO);
+        *(&raw mut SB_DIRTY) = true;
+    }
+}
+
+/// Allocate the next monotonically-increasing inode number. Updates both the
+/// in-memory `NEXT_INO` counter and the on-disk `SB.next_inode_seq` field,
+/// marking the superblock dirty for deferred flush.
+pub(crate) fn allocate_next_inode() -> u64 {
+    unsafe {
+        let n = *(&raw const NEXT_INO);
+        *(&raw mut NEXT_INO) = n + 1;
+        (*(&raw mut SB)).next_inode_seq = n + 1;
+        *(&raw mut SB_DIRTY) = true;
+        n
+    }
+}
+
+/// Flush the superblock to disk if it has been dirtied by inode
+/// allocation. Returns `true` on success (or a no-op when the dirty
+/// flag was clear); `false` if `write_superblock()` failed, in which
+/// case `SB_DIRTY` is preserved so a subsequent flush retries.
+pub(crate) fn flush_superblock_if_dirty() -> bool {
+    unsafe {
+        if !*(&raw const SB_DIRTY) {
+            return true;
+        }
+        if write_superblock() {
+            *(&raw mut SB_DIRTY) = false;
+            true
+        } else {
+            // Leave SB_DIRTY set — the next flush attempt will retry.
+            false
+        }
     }
 }
 
@@ -668,11 +737,28 @@ pub(crate) fn setup_blk_shm() -> bool {
     msg.length = 0;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
+    let Some(blk_shm_cap) = alloc_receive_cap_slot(b"saltyfs blk shm cap") else {
+        return false;
+    };
+    unsafe {
+        trona_runtime::core::ipc_ext::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, blk_shm_cap, 0);
+    }
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ctx,
+            crate::blkdrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n");
         });
+        // SAFETY: blk_shm_cap is the SHM cap blkdrv handed us, solely owned here;
+        // freed once on this failure path.
+        unsafe { delete_and_free_cap(blk_shm_cap) };
         return false;
     }
 
@@ -680,27 +766,46 @@ pub(crate) fn setup_blk_shm() -> bool {
         *(&raw mut BLK_SHM_ID) = reply.regs[0];
     }
 
-    // Map the SHM into our address space
-    let mut msg = TronaMsg::zeroed();
-    msg.label = MM_SHM_MAP;
-    msg.length = 4;
-    msg.regs[0] = unsafe { *(&raw const BLK_SHM_ID) };
-    msg.regs[1] = 0; // badge (self)
-    msg.regs[2] = SHM_VADDR;
-    msg.regs[3] = 0x3; // RW
-
-    let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[saltyfs] SHM map failed: ");
-            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+    // Map blkdrv's SHM at the fixed VA. `shm_map` sends the cap blkdrv handed
+    // us (mmsrv moves it on success); free the slot accordingly.
+    let blk_shm_idx = unsafe { *(&raw const BLK_SHM_ID) };
+    // `shm_map` takes a TransferCap: mmsrv moves the cap out on success, and the
+    // TransferCap reclaims the slot on either outcome (empty after a successful
+    // move, or rolled-back-then-deleted on failure) — no manual teardown here.
+    // SAFETY: blk_shm_cap is the SHM cap blkdrv handed us into a slot we solely
+    // own; no other handle owns it.
+    let map_res = trona_runtime::client::mm::shm_map(
+        blk_shm_idx,
+        unsafe {
+            trona_runtime::core::slot_alloc::move_for_transfer(
+                trona_runtime::core::slot_alloc::resolved_cap_ref(blk_shm_cap),
+            )
+        },
+        SHM_VADDR,
+        SHM_SIZE,
+        0x3,
+    );
+    let blk_va = match map_res {
+        Ok(va) => va,
+        Err(label) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[saltyfs] SHM map failed: ");
+                _lb.dec(label);
+                _lb.putc(b'\n');
+            });
+            return false;
+        }
+    };
+    if blk_va != SHM_VADDR {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] SHM mapped at unexpected VA ");
+            _lb.hex(blk_va);
             _lb.putc(b'\n');
         });
         return false;
     }
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[saltyfs] SHM mapped from blkdrv\n");
     });
     true
@@ -708,42 +813,49 @@ pub(crate) fn setup_blk_shm() -> bool {
 
 /// Allocate cache memory via mmsrv
 pub(crate) fn setup_cache() -> bool {
-    let ctx = ipc_ctx();
+    // Create the saltyfs block-cache SHM (producer). The shared helper carries
+    // the size in bytes and receives the MO cap into a fresh slot.
+    let (cache_shm_idx, cache_cap) =
+        match trona_runtime::client::mm::shm_create(0x53465343, CACHE_TOTAL_PAGES * 4096) {
+            Ok(v) => v,
+            Err(_) => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[saltyfs] Cache SHM create failed\n");
+                });
+                return false;
+            }
+        };
 
-    // Allocate pages for block cache
-    let mut msg = TronaMsg::zeroed();
-    msg.label = MM_SHM_CREATE;
-    msg.length = 2;
-    msg.regs[0] = 0x53465343; // "SFSC" - saltyfs cache
-    msg.regs[1] = CACHE_TOTAL_PAGES;
-
-    let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != 0 && reply.label != TRONA_ALREADY_EXISTS) {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[saltyfs] Cache SHM create failed\n");
+    // Map at the fixed cache VA. `shm_map` sends the cap (mmsrv moves it on
+    // success); free the slot accordingly.
+    // `shm_map` takes a TransferCap: cache_cap (OwnedCap) is moved in, and the
+    // TransferCap reclaims its slot on either outcome — no manual teardown here.
+    let map_res = trona_runtime::client::mm::shm_map(
+        cache_shm_idx,
+        cache_cap.into_transfer(),
+        CACHE_VADDR,
+        CACHE_TOTAL_PAGES * 4096,
+        0x3,
+    );
+    let cache_va = match map_res {
+        Ok(va) => va,
+        Err(_) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[saltyfs] Cache SHM map failed\n");
+            });
+            return false;
+        }
+    };
+    if cache_va != CACHE_VADDR {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] Cache SHM mapped at unexpected VA ");
+            _lb.hex(cache_va);
+            _lb.putc(b'\n');
         });
         return false;
     }
 
-    let mut msg = TronaMsg::zeroed();
-    msg.label = MM_SHM_MAP;
-    msg.length = 4;
-    msg.regs[0] = 0x53465343;
-    msg.regs[1] = 0;
-    msg.regs[2] = CACHE_VADDR;
-    msg.regs[3] = 0x3; // RW
-
-    let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[saltyfs] Cache SHM map failed\n");
-        });
-        return false;
-    }
-
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[saltyfs] Block cache allocated\n");
     });
     true
@@ -759,7 +871,7 @@ fn check_features(sb: &Superblock) -> bool {
     // 1) Unknown incompat bits → hard refuse
     let unknown_incompat = sb.incompat_flags & !SALTYFS_INCOMPAT_SUPPORTED;
     if unknown_incompat != 0 {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[saltyfs] mount refused: unsupported incompat flags=0x");
             _lb.hex(unknown_incompat as u64);
             _lb.putc(b'\n');
@@ -771,7 +883,7 @@ fn check_features(sb: &Superblock) -> bool {
     if (sb.incompat_flags & SALTYFS_INCOMPAT_CASEFOLD) != 0
         && sb.casefold_version != CASEFOLD_VERSION_UNICODE_15_1
     {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[saltyfs] mount refused: casefold version mismatch (image=");
             _lb.dec(sb.casefold_version as u64);
             _lb.str(b" driver=");
@@ -784,7 +896,7 @@ fn check_features(sb: &Superblock) -> bool {
     // 3) Unknown compat_ro bits → force read-only mount
     let unknown_compat_ro = sb.compat_ro_flags & !SALTYFS_COMPAT_RO_SUPPORTED;
     if unknown_compat_ro != 0 {
-        trona::uwarn!(|_lb| {
+        trona_runtime::uwarn!(|_lb| {
             _lb.str(b"[saltyfs] mount read-only: unsupported compat_ro flags=0x");
             _lb.hex(unknown_compat_ro as u64);
             _lb.putc(b'\n');
@@ -817,7 +929,7 @@ pub(crate) fn read_superblock() -> bool {
     } else if let Some((lba, sb)) = scan_mbr_for_saltyfs_partition() {
         (lba, sb)
     } else {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n");
         });
         return false;
@@ -835,7 +947,7 @@ pub(crate) fn read_superblock() -> bool {
     }
 
     unsafe {
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[saltyfs] Mounted: part_lba=");
             _lb.dec(*(&raw const PARTITION_BASE_LBA));
             _lb.str(b" blocks=");

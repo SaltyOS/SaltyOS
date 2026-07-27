@@ -1,5 +1,65 @@
 # Memory Manager Server (mmsrv)
 
+> **VA ownership redesign (2026-04-29).** mmsrv now models per-client
+> address space as the union of `MappedRegion` (active mappings, in
+> `regions_slab` + base-sorted `regions_index`) and `ReservedRange`
+> (VA owned but unmapped — Arena/Guard/Exclusion/System kinds, in
+> `reservations_slab` + `reservations_index`). The legacy `mmap_next`
+> watermark is renamed `mmap_hint` and is no longer authoritative —
+> every auto-placement flows through `va_alloc::find_free_va_gap`,
+> which walks both indices plus the static global exclusions (null
+> guard, kernel half). Internal fixed allocations
+> (`MM_ALLOC_PRIVATE_REGION`, `MM_ALLOC_STACK_REGION`) default to
+> strict; explicit `MM_ALLOC_FLAG_REPLACE` opts into legacy "silent
+> replace" semantics. POSIX `MAP_FIXED` retains its replacement
+> semantics; `MAP_FIXED_NOREPLACE` was added for the strict variant.
+> Stack guards moved from `MmRegion.stack_guard_pages` to
+> `ReservedRange(kind=Guard)` with mutual back-links via `RegionId` /
+> `ReservationId` (generation-tagged handles, ABA-safe).
+> `MM_RESERVE_RANGE` (0x40A) and `MM_UNRESERVE_RANGE` (0x40B) expose
+> reservations to userland; at boot init reserves the fixed VA windows
+> its directly-mapped arenas occupy (slab backing, cookie-table segment,
+> loader scratch) so mmsrv's gap allocator avoids them. Every
+> mapping creation/destruction routes through the typed `MapPlan`
+> family in `crate::txn` (`MappingPlan` / `UnmapPlan` / `MprotectPlan`
+> / `StackAllocPlan` / `StackFreePlan` / `ReservationPlan` /
+> `UnreservationPlan` / `HeapPlan` / `ForkPlan`) so
+> `no_partial_publish` is enforced at the type level. Cross-client
+> opcodes (`MM_DEREGISTER`, `MM_MPROTECT_TARGET`, `MM_*_WINDOW`,
+> `MM_PREFAULT_RANGE`, `MM_MAP_BATCH`, `MM_FORK_REGIONS`,
+> `MM_ALLOC_*_COPY*`) call `enforce_target_authorization` /
+> `enforce_fork_authorization`, closing audit blockers H2–H4. The
+> 5500-line legacy `mmap.rs` is split into a `mmap/` module
+> (`alloc` / `anon` / `brk` / `copy` / `file` / `fork` / `helpers` /
+> `pagein` / `pager` / `range` / `reserve` / `stack` / `window`).
+
+> **Shared arena machinery + init (2026-06-07).** The growable slab
+> layer is promoted to `trona_server`: `TrackedSlab<T>` /
+> `BaseSortedIndex` (page-backed, epoch-tagged, ABA-safe), `U32HashIndex`
+> (heap-free O(1) `u32 → u32`), and the untyped-backed `FrameAllocator`
+> are shared by mmsrv and init through a generic `PageBacking` trait. mmsrv
+> backs its own region/reservation slabs via `SelfVm` (one MemoryObject
+> per buffer, committed from the kernel PMM at a private scratch window).
+> init — which runs before mmsrv exists — backs its slabs via `InitSelfVm`,
+> identical except it commits from init's own untyped pool (a dedicated
+> chunk carved from `init_private`, reset-isolated from the cookie-table
+> FRAMEs so an exhaustion-reset can never recycle live tables). init's PID
+> table is now an arena `TrackedSlab<ProcessRecord>` (a process's **PID is
+> its slab slot index**) with a `U32HashIndex` `client_id → pid` index
+> replacing the O(n) fault-dispatcher scan; the fixed 512-process cap is
+> gone. Thread records moved to a chained `ThreadBlock` slab (no
+> per-process thread cap); supplementary groups stay embedded (the
+> `getgroups`/`setgroups` wire layout caps them regardless, so extracting
+> them buys nothing). The lifecycle-observer table is likewise a slab.
+> **Kernel:** untyped-backed MO pages now use `MoData` as their live PMM
+> owner and keep the exact carving source in `FrameMeta::source_ut`.
+> MO destroy/decommit returns those pages to that source untyped via the
+> source pointer, while diagnostics and owner checks see the true live owner.
+> This preserves `InitSelfVm`'s commit-from-init-untyped recycling without
+> letting untyped teardown race live MO data. **Future (no consumer yet):** a worker-scratch
+> arena (init drives a single-threaded reactor) and per-record extras
+> beyond the thread chain.
+
 ## 1. Overview
 
 mmsrv is the central pager service in SaltyOS, responsible for all userland frame allocation and VSpace mapping. It eliminates per-service memory allocators and hardcoded `MAX_*` pool limits by centralizing frame management in a single server with a growable architecture.
@@ -11,7 +71,7 @@ mmsrv is the central pager service in SaltyOS, responsible for all userland fram
 - Per-client region tracking (heap, mmap, shared memory, file-backed)
 - Demand paging for lazy-allocated regions
 - Shared memory object management for VFS
-- Dual-mapping windows for procmgr spawn/fork operations
+- Dual-mapping windows for the supervisor's spawn/fork operations
 - File-backed mmap coordination with VFS pager
 
 **Design philosophy:**
@@ -26,7 +86,7 @@ mmsrv is the central pager service in SaltyOS, responsible for all userland fram
 ### Boot Order
 
 ```
-init (phase 0)
+init (phase 0 — also owns process lifecycle: spawn/exit/waitpid/SIGCHLD)
   ↓
 console (serial I/O server)
   ↓
@@ -36,12 +96,10 @@ mmsrv ← YOU ARE HERE (frame allocator + pager)
   ↓
 vfs (filesystem + sockets)
   ↓
-procmgr (process manager)
-  ↓
 ...rest of userland
 ```
 
-mmsrv must start before VFS and procmgr because both need dynamic memory allocation for their internal data structures. Once mmsrv is running, all subsequent services use `posix_mmap()` → mmsrv IPC for frame allocation.
+mmsrv must start before VFS and the rest of userland because every service needs dynamic memory allocation for its internal data structures. Once mmsrv is running, all subsequent services use `posix_mmap()` → mmsrv IPC for frame allocation.
 
 ### MO-Based Memory Flow
 
@@ -74,7 +132,7 @@ Set by init in `spawn.rs`:
 | 12 | `CAP_INITRD_UNTYPED` | Untyped | Initrd-backed untyped |
 | 14 | `CAP_READINESS_NTFN` | Notification | Signal to init when ready |
 | 16+ | `CAP_UNTYPED_START` | Untyped | Mirrored parent untyped caps (up to 8) |
-| 64 | `CAP_NAMESERV` | Endpoint | Name service endpoint (via NeedEP) |
+| 64 | `CAP_NAMESERV` | Endpoint | Name service endpoint (startup attachment) |
 | 256+ | - | - | Slot allocator pool |
 | 15360-16383 | - | - | Receive slot pool (RECV_SLOT_BASE=0x3C00) |
 
@@ -103,46 +161,46 @@ unused; 0x96 is reserved (device mmap handled as subcase of `MM_FILE_MMAP`).
 
 | Label | Name | Source | Purpose |
 |-------|------|--------|---------|
-| 0x80 | `MM_REGISTER` | procmgr | Register new client + VSpace cap transfer |
-| 0x81 | `MM_DEREGISTER` | procmgr | Deregister client on exit |
+| 0x80 | `MM_REGISTER` | init supervisor | Register new client + VSpace cap transfer |
+| 0x81 | `MM_DEREGISTER` | init supervisor | Deregister client on exit |
 | 0x82 | `MM_BRK` | client | Set program break (absolute) |
 | 0x83 | `MM_SBRK` | client | Increment program break (relative) |
 | 0x84 | `MM_MMAP` | client | Anonymous mmap (eager or lazy) |
 | 0x85 | `MM_MUNMAP` | client | Unmap and free frames |
 | 0x86 | `MM_MPROTECT` | client | Change page protection |
-| 0x87 | `MM_MAP_BATCH` | procmgr | Batch-map N pages for spawn |
-| 0x88 | `MM_MAP_WINDOW` | procmgr | Dual-map frames (target + caller) |
-| 0x89 | `MM_UNMAP_WINDOW` | procmgr | Remove caller-side mapping |
+| 0x87 | `MM_MAP_BATCH` | init supervisor | Batch-map N pages for spawn |
+| 0x88 | `MM_MAP_WINDOW` | init supervisor | Dual-map frames (target + caller) |
+| 0x89 | `MM_UNMAP_WINDOW` | init supervisor | Remove caller-side mapping |
 | 0x8A | `MM_SHM_CREATE` | vfs | Create shared memory object |
 | 0x8B | `MM_SHM_MAP` | vfs | Map SHM into client VSpace |
 | 0x8C | `MM_SHM_UNMAP` | vfs | Unmap SHM from client VSpace |
-| 0x8D | `MM_FORK_REGIONS` | procmgr | Clone parent's region state to child |
+| 0x8D | `MM_FORK_REGIONS` | init supervisor | Clone parent's region state to child |
 | 0x8E | `MM_SHM_DESTROY` | vfs | Destroy SHM backing after last close |
 | 0x8F | `MM_SHM_RESIZE` | vfs | Resize SHM backing with mapped-tail safety checks |
 | 0x90 | `MM_GET_CLIENT_STATS` | any | Query per-client memory usage |
-| 0x92 | `MM_REGISTER_SHARED_REGION` | procmgr | Register shared library region |
-| 0x93 | `MM_MAP_OBJECT_REGION` | procmgr | Map MO-backed region into client |
+| 0x92 | `MM_REGISTER_SHARED_REGION` | init supervisor | Register shared library region |
+| 0x93 | `MM_MAP_OBJECT_REGION` | init supervisor | Map MO-backed region into client |
 | 0x94 | `MM_SYNC_FILE_BACKING` | vfs | Sync file-backed MO to storage |
 | 0x95 | `MM_FILE_MMAP` | vfs | File-backed mmap (MO + pager) |
 | 0x97 | `MM_SYNC_MMAP_WRITE` | vfs | Sync dirty mmap pages |
-| 0x98 | `MM_PROVISION_UNTYPED` | procmgr | Push untyped memory to mmsrv |
+| 0x98 | `MM_PROVISION_UNTYPED` | init supervisor | Push untyped memory to mmsrv |
 | 0x99 | `MM_QUERY_CAPACITY` | any | Query available memory capacity |
 | 0x9A | `MM_PAGER_REQUEST` | kernel/vfs | Page-in request (demand paging) |
 | 0x9B | `MM_PAGER_WRITE_REQUEST` | kernel/vfs | Write-back request for dirty page |
 | 0x9C | `MM_DUMP_PENDING` | debug | Dump pending operations (debug) |
 | 0x9D | `MM_REGISTER_PAGER_EP` | vfs | Register backend callback endpoint for file-backed regions |
-| 0x9E | `MM_ALLOC_PRIVATE_REGION` | procmgr | Allocate private MO-backed region |
-| 0x9F | `MM_ALLOC_PRIVATE_WINDOW` | procmgr | Allocate private dual-mapped window |
-| 0xA0 | `MM_ALLOC_INITRD_COPY` | procmgr | Copy initrd data into MO pages |
-| 0xA1 | `MM_ALLOC_BOOTINFO_COPY` | procmgr | Copy bootinfo into MO pages |
-| 0xA2 | `MM_COPY_FROM_CLIENT_REGION` | procmgr | Copy data from client's region |
-| 0xA3 | `MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION` | procmgr | Allocate + copy from client region |
+| 0x9E | `MM_ALLOC_PRIVATE_REGION` | init supervisor | Allocate private MO-backed region |
+| 0x9F | `MM_ALLOC_PRIVATE_WINDOW` | init supervisor | Allocate private dual-mapped window |
+| 0xA0 | `MM_ALLOC_INITRD_COPY` | init supervisor | Copy initrd data into MO pages |
+| 0xA1 | `MM_ALLOC_BOOTINFO_COPY` | init supervisor | Copy bootinfo into MO pages |
+| 0xA2 | `MM_COPY_FROM_CLIENT_REGION` | init supervisor | Copy data from client's region |
+| 0xA3 | `MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION` | init supervisor | Allocate + copy from client region |
 
 **Note:** 0x91 is currently unused. 0x96 is reserved (device mmap handled as subcase of `MM_FILE_MMAP`).
 
 ### Message Layouts
 
-**MM_REGISTER (procmgr → mmsrv):**
+**MM_REGISTER (init supervisor → mmsrv):**
 ```
 MR0 = client_badge (unique badge for client's EP)
 MR1 = heap_base (virtual address)
@@ -169,7 +227,7 @@ Badge identifies client
 Reply: label = TRONA_OK, MR0 = new_break
 ```
 
-**MM_MAP_WINDOW (procmgr → mmsrv):**
+**MM_MAP_WINDOW (init supervisor → mmsrv):**
 ```
 MR0 = target_badge (child process)
 MR1 = target_vaddr (where to map in child)
@@ -180,13 +238,13 @@ MR4 = vspace_flags (for target mapping)
 Reply: label = TRONA_OK, MR0 = pages_mapped
 ```
 
-**MM_PROVISION_UNTYPED (procmgr → mmsrv):**
+**MM_PROVISION_UNTYPED (init supervisor → mmsrv):**
 ```
 + cap transfer: untyped capability
 Reply: label = TRONA_OK
 ```
 
-This is a push model: procmgr provisions additional untyped memory to mmsrv when the system grows, avoiding mmsrv needing to request memory from procmgr (which would create a circular dependency).
+This is a push model: init supervisor provisions additional untyped memory to mmsrv when the system grows, avoiding mmsrv needing to request memory from init supervisor (which would create a circular dependency).
 
 **MM_FILE_MMAP (vfs → mmsrv):**
 ```
@@ -241,16 +299,29 @@ This direct path is only used for mmsrv's internal allocations. Client allocatio
 **MmClient struct (per client):**
 ```rust
 struct MmClient {
-    badge: u64,              // Client's EP badge (unique ID)
-    pid: u32,                // Process ID
-    active: bool,            // Is this slot occupied?
-    vspace_cap: Cap,         // Client's VSpace cap (held by mmsrv)
-    heap_base: u64,          // POSIX heap start address
-    heap_current: u64,       // Current program break
-    mmap_next: u64,          // Next mmap allocation address
-    regions: *mut MmRegion,  // Growable region array
-    region_count: usize,     // Number of active regions
-    region_cap: usize,       // Capacity of region array
+    // immutable after registration
+    badge: u64,                // Client's EP badge (unique ID)
+    pid: u32,                  // Process ID
+    vspace_cap: Cap,           // Client's VSpace cap (held by mmsrv)
+    registrant_badge: u64,     // Caller that issued MM_REGISTER (cross-client auth)
+
+    // state-machine flags
+    active: bool,
+    deregistering: bool,
+
+    // scalar VA watermarks (mutated only via MapPlan.publish + register/deregister)
+    heap_base: u64,
+    heap_current: u64,
+    heap_limit: u64,
+    mmap_base: u64,
+    mmap_hint: u64,            // auto-placement search hint, never authoritative
+    mmap_limit: u64,
+
+    // region / reservation storage (mutated only via MapPlan.publish)
+    regions_slab: TrackedSlab<MappedRegion>,
+    regions_index: BaseSortedIndex,   // base-sorted lookup over regions_slab slots
+    reservations_slab: TrackedSlab<ReservedRange>,
+    reservations_index: BaseSortedIndex,
 }
 ```
 
@@ -264,28 +335,53 @@ struct MmClient {
 
 ### Region Tracking
 
-**MmRegion struct (per memory region):**
+The legacy `MmRegion` struct has been replaced with:
+
+* **`MappedRegion`** — describes an active mapping, stored in
+  `regions_slab` and indexed by base in `regions_index`.
+* **`ReservedRange`** — VA range owned by the client without a
+  mapping (sparse arena, stack guard, exclusion zone). Lives in
+  `reservations_slab` / `reservations_index`.
+* **`BackingDescriptor`** — typed enum that carries the storage
+  contract: `Anon` / `CowChild` / `FileBacked` / `ShmFrames` /
+  `Device` / `Image`. Replaces the grab-bag of `mo_cap` /
+  `mo_offset` / `backing_kind` / `backing_id*` /
+  `backing_file_*` fields the legacy struct used to carry.
+
 ```rust
-struct MmRegion {
-    base: u64,              // Virtual address start
-    length: u64,            // Region size in bytes
-    prot: u8,               // PROT_READ/WRITE/EXEC
-    region_type: u8,        // REGION_HEAP=0 or REGION_MMAP=1
-    active: bool,           // Is this region valid?
-    lazy: bool,             // Demand-paged (MAP_LAZY)?
-    mo_cap: Cap,            // MemoryObject capability (owns the backing pages)
-    frame_count: u16,       // Number of frames committed
+struct MappedRegion {
+    base: u64,                 // VA start
+    length: u64,               // bytes
+    prot: u8,                  // PROT_READ / WRITE / EXEC
+    region_type: u8,           // mmsrv classification (HEAP/MMAP/STACK/SHM/IMAGE_*)
+    active: bool,              // mapping installed?
+    lazy: bool,                // demand-paged (MAP_LAZY)?
+    backing: BackingDescriptor,
+    reservation: Option<ReservationId>,        // mapping inside which reservation, if any
+    stack_allocator_badge: u64,                // REGION_STACK only
+    guard_reservation_id: Option<ReservationId>, // REGION_STACK + paired guard back-link
+}
+
+struct ReservedRange {
+    base: u64,
+    length: u64,
+    kind: ReservationKind,     // Arena / Guard / Exclusion / System
+    owner_badge: u64,          // 0 = unowned exclusion zone
+    stack_region_id: Option<RegionId>,  // Guard kind only — paired stack mapping
 }
 ```
 
-**Per-client region list:**
-- Growable array (starts at 8 entries, doubles on overflow)
-- Each client has independent region tracking
-- Regions track MO caps for cleanup on munmap/deregister
+**Stable handles:** `RegionId { idx: u32, generation: u32 }` and the
+matching `ReservationId` are ABA-safe — slabs bump the generation on
+every `slot_free`, so a stale handle into a freed-and-reused slot
+deterministically misses (`region_at` / `reservation_at` returns
+`None`).
 
-**Lazy regions (MAP_LAZY):**
+**Lazy regions (`MAP_LAZY` / file mmap):**
 - MO is created but pages are not committed
-- VMFault handler commits pages on first access via `mo_commit()` + `vspace_map_mo()`
+- VMFault handler commits pages on first access via
+  `pagein::materialize_region_page` (calls `commit_mo_pages` for anon
+  and `pagein_backing_page` for file-backed regions)
 
 ### Untyped Pool
 
@@ -303,7 +399,7 @@ Scans untyped sources in round-robin order:
 **Sources:**
 - Slot 7: child untyped (primary)
 - Slots 16-23: mirrored parent untypeds (if present)
-- Additional untypeds from `MM_PROVISION_UNTYPED` (push model from procmgr)
+- Additional untypeds from `MM_PROVISION_UNTYPED` (push model from init supervisor)
 - Up to 12 total sources (`MAX_UT_SOURCES`)
 
 ### Receive Slot Pool
@@ -327,7 +423,7 @@ Scans untyped sources in round-robin order:
 
 ### Registration (MM_REGISTER)
 
-**Called by:** procmgr after spawning a new process
+**Called by:** init supervisor after spawning a new process
 
 **Steps:**
 1. Extract client badge, heap_base, mmap_base, pid from message
@@ -338,7 +434,7 @@ Scans untyped sources in round-robin order:
 6. Mark receive slot as kept (`RECV_SLOT_KEPT=true`)
 7. Reply with `TRONA_OK`
 
-**Badge assignment:** procmgr chooses badge = PID (ensures uniqueness)
+**Badge assignment:** init supervisor chooses badge = PID (ensures uniqueness)
 
 **Heap/mmap layout:**
 - `heap_base` — start of POSIX heap (typically 1 MB after scratch region)
@@ -347,7 +443,7 @@ Scans untyped sources in round-robin order:
 
 ### Deregistration (MM_DEREGISTER)
 
-**Called by:** procmgr after process exit or kill
+**Called by:** init supervisor after process exit or kill
 
 **Steps:**
 1. Find client by badge
@@ -449,7 +545,7 @@ old_break returned in MR0
 
 ### Batch Mapping (MM_MAP_BATCH)
 
-**Purpose:** procmgr needs to map N pages into a child's VSpace during spawn (for code, data, stack).
+**Purpose:** init supervisor needs to map N pages into a child's VSpace during spawn (for code, data, stack).
 
 **Protocol:**
 ```
@@ -466,11 +562,11 @@ Reply: MR0 = pages_mapped
 3. Map MO into target's VSpace via `vspace_map_mo()`
 4. Return number of pages successfully mapped (partial success allowed)
 
-**Partial success:** If commit fails midway, return the count of successfully mapped pages. Procmgr decides whether to retry or abort.
+**Partial success:** If commit fails midway, return the count of successfully mapped pages. The supervisor decides whether to retry or abort.
 
 ### Write Window (MM_MAP_WINDOW / MM_ALLOC_PRIVATE_WINDOW)
 
-**Purpose:** procmgr needs to write to a child's VSpace (copy ELF segments, initialize stack).
+**Purpose:** init supervisor needs to write to a child's VSpace (copy ELF segments, initialize stack).
 
 **Dual-mapping strategy:**
 1. Create MO and commit pages
@@ -488,7 +584,7 @@ Reply: MR0 = pages_mapped
 
 ### Region Cloning (MM_FORK_REGIONS)
 
-**Purpose:** procmgr calls this after COW fork to clone parent's memory layout to child.
+**Purpose:** init supervisor calls this after COW fork to clone parent's memory layout to child.
 
 **Protocol:**
 ```
@@ -626,7 +722,7 @@ Badge = faulting client's badge
 1. **Identify client:** `find_client_by_badge(badge)`
    - Error if client not registered (orphaned fault)
 2. **Find region:** `find_region_by_addr(client, page_addr)`
-   - If no region: segfault (reply `TRONA_INVALID_ARGUMENT` → procmgr kills process)
+   - If no region: segfault (reply `TRONA_INVALID_ARGUMENT` → init supervisor kills process)
 3. **Commit page:** `mo_commit(region.mo_cap, ut_cap, page_offset, 1)`
    - Dual-source: tries untyped first, falls back to PMM
 4. **Map page:** `vspace_map_mo(client.vspace_cap, region.mo_cap, page_addr, page_offset, flags)`
@@ -673,21 +769,21 @@ For dirty page write-back:
 **Problem:** rtld runs **before** mmsrv in the boot order (rtld is embedded in init, which is phase 0; mmsrv is phase 2).
 
 **Solution:** rtld uses direct untyped retype:
-- Receives `AT_TRONA_UNTYPED` via auxv
+- Receives the bootstrap untyped slot via `SaltyOSCspaceLayoutV1.rtld_untyped_base`
 - Directly calls `untyped_retype()` + `vspace_map()`
 - No IPC to mmsrv
 
-### procmgr Shared Library Cache
+### init supervisor Shared Library Cache
 
-**Problem:** procmgr maintains a shared library cache (loads `libtrona.so`, `libc.so` once, maps into all children). This cache needs frames, but procmgr can't use mmsrv (circular dependency — mmsrv uses procmgr for process management).
+**Problem:** init supervisor maintains a shared library cache (loads `libtrona.so`, `libc.so` once, maps into all children). This cache needs frames, but init supervisor can't use mmsrv (circular dependency — mmsrv uses init supervisor for process management).
 
-**Solution:** procmgr also has its own child untyped capability:
+**Solution:** init supervisor also has its own child untyped capability:
 - Allocates cache frames directly via `untyped_retype()`
 - Maps cache frames into children via `vspace_map(child_vspace_cap, ...)`
 
 ### Transition Point
 
-Once a process is spawned by procmgr:
+Once a process is spawned by init supervisor:
 - It receives `CAP_MMSRV_EP` (slot 7, badged endpoint)
 - All `posix_mmap()` calls go through mmsrv IPC
 - No direct untyped access (slot allocator uses mmsrv for frame allocation)
@@ -709,9 +805,9 @@ Once a process is spawned by procmgr:
 ### VMFault Error Handling
 
 - **TRONA_OK:** Page committed and mapped → resume thread
-- **TRONA_BAD_ADDRESS:** vspace_map_mo failed (rare, indicates kernel state corruption) → procmgr should kill process
-- **TRONA_INVALID_ARGUMENT:** No region covers fault address (segfault) → procmgr delivers SIGSEGV
-- **TRONA_OUT_OF_MEMORY:** MO commit failed → procmgr should kill process (or swap to disk, if supported)
+- **TRONA_BAD_ADDRESS:** vspace_map_mo failed (rare, indicates kernel state corruption) → init supervisor should kill process
+- **TRONA_INVALID_ARGUMENT:** No region covers fault address (segfault) → init supervisor delivers SIGSEGV
+- **TRONA_OUT_OF_MEMORY:** MO commit failed → init supervisor should kill process (or swap to disk, if supported)
 
 ## 13. Performance Considerations
 
@@ -784,7 +880,7 @@ Label 0x99 returns available memory capacity:
 
 **Current:** Server panic = system halt (no recovery)
 
-**Future:** Procmgr could respawn mmsrv on crash, but state loss is catastrophic (all client MO references lost). Better strategy: kernel-level checkpointing of mmsrv state.
+**Future:** init's supervisor could respawn mmsrv on crash, but state loss is catastrophic (all client MO references lost). Better strategy: kernel-level checkpointing of mmsrv state.
 
 ## 16. Cross-References
 
@@ -794,3 +890,85 @@ Label 0x99 returns available memory capacity:
 - **[trona Design](trona.md)** — Slot allocator's use of mmsrv for frame allocation
 - **[Kernel Memory Management](memory.md)** — Untyped retype, VSpace mapping, COW implementation
 - **[IPC Design](ipc.md)** — Endpoint badging, cap transfer, fault delivery
+
+## 17. Current ABI
+
+mmsrv's wire surface is two tiers. Per-client MP ownership is the
+self-tier identity model: a process's request MP recv side held by
+mmsrv determines who can drive any self-tier label. The admin tier is
+gated by per-client control capabilities — authority and target
+identity both ride on an unforgeable badge, so init drives every admin
+verb (register / deregister / fork / fault-pipe / stage / exec-replace)
+without passing a trusted `client_id`.
+
+### 17.1 Wire tiers
+
+- **admin tier (per-client control capabilities)**: authority and
+  target identity ride on the control cap's badge
+  (`TAG(0xC) | ROOT | epoch(43b) | slot(16b)`). `MM_REGISTER_CLIENT`
+  is authorized by the per-server **ROOT** control cap (init-only);
+  every other verb is invoked on the **per-client** cap mmsrv mints and
+  returns at register — invoking it is both the authorization and the
+  client selector, so no trusted `client_id` integer is accepted.
+  - `0x400 MM_REGISTER_CLIENT` — register a fresh client. Caps:
+    `[vspace, request_mp_recv, request_mp_send]`; the reply returns the
+    minted per-client control cap. The request-send side is retained on
+    `ClientState.request_mp_send_slot` so the child can pick it up via
+    `MM_BIND_CLIENT_SELF`.
+  - `0x401 MM_DEREGISTER_CLIENT` — tear down a client (non-reply
+    `MP_WRITE`). Bumps the slot epoch so a recycled slot's stale cap
+    fails closed; releases the saved `request_mp_send_slot`, regions,
+    and MOs.
+  - `0x402 MM_FORK_VSPACE(exclude_count, exclude_vas[])` + `0x409
+    MM_FORK_SET_PARTNER` — clone the parent's anon regions into the
+    child VSpace via a two-step invoke: `SET_PARTNER` on the child cap
+    pins the child under a nonce, then the operate step on the parent
+    cap runs the clone. Regions whose `va_base` matches an exclude
+    entry are skipped (init preserves the cap-table region at
+    `CHILD_CAP_TABLE_VA`).
+  - `0x403 MM_REGISTER_FAULT_PIPE` — registration of a per-TCB fault MP
+    recv onto the fault EQ, on the client's control cap.
+  - `0x404 MM_STAGE_IMAGE_REGION` + `0x40D MM_STAGE_SET_SOURCE` and
+    `0x405..0x407` exec transaction — staging runs on the destination
+    client's cap; a cross-client source is pinned via the two-step
+    `MM_STAGE_SET_SOURCE` (the `EXEC_MO_SRC` sub-path has no source
+    client and stays single-step).
+  - **Bootstrap-bind exception**: `0x408 MM_BIND_CLIENT_SELF`. The one
+    label outside the control-cap gate: a freshly spawned process binds
+    its own request MP to the `ClientState` init pre-created for it,
+    matched on the caller's `client_id`. The handler returns a
+    `cnode_copy` of the saved `request_mp_send_slot` so the child picks
+    up its self-tier MP send through namesrv lookup + this round-trip.
+- **self-tier (per-client request MP)**: `MM_MMAP / MM_MUNMAP /
+  MM_MPROTECT / MM_BRK / MM_SBRK / MM_SHM_* / MM_FILE_MMAP /
+  MM_PREFAULT_RANGE / MM_GET_SYSTEM_MEMINFO`.
+
+### 17.2 Identity model
+
+mmsrv does not consult `record.badge` for self-tier dispatch. Each
+per-client MP recv side carries a Watch armed with
+`cookie = client_id`; the service-EQ reactor reads the cookie and
+indexes `client_table[client_id]` directly. The send side held by
+the child is unbadged (`RSRC_ALLOC_MP_PAIR` returns caps with
+badge=0). Cross-client send invocation is impossible because the
+kernel cap system gates each MP send to the holder's CSpace.
+
+The **admin** tier is the inverse: it dispatches *on* the badge. The
+per-client control cap's badge decodes to `(slot, epoch)`, and
+`resolve_control` validates both against the live `ClientState` (active
+slot + matching epoch) before any verb runs — so a leaked cap for a
+recycled slot fails closed.
+
+The fault dispatcher uses `cookie = (client_id << 32) | tcb_id` so
+a single `EQ_WAIT(fault_eq)` resolves to a `(client_id, tcb_id)`
+pair without looking at the inbound `record.badge`.
+
+### 17.3 Fork exclude list
+
+`MM_FORK_VSPACE`'s operate step reads `regs[0]` as the two-step nonce,
+`regs[1]` as `exclude_count`, and `regs[2..2+count]` as the exclude VA
+array (currently capped at 4
+entries). Matching parent regions are skipped during the
+per-region `KERNITE_INV_VSPACE_FORK_RANGE` walk. init's
+`mm_ipc::mm_fork_vspace` builds this list at every `INIT_FORK` call
+to preserve `CHILD_CAP_TABLE_VA` for `populate_via_mmsrv` staging.

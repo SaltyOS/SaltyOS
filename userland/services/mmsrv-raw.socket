@@ -1,0 +1,6 @@
+[Unit]
+Name=mmsrv-raw.socket
+
+[Socket]
+Provider=mmsrv
+Alias=authority_raw

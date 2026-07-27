@@ -10,14 +10,11 @@ use crate::net::checksum;
 use crate::net::proto::ipv4::{self, Ipv4Header, PROTO_TCP};
 use crate::net::proto::tcp as tcp_proto;
 use crate::net::socket::options::{self, SocketOptions};
-use trona::consts::kernel::{SYS_CLOCK_GETTIME, SYS_GETRANDOM, TRONA_INVALID_ARGUMENT, TRONA_OK};
-use trona::consts::posix::SOCK_STREAM;
-use trona::consts::server::{
+use trona_protocol::common::{TRONA_INVALID_ARGUMENT, TRONA_OK, TRONA_TIMED_OUT};
+use trona_protocol::posix::{
     INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, TRONA_CONN_REFUSED, TRONA_NOT_CONNECTED,
-    TRONA_TIMED_OUT,
 };
-use trona_posix::consts::*;
-use trona::types::core::Timespec;
+use trona_protocol::posix_abi::socket::SOCK_STREAM;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -199,20 +196,8 @@ static mut TCBS: [TcpControlBlock; MAX_TCP_CONNS] = {
         rcv_wnd: DEFAULT_WINDOW,
         iss: 0,
         irs: 0,
-        rx_buf: RingBuf {
-            data: [0u8; TCP_RX_BUF_SIZE],
-            head: 0,
-            tail: 0,
-            len: 0,
-            cap: TCP_RX_BUF_SIZE,
-        },
-        tx_buf: RingBuf {
-            data: [0u8; TCP_RX_BUF_SIZE],
-            head: 0,
-            tail: 0,
-            len: 0,
-            cap: TCP_TX_BUF_SIZE,
-        },
+        rx_buf: RingBuf::new(TCP_RX_BUF_SIZE),
+        tx_buf: RingBuf::new(TCP_TX_BUF_SIZE),
         rto_ms: INITIAL_RTO_MS,
         retx_deadline_ns: 0,
         retx_count: 0,
@@ -297,6 +282,51 @@ fn push_completion(c: Completion) {
     }
 }
 
+/// Enqueue an `INET_OP_RECV` completion for data that was already buffered
+/// at the moment `NET_RECV_WAIT` arrived. The VFS-side `PendingInetOp`
+/// table must be populated before the caller fires the `mp_write_ctx`, so the
+/// completion delivered by the next `drain_completion_queue` pass finds
+/// its client reply slot.
+pub(crate) fn push_immediate_recv_completion(conn_id: u32, data: &[u8]) {
+    let n = core::cmp::min(data.len(), 152);
+    let mut comp = Completion {
+        conn_id,
+        result: TRONA_OK,
+        op_type: INET_OP_RECV,
+        data: [0u8; 152],
+        data_len: n,
+        extra_conn_id: 0,
+        extra_ip: 0,
+        extra_port: 0,
+    };
+    comp.data[..n].copy_from_slice(&data[..n]);
+    push_completion(comp);
+}
+
+/// Enqueue an `INET_OP_ACCEPT` completion for a TCP listener whose
+/// backlog already contained an established connection when
+/// `NET_ACCEPT_WAIT` arrived. `new_conn_id` is the child socket,
+/// `(remote_ip, remote_port)` the peer address reported to the
+/// `accept(2)` caller. Must be ordered after the VFS-side
+/// `PendingInetOp` entry registration.
+pub(crate) fn push_immediate_accept_completion(
+    listener_conn_id: u32,
+    new_conn_id: u32,
+    remote_ip: u32,
+    remote_port: u16,
+) {
+    push_completion(Completion {
+        conn_id: listener_conn_id,
+        result: TRONA_OK,
+        op_type: INET_OP_ACCEPT,
+        data: [0u8; 152],
+        data_len: 0,
+        extra_conn_id: new_conn_id,
+        extra_ip: remote_ip,
+        extra_port: remote_port,
+    });
+}
+
 pub(crate) fn pop_completion() -> Option<Completion> {
     // SAFETY: Single-threaded driver.
     unsafe {
@@ -327,19 +357,21 @@ pub(crate) fn pop_completion() -> Option<Completion> {
 // ---------------------------------------------------------------------------
 
 fn now_ns() -> u64 {
-    let mut ts = Timespec::zeroed();
-    // SAFETY: Passing valid stack pointer for clock_gettime output.
-    let _ =
-        unsafe { trona::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0) };
-    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    trona_kernel::syscall::clock_read_monotonic(trona_runtime::client::caps::clock_cap().addr())
 }
 
 fn generate_isn() -> u32 {
-    let mut buf = [0u8; 4];
-    // SAFETY: Passing valid stack buffer to GetRandom syscall.
-    let _ =
-        unsafe { trona::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 4, 0, 0, 0, 0) };
-    let rnd = u32::from_ne_bytes(buf);
+    let mut bytes = [0u8; 4];
+    let r = trona_kernel::syscall::rng_read_bytes(
+        trona_runtime::client::caps::kernel_rng_cap().addr(),
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    let rnd = if r.error == 0 && r.value == bytes.len() as u64 {
+        u32::from_le_bytes(bytes)
+    } else {
+        0
+    };
     let clock = (now_ns() / 4_000) as u32; // ~4us granularity
     rnd.wrapping_add(clock)
 }
@@ -894,14 +926,14 @@ pub(crate) fn tcp_close(conn_id: u32) -> i32 {
                 // Send FIN
                 tcb.fin_seq = tcb.snd_nxt;
                 send_tcp_segment(
-                tcb.local_ip,
-                tcb.remote_ip,
-                tcb.local_port,
-                tcb.remote_port,
-                tcb.opts.ip_ttl,
-                tcb.snd_nxt,
-                tcb.rcv_nxt,
-                tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
+                    tcb.local_ip,
+                    tcb.remote_ip,
+                    tcb.local_port,
+                    tcb.remote_port,
+                    tcb.opts.ip_ttl,
+                    tcb.snd_nxt,
+                    tcb.rcv_nxt,
+                    tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
                     tcb.rcv_wnd,
                     &[],
                 );
@@ -914,14 +946,14 @@ pub(crate) fn tcp_close(conn_id: u32) -> i32 {
                 // Send FIN
                 tcb.fin_seq = tcb.snd_nxt;
                 send_tcp_segment(
-                tcb.local_ip,
-                tcb.remote_ip,
-                tcb.local_port,
-                tcb.remote_port,
-                tcb.opts.ip_ttl,
-                tcb.snd_nxt,
-                tcb.rcv_nxt,
-                tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
+                    tcb.local_ip,
+                    tcb.remote_ip,
+                    tcb.local_port,
+                    tcb.remote_port,
+                    tcb.opts.ip_ttl,
+                    tcb.snd_nxt,
+                    tcb.rcv_nxt,
+                    tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
                     tcb.rcv_wnd,
                     &[],
                 );
@@ -1014,7 +1046,7 @@ pub(crate) fn tcp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(
         options::get_option(
             &mut tcb.opts,
             SOCK_STREAM,
-            trona::consts::posix::IPPROTO_TCP,
+            trona_protocol::posix_abi::socket::IPPROTO_TCP,
             level,
             optname,
         )
@@ -1615,8 +1647,6 @@ fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
 fn handle_fin_wait1(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
-        let tcb = &mut (*(&raw mut TCBS))[idx];
-
         if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
@@ -1671,8 +1701,6 @@ fn handle_fin_wait1(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
 fn handle_fin_wait2(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
-        let tcb = &mut (*(&raw mut TCBS))[idx];
-
         if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
@@ -1867,14 +1895,14 @@ fn process_data(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
 
         // Send ACK
         send_tcp_segment(
-                tcb.local_ip,
-                tcb.remote_ip,
-                tcb.local_port,
-                tcb.remote_port,
-                tcb.opts.ip_ttl,
-                tcb.snd_nxt,
-                tcb.rcv_nxt,
-                tcp_proto::TCP_FLAG_ACK,
+            tcb.local_ip,
+            tcb.remote_ip,
+            tcb.local_port,
+            tcb.remote_port,
+            tcb.opts.ip_ttl,
+            tcb.snd_nxt,
+            tcb.rcv_nxt,
+            tcp_proto::TCP_FLAG_ACK,
             tcb.rcv_wnd,
             &[],
         );

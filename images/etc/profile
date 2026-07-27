@@ -1,7 +1,7 @@
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export HOME="${HOME:-/root}"
 export TERM="${TERM:-vt100}"
-export SHELL="${SHELL:-/bin/bash}"
+export SHELL="${SHELL:-/usr/bin/bash}"
 
 umask 022
 

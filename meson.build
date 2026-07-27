@@ -39,10 +39,12 @@ nasm = find_program('nasm', required: build_boot)
 # Binary tools
 objcopy = find_program('llvm-objcopy', required: build_boot)
 lld_link = find_program('lld-link', required: build_boot)
+llvm_ar = find_program('llvm-ar', required: build_userland)
 llvm_strip = find_program('llvm-strip', required: false)
 if not llvm_strip.found()
   llvm_strip = find_program('strip', required: build_userland)
 endif
+py_prog = find_program('python3', required: build_kernel or build_userland)
 
 # Rust: must be nightly (required for building core library)
 rustc = find_program('rustc', required: build_kernel or build_userland)
@@ -158,6 +160,8 @@ rust_kernel_args = [
   '--target=' + rust_kernel_target,
   '-C', 'panic=abort',
   '-C', 'opt-level=2',
+  '-C', 'force-frame-pointers=yes',
+  '-C', 'force-unwind-tables=yes',
 ]
 if get_option('debug_symbols')
   rust_kernel_args += ['-C', 'debuginfo=2']
@@ -170,13 +174,14 @@ endif
 # Subdirectories
 # =============================================================================
 
-if build_boot
-  subdir('boot')
+# UAPI bindings — bindgen runs once and exposes uapi_bindgen_rs to
+# kernite (kernel rmeta) and lib/trona (userland + PE rmeta).
+if build_kernel or build_userland
+  subdir('kernite/include/uapi')
 endif
 
-if build_kernel or build_userland
-  # Build core library and compiler_builtins (shared by kernel and userland)
-  subdir('rust')
+if build_boot
+  subdir('boot')
 endif
 
 if build_kernel
@@ -246,13 +251,13 @@ if build_userland and mkcpio.found()
   )
   initrd_rtld_so = custom_target('initrd_rtld_so',
     input: ld_trona_so,
-    output: 'ld-trona.initrd.so',
+    output: 'ldtrona-elf.initrd.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
   initrd_pe_rtld_so = custom_target('initrd_pe_rtld_so',
     input: ld_trona_pe_so,
-    output: 'ld-trona-pe.initrd.so',
+    output: 'ldtrona-pe.initrd.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -283,12 +288,6 @@ if build_userland and mkcpio.found()
   initrd_namesrv_elf = custom_target('initrd_namesrv_elf',
     input: namesrv_elf,
     output: 'namesrv.initrd.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
-  initrd_procmgr_elf = custom_target('initrd_procmgr_elf',
-    input: procmgr_elf,
-    output: 'procmgr.initrd.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -367,6 +366,18 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_logsrv_elf = custom_target('initrd_logsrv_elf',
+    input: logsrv_elf,
+    output: 'logsrv.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_ldsrv_elf = custom_target('initrd_ldsrv_elf',
+    input: ldsrv_elf,
+    output: 'ldsrv.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
   initrd_pcidrv_elf = custom_target('initrd_pcidrv_elf',
     input: pcidrv_elf,
     output: 'pcidrv.initrd.elf',
@@ -415,10 +426,10 @@ if build_userland and mkcpio.found()
   svc_namesrv = files('userland/services/namesrv.service')
   svc_mmsrv = files('userland/services/mmsrv.service')
   svc_rsrcsrv = files('userland/services/rsrcsrv.service')
+  svc_logsrv = files('userland/services/logsrv.service')
+  svc_ldsrv = files('userland/services/ldsrv.service')
   svc_rsrcsrv_target = files('userland/services/rsrcsrv.target')
   svc_vfs = files('userland/services/vfs.service')
-  svc_procmgr = files('userland/services/procmgr.service')
-  svc_procmgr_target = files('userland/services/procmgr.target')
   svc_dispdrv = files('userland/services/dispdrv.service')
   svc_posix_ttysrv = files('userland/services/posix_ttysrv.service')
   svc_test_runner = files('userland/services/test_runner.service')
@@ -441,16 +452,16 @@ if build_userland and mkcpio.found()
     input: [initrd_rtld_so, initrd_pe_rtld_so, initrd_libtrona_so, initrd_libc_so,
           initrd_libcxx_so, initrd_kernel32_dll,
           initrd_init_elf, initrd_console_elf, initrd_namesrv_elf,
-          initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
-          initrd_rsrcsrv_elf,
+          initrd_vfs_elf, initrd_mmsrv_elf,
+          initrd_rsrcsrv_elf, initrd_logsrv_elf, initrd_ldsrv_elf,
           initrd_pcidrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
           initrd_win32_csrss_elf,
           stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
           stripped_test_runner_elf, stripped_netdrv_elf, stripped_netsrv_elf,
           stripped_dnssrv_elf, stripped_hello_pe_exe],
     depend_files: [mkcpio_script, initramfs_manifest,
-          svc_console, svc_namesrv, svc_mmsrv, svc_rsrcsrv, svc_rsrcsrv_target,
-          svc_vfs, svc_procmgr, svc_procmgr_target, svc_dispdrv,
+          svc_console, svc_namesrv, svc_mmsrv, svc_rsrcsrv, svc_logsrv, svc_ldsrv, svc_rsrcsrv_target,
+          svc_vfs, svc_dispdrv,
           svc_posix_ttysrv, svc_test_runner, svc_posix_getty,
           svc_pcidrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
           svc_dnssrv, svc_win32_csrss, svc_hello_pe],
@@ -487,13 +498,13 @@ if mkrootfs.found() and build_userland
   # Stripped shared libraries for rootfs (separate from initrd targets)
   rootfs_rtld_so = custom_target('rootfs_rtld_so',
     input: ld_trona_so,
-    output: 'ld-trona.rootfs.so',
+    output: 'ldtrona-elf.rootfs.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: false,
   )
   rootfs_pe_rtld_so = custom_target('rootfs_pe_rtld_so',
     input: ld_trona_pe_so,
-    output: 'ld-trona-pe.rootfs.so',
+    output: 'ldtrona-pe.rootfs.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: false,
   )
@@ -532,11 +543,11 @@ if mkrootfs.found() and build_userland
             stripped_vfs_stress_elf, stripped_vfs_stress_pe_exe,
             stripped_console_stress_pe_exe],
     output: 'rootfs-binaries.manifest',
-    command: [find_program('python3'), '-c',
+    command: [py_prog, '-c',
       'import sys; f=open(sys.argv[1],"w"); [f.write(e+chr(10)) for e in sys.argv[2:]]',
       '@OUTPUT@',
-      '/lib/ld-trona.so=@INPUT0@',
-      '/lib/ld-trona-pe.so=@INPUT1@',
+      '/lib/ldtrona-elf.so=@INPUT0@',
+      '/lib/ldtrona-pe.so=@INPUT1@',
       '/lib/libtrona.so=@INPUT2@',
       '/lib/libc.so=@INPUT3@',
       '/lib/libc++.so=@INPUT4@',

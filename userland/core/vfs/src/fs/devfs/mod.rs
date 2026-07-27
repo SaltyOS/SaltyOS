@@ -1,28 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! devfs — device filesystem backed by a static registration table.
+//
+//! devfs — synthetic device filesystem.
 //!
-//! devfs presents character-device nodes (`/dev/console`, `/dev/null`,
-//! `/dev/zero`, `/dev/urandom`, `/dev/fb0`, `/dev/ptmx`, `/dev/tty`) and a dynamic
-//! `pts/` subdirectory for allocated PTY slaves.
+//! Presents the canonical `/dev/console`, `/dev/null`, `/dev/zero`,
+//! `/dev/urandom`, `/dev/fb0`, `/dev/ptmx`, `/dev/tty` device nodes
+//! plus a synthetic `pts/` subdirectory for posix_ttysrv-allocated
+//! PTY slaves.
 //!
-//! The filesystem is read-only in terms of namespace mutation: `create`,
-//! `mkdir`, `unlink`, `rmdir`, `rename` all return `NotSupported`. The
-//! `open` / `read` / `write` ops dispatch per-device I/O (serial IPC for
-//! console, CSPRNG for urandom, posix_ttysrv IPC for PTY, etc.).
+//! Read-only namespace — `create` / `mkdir` / `unlink` / `rmdir`
+//! / `rename` all return `NotSup`. The `read` / `write` / `ioctl`
+//! ops dispatch per-device IO (serial IPC for the console, `KernelRng`
+//! for `urandom`, posix_ttysrv IPC for PTY paths once that lands).
 
 mod vfsops;
 mod vops;
 
-use crate::vfs_core::error::VfsResult;
-use crate::vfs_core::vfs::{register_fs_type, VfsOps};
-use crate::vfs_core::vnode::VnodeHandle;
-use crate::vfs_core::vop::VopVector;
+use crate::core::vnode::VnodeHandle;
+use crate::core::vop::{
+    DATA_OPS_DEFAULT, META_OPS_DEFAULT, VfsOps, VopDataOps, VopMetaOps, VopVector,
+};
 
 // =========================================================================
 // DevKind — device type discriminator
 // =========================================================================
 
-/// Identifies the device backing a devfs vnode.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DevKind {
@@ -36,7 +37,7 @@ pub(crate) enum DevKind {
     Tty = 6,
     /// A specific PTY slave device (`/dev/pts/N`).
     PtySlave = 7,
-    /// The `/dev/pts` directory itself (synthetic container).
+    /// The `/dev/pts` directory itself.
     PtsDir = 8,
 }
 
@@ -44,15 +45,12 @@ pub(crate) enum DevKind {
 // Static device registration table
 // =========================================================================
 
-/// One entry in the static device registration table.
 pub(crate) struct DevfsRegistration {
     pub(crate) name: &'static [u8],
     pub(crate) kind: DevKind,
     pub(crate) mode: u32,
 }
 
-/// Static table of device nodes that devfs exposes at the top level.
-/// The `pts` subdirectory is handled specially in `lookup` / `readdir`.
 pub(crate) static DEVFS_REGISTRATIONS: &[DevfsRegistration] = &[
     DevfsRegistration {
         name: b"console",
@@ -95,103 +93,109 @@ pub(crate) static DEVFS_REGISTRATIONS: &[DevfsRegistration] = &[
 // DevfsVnodeData — per-vnode backend data
 // =========================================================================
 
-/// Backend-private data hung off `Vnode.data` for devfs vnodes.
 #[repr(C)]
 pub(crate) struct DevfsVnodeData {
     pub(crate) kind: DevKind,
     /// PTY slave index for `PtySlave` nodes; unused otherwise.
     pub(crate) sub_id: u32,
-    /// POSIX mode bits (type + permission).
+    /// POSIX mode bits.
     pub(crate) mode: u32,
+    /// PTY generation captured at lookup; passed back on slave
+    /// open so posix_ttysrv can reject opens against a slot that
+    /// has been recycled. Future PTY-routing path consumes this.
+    pub(crate) generation: u32,
 }
 
 // =========================================================================
 // DevfsMountData — per-mount backend data
 // =========================================================================
 
-/// Maximum number of vnodes managed by a single devfs mount.
-///
-/// `DEVFS_REGISTRATIONS.len()` static devices + 1 root dir + 1 pts dir
-/// + dynamic PTY slave entries.
+/// `DEVFS_REGISTRATIONS.len()` static devices + 1 root + 1 pts
+/// dir + dynamic PTY slave entries.
 pub(super) const MAX_DEVFS_VNODES: usize = 32;
 
-/// Per-mount state for devfs.
 #[repr(C)]
 pub(crate) struct DevfsMountData {
-    /// Parallel array: arena handles for tracked vnodes.
     pub(crate) vnode_handles: [VnodeHandle; MAX_DEVFS_VNODES],
-    /// Parallel array: vnode ids for tracked vnodes.
     pub(crate) vnode_ids: [u64; MAX_DEVFS_VNODES],
-    /// Parallel array of vnode-private data.
     pub(crate) vdata: [DevfsVnodeData; MAX_DEVFS_VNODES],
-    /// Number of vnodes currently populated (next allocation index).
     pub(crate) count: usize,
 }
 
-// DevfsMountData is allocated via map_anon + write_bytes (zero-init).
-// VnodeHandle zero = Handle { slot: 0, gen: 0 } which passes is_valid()
-// but the count field gates iteration so only populated entries are accessed.
-
 // =========================================================================
-// Vdata allocator and vnode tracker
+// Vdata allocator
 // =========================================================================
 
-/// Allocate a vnode-data slot from the devfs mount data pool.
-///
-/// Returns a pointer to the allocated `DevfsVnodeData`, or null if
-/// the pool is full. The caller initializes the slot.
-///
-/// # Safety
-///
-/// `mount_data` must point to a valid `DevfsMountData`.
 pub(super) unsafe fn alloc_vdata(mount_data: *mut u8) -> *mut DevfsVnodeData {
     unsafe {
         let md = mount_data as *mut DevfsMountData;
         if (*md).count >= MAX_DEVFS_VNODES {
-            return core::ptr::null_mut();
+            return ::core::ptr::null_mut();
         }
         let idx = (*md).count;
-        // count is incremented by record_vnode after handle is known.
+        // record_vnode bumps `count`; at this point we hand out
+        // the slot pointer for the caller to fill.
         &raw mut (*md).vdata[idx]
     }
 }
 
-/// Record a vnode handle and id in the parallel tracking arrays.
-///
-/// Must be called after `alloc_vdata` for the same slot index (count).
-///
-/// # Safety
-///
-/// `mount_data` must point to a valid `DevfsMountData`. Must be called
-/// exactly once per `alloc_vdata` call, before another `alloc_vdata`.
-pub(super) unsafe fn record_vnode(mount_data: *mut u8, vh: VnodeHandle, id: u64) {
+pub(super) unsafe fn record_vnode(mount_data: *mut u8, vnode_h: VnodeHandle, id: u64) {
     unsafe {
         let md = mount_data as *mut DevfsMountData;
         let idx = (*md).count;
-        (*md).vnode_handles[idx] = vh;
+        (*md).vnode_handles[idx] = vnode_h;
         (*md).vnode_ids[idx] = id;
-        (*md).count += 1;
+        (*md).count = idx + 1;
     }
 }
 
 // =========================================================================
-// Static VfsOps / VopVector
+// Static dispatch tables
 // =========================================================================
 
-pub(crate) static DEVFS_VFSOPS: VfsOps = vfsops::DEVFS_VFSOPS;
-pub(crate) static DEVFS_VOPS: VopVector = vops::DEVFS_VOPS;
+pub(crate) static DEVFS_VOPS: VopVector = VopVector {
+    meta: VopMetaOps {
+        lookup: vops::devfs_lookup,
+        lookup_ci: vops::devfs_lookup,
+        create: META_OPS_DEFAULT.create,
+        mkdir: META_OPS_DEFAULT.mkdir,
+        symlink: META_OPS_DEFAULT.symlink,
+        mkfifo: META_OPS_DEFAULT.mkfifo,
+        unlink: META_OPS_DEFAULT.unlink,
+        rmdir: META_OPS_DEFAULT.rmdir,
+        link: META_OPS_DEFAULT.link,
+        rename: META_OPS_DEFAULT.rename,
+        open: vops::devfs_open,
+        close: vops::devfs_close,
+        getattr: vops::devfs_getattr,
+        setattr: META_OPS_DEFAULT.setattr,
+        access: vops::devfs_access,
+        readlink: META_OPS_DEFAULT.readlink,
+        truncate: META_OPS_DEFAULT.truncate,
+        data_size: META_OPS_DEFAULT.data_size,
+        inactive: vops::devfs_inactive,
+    },
+    data: VopDataOps {
+        read: vops::devfs_read,
+        write: vops::devfs_write,
+        writeback: vops::devfs_write,
+        fsync: DATA_OPS_DEFAULT.fsync,
+        readdir: vops::devfs_readdir,
+        statfs: vops::devfs_statfs,
+        getxattr: DATA_OPS_DEFAULT.getxattr,
+        setxattr: DATA_OPS_DEFAULT.setxattr,
+        listxattr: DATA_OPS_DEFAULT.listxattr,
+        removexattr: DATA_OPS_DEFAULT.removexattr,
+        ioctl: vops::devfs_ioctl,
+        mmap_get_page: DATA_OPS_DEFAULT.mmap_get_page,
+    },
+};
 
-// =========================================================================
-// Registration
-// =========================================================================
-
-/// Register the `devfs` filesystem type. Called during VFS bootstrap Stage 2.
-pub(crate) unsafe fn register() -> VfsResult<()> {
-    unsafe {
-        register_fs_type(
-            b"devfs",
-            &raw const DEVFS_VFSOPS,
-            &raw const DEVFS_VOPS,
-        )
-    }
-}
+pub(crate) static DEVFS_VFSOPS: VfsOps = VfsOps {
+    mount: vfsops::devfs_mount,
+    unmount: vfsops::devfs_unmount,
+    root: vfsops::devfs_root,
+    vget: vfsops::devfs_vget,
+    statfs: vfsops::devfs_statfs,
+    sync: vfsops::devfs_sync,
+};

@@ -2,29 +2,25 @@
 //! Moved from crate root module for POSIX subsystem separation.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::TronaMsg;
+use trona_kernel::core_types::TronaMsg;
 
-use crate::base::proc_table::{find_by_badge, proctab, proctab_cap, ProcessState};
+use crate::base::proc_table::{ProcessState, find_by_badge, proctab, proctab_cap};
 
 const ITIMER_REAL: u64 = 0;
 const USEC_PER_SEC: u64 = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 fn clock_realtime_ns() -> u64 {
-    let now = trona::syscall::syscall(
-        trona::SYS_CLOCK_GETTIME,
-        trona::consts::CLOCK_REALTIME as u64,
+    let now = trona_kernel::syscall::syscall(
+        uapi::KERNITE_SYS_CLOCK_GETTIME,
+        trona_runtime::core::server_consts::CLOCK_REALTIME as u64,
         0,
         0,
         0,
         0,
         0,
     );
-    if now.error == 0 {
-        now.value
-    } else {
-        0
-    }
+    if now.error == 0 { now.value } else { 0 }
 }
 
 fn timeval_to_ns(sec: u64, usec: u64) -> Option<u64> {
@@ -58,7 +54,9 @@ pub(crate) fn has_pending_timers() -> bool {
     unsafe {
         for i in 0..proctab_cap() {
             let p = proctab(i);
-            if (p.state == ProcessState::Running || p.state == ProcessState::Stopped) && p.timer_deadline_ns != 0 {
+            if (p.state == ProcessState::Running || p.state == ProcessState::Stopped)
+                && p.timer_deadline_ns != 0
+            {
                 return true;
             }
         }

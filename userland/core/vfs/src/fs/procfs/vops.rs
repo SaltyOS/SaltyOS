@@ -1,42 +1,48 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! procfs `VopVector` — per-vnode operations for the process information filesystem.
 //!
-//! All content is generated dynamically from IPC queries to procmgr and netsrv.
-//! Every non-root vnode carries `VN_NOCACHE` and is reclaimed after last close.
+//! All content is generated dynamically from IPC queries to init server and
+//! netsrv. Every non-root vnode carries `VN_NOCACHE` and is reclaimed after
+//! last close.
 
+use crate::core::cred::VfsCred;
+use crate::core::error::VfsError;
+use crate::core::file::{MODE_TYPE_DIR, MODE_TYPE_LNK, MODE_TYPE_REG};
+use crate::core::file::{VAttr, VStatfs};
+use crate::core::identity::{BackendNodeId, VnodeKey};
+use crate::core::outcome::{Parked, Ready, VopOutcome};
+use crate::core::vnode::{VN_NOCACHE, VnodeHandle, VnodeKind};
+use crate::core::vop::{
+    DATA_OPS_DEFAULT, META_OPS_DEFAULT, ReaddirEmit, VopDataOps, VopMetaOps, VopVector,
+};
+use crate::core::vop_context::{OwnerVopCtx, VopDataCtx};
 use crate::server::consts::MAX_PATH_LEN;
-use crate::personality::posix::consts::{S_IFDIR_L, S_IFLNK_L, S_IFREG_L};
-use crate::vfs_core::cred::VfsCred;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::{VAttr, VStatfs};
-use crate::vfs_core::vnode::{VnodeHandle, VN_NOCACHE, VT_DIR, VT_LNK, VT_REG};
-use crate::vfs_core::vop::{
-    ReaddirEmit, VopDataOps, VopMetaOps, VopVector, DATA_OPS_DEFAULT, META_OPS_DEFAULT,
-};
-use crate::vfs_core::vop_context::{VopContext, VopDataContext};
 
-use super::generators::{fmt_u32, parse_pid};
-use super::net::{proc_gen_arp, proc_gen_net_dev, proc_gen_route};
+use super::generators::parse_pid;
+use super::net::{
+    proc_gen_arp, proc_gen_hosts, proc_gen_net_dev, proc_gen_resolv_conf, proc_gen_route,
+};
 use super::pid::{
-    proc_gen_cmdline, proc_gen_comm, proc_gen_maps, proc_gen_stat,
-    proc_gen_status, proc_get_exe_path, proc_list_pids, proc_pid_exists,
+    proc_gen_cgroup, proc_gen_io, proc_gen_maps, proc_gen_oom_score, proc_gen_reservations,
+    proc_gen_smaps, proc_gen_statm, proc_pid_exists,
 };
-use super::{alloc_vdata, encode_id, encode_sys_id, ProcfsKind, ProcfsVnodeData};
+use super::{
+    ProcfsKind, ProcfsVnodeData, alloc_vdata, encode_id, encode_sys_dynleaf_id, encode_sys_id,
+};
+use crate::fs::sysctlfs::tree::{SysctlCtx, SysctlOutcome};
 
-/// Content generation buffer size.
 const PROC_TEXT_BUF_SIZE: usize = 2048;
-
-// =========================================================================
-// Helpers
-// =========================================================================
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
 
 #[inline]
-unsafe fn vdata(ctx: &VopContext) -> *mut ProcfsVnodeData {
+unsafe fn vdata(ctx: &OwnerVopCtx<'_>) -> *mut ProcfsVnodeData {
     ctx.data as *mut ProcfsVnodeData
 }
 
 #[inline]
-unsafe fn vdata_d(ctx: &VopDataContext) -> *mut ProcfsVnodeData {
+unsafe fn vdata_d(ctx: &VopDataCtx) -> *mut ProcfsVnodeData {
     ctx.data as *mut ProcfsVnodeData
 }
 
@@ -53,194 +59,253 @@ fn name_eq(a: *const u8, a_len: u8, b: &[u8]) -> bool {
     true
 }
 
-/// Allocate an ephemeral procfs vnode via the arena trampoline.
-///
-/// Sets up the vnode fields and allocates a vdata slot from the mount pool.
-/// Returns the new VnodeHandle, or an error if allocation fails.
 unsafe fn alloc_procfs_vnode(
-    ctx: &VopContext,
-    vtype: u8,
-    kind: ProcfsKind,
+    ctx: &mut OwnerVopCtx<'_>,
+    kind: VnodeKind,
+    pkind: ProcfsKind,
     pid: u32,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*vp).vtype = vtype;
-        (*vp).flags = VN_NOCACHE;
-        (*vp).id = encode_id(kind, pid);
-        (*vp).mount = ctx.mount_handle;
-        (*vp).ops = (*ctx.vnode).ops;
-        (*vp).nlink = 1;
+        let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_instance_id = (*ctx.mount).fs_instance_id;
+        (*vnode_ptr).kind = kind;
+        (*vnode_ptr).flags = VN_NOCACHE;
+        (*vnode_ptr).key = VnodeKey {
+            fs_instance_id,
+            backend_id: BackendNodeId::new(encode_id(pkind, pid), 0),
+        };
+        (*vnode_ptr).backend_seq = 0;
+        (*vnode_ptr).mount = ctx.mount_handle;
+        (*vnode_ptr).fs_instance_id = fs_instance_id;
+        (*vnode_ptr).ops = (*ctx.vnode).ops;
+        (*vnode_ptr).nlink = 1;
 
-        let vd = alloc_vdata(ctx.mount_data);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = alloc_vdata(ctx.mount_data);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
-        (*vd).kind = kind;
-        (*vd).pid = pid;
-        (*vd).sys_ptr = core::ptr::null();
-        (*vp).data = vd as *mut u8;
+        (*vdata).kind = pkind;
+        (*vdata).pid = pid;
+        (*vdata).sys_ptr = ::core::ptr::null();
+        (*vdata).dyn_name = [0; 32];
+        (*vdata).dyn_name_len = 0;
+        (*vnode_ptr).data = vdata as *mut u8;
 
-        Ok(vh)
+        Ok(Ready(vnode_h))
     }
 }
 
-/// Allocate an ephemeral procfs vnode with a sys_ptr (SysDir/SysLeaf).
 unsafe fn alloc_procfs_sys_vnode(
-    ctx: &VopContext,
-    vtype: u8,
-    kind: ProcfsKind,
+    ctx: &mut OwnerVopCtx<'_>,
+    kind: VnodeKind,
+    pkind: ProcfsKind,
     sys_ptr: *const u8,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let (vh, vp) = (ctx.alloc)().ok_or(VfsError::NoSpace)?;
-        (*vp).vtype = vtype;
-        (*vp).flags = VN_NOCACHE;
-        (*vp).id = encode_sys_id(kind, sys_ptr);
-        (*vp).mount = ctx.mount_handle;
-        (*vp).ops = (*ctx.vnode).ops;
-        (*vp).nlink = if vtype == VT_DIR { 2 } else { 1 };
+        let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        let fs_instance_id = (*ctx.mount).fs_instance_id;
+        (*vnode_ptr).kind = kind;
+        (*vnode_ptr).flags = VN_NOCACHE;
+        (*vnode_ptr).key = VnodeKey {
+            fs_instance_id,
+            backend_id: BackendNodeId::new(encode_sys_id(pkind, sys_ptr), 0),
+        };
+        (*vnode_ptr).backend_seq = 0;
+        (*vnode_ptr).mount = ctx.mount_handle;
+        (*vnode_ptr).fs_instance_id = fs_instance_id;
+        (*vnode_ptr).ops = (*ctx.vnode).ops;
+        (*vnode_ptr).nlink = if matches!(kind, VnodeKind::Directory) {
+            2
+        } else {
+            1
+        };
 
-        let vd = alloc_vdata(ctx.mount_data);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = alloc_vdata(ctx.mount_data);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
-        (*vd).kind = kind;
-        (*vd).pid = 0;
-        (*vd).sys_ptr = sys_ptr;
-        (*vp).data = vd as *mut u8;
+        (*vdata).kind = pkind;
+        (*vdata).pid = 0;
+        (*vdata).sys_ptr = sys_ptr;
+        (*vdata).dyn_name = [0; 32];
+        (*vdata).dyn_name_len = 0;
+        (*vnode_ptr).data = vdata as *mut u8;
 
-        Ok(vh)
+        Ok(Ready(vnode_h))
     }
 }
 
-// =========================================================================
-// MetaOps — Lookup
-// =========================================================================
-
-/// Look up a child by name in a procfs directory vnode.
-///
-/// - Root directory: "self" (SelfLink), "net" (NetDir), "sys" (SysDir), numeric PID (PidDir).
-/// - PidDir: "stat", "status", "maps", "exe", "cmdline", "comm".
-/// - NetDir: "route", "arp", "dev".
-/// - SysDir: delegates to sysctlfs MIB tree (child nodes + leaves).
 unsafe fn procfs_lookup(
-    ctx: &VopContext,
+    ctx: &mut OwnerVopCtx<'_>,
     name: *const u8,
     name_len: u8,
-) -> VfsResult<VnodeHandle> {
+) -> VopOutcome<VnodeHandle> {
     unsafe {
-        let dvd = vdata(ctx);
+        let dir_vdata = vdata(ctx);
 
-        // "." — self reference.
         if name_len == 1 && *name == b'.' {
-            return Ok(ctx.handle);
+            return Ok(Ready(ctx.handle));
         }
 
-        // ".." — parent. Root's parent is itself (mount layer handles cross-mount).
         if name_len == 2 && *name == b'.' && *name.add(1) == b'.' {
-            match (*dvd).kind {
-                ProcfsKind::PidDir | ProcfsKind::NetDir | ProcfsKind::SysDir => {
-                    let root_vh = (*ctx.mount).root_vnode;
+            match (*dir_vdata).kind {
+                ProcfsKind::PidDir
+                | ProcfsKind::NetDir
+                | ProcfsKind::SysDir
+                | ProcfsKind::SysDynDir => {
+                    let root_vh = (*ctx.mount).root;
                     if root_vh.is_valid() {
-                        return Ok(root_vh);
+                        return Ok(Ready(root_vh));
                     }
-                    return Ok(ctx.handle);
+                    return Ok(Ready(ctx.handle));
                 }
                 _ => {
-                    return Ok(ctx.handle);
+                    return Ok(Ready(ctx.handle));
                 }
             }
         }
 
-        match (*dvd).kind {
+        match (*dir_vdata).kind {
             ProcfsKind::Root => {
-                // "self" → SelfLink
                 if name_eq(name, name_len, b"self") {
-                    return alloc_procfs_vnode(ctx, VT_LNK, ProcfsKind::SelfLink, 0);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Symlink, ProcfsKind::SelfLink, 0);
                 }
 
-                // "net" → NetDir
                 if name_eq(name, name_len, b"net") {
-                    let vh = alloc_procfs_vnode(ctx, VT_DIR, ProcfsKind::NetDir, 0)?;
-                    return Ok(vh);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Directory, ProcfsKind::NetDir, 0);
                 }
 
-                // "sys" → SysDir (Linux compat, delegates to sysctlfs MIB root)
                 if name_eq(name, name_len, b"sys") {
                     let root_ptr = &raw const crate::fs::sysctlfs::tree::MIB_ROOT;
                     return alloc_procfs_sys_vnode(
                         ctx,
-                        VT_DIR,
+                        VnodeKind::Directory,
                         ProcfsKind::SysDir,
                         root_ptr as *const u8,
                     );
                 }
 
-                // Numeric PID → PidDir (validate via procmgr IPC).
-                let pid_slice = core::slice::from_raw_parts(name, name_len as usize);
+                if name_eq(name, name_len, b"stat") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::SysStat, 0);
+                }
+                if name_eq(name, name_len, b"meminfo") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::SysMeminfo, 0);
+                }
+                if name_eq(name, name_len, b"uptime") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::SysUptime, 0);
+                }
+                if name_eq(name, name_len, b"cpuinfo") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::SysCpuinfo, 0);
+                }
+                if name_eq(name, name_len, b"loadavg") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::SysLoadavg, 0);
+                }
+
+                let pid_slice = ::core::slice::from_raw_parts(name, name_len as usize);
                 let (pid, ok) = parse_pid(pid_slice);
                 if !ok {
-                    return Ok(VnodeHandle::INVALID);
+                    return Ok(Ready(VnodeHandle::INVALID));
                 }
 
                 if !proc_pid_exists(pid) {
-                    return Ok(VnodeHandle::INVALID);
+                    return Ok(Ready(VnodeHandle::INVALID));
                 }
 
-                alloc_procfs_vnode(ctx, VT_DIR, ProcfsKind::PidDir, pid)
+                alloc_procfs_vnode(ctx, VnodeKind::Directory, ProcfsKind::PidDir, pid)
             }
 
             ProcfsKind::PidDir => {
-                let pid = (*dvd).pid;
+                let pid = (*dir_vdata).pid;
 
                 if name_eq(name, name_len, b"stat") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::PidStat, pid);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidStat, pid);
                 }
                 if name_eq(name, name_len, b"status") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::PidStatus, pid);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidStatus, pid);
                 }
                 if name_eq(name, name_len, b"maps") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::PidMaps, pid);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidMaps, pid);
                 }
                 if name_eq(name, name_len, b"exe") {
-                    return alloc_procfs_vnode(ctx, VT_LNK, ProcfsKind::PidExe, pid);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Symlink, ProcfsKind::PidExe, pid);
                 }
                 if name_eq(name, name_len, b"cmdline") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::PidCmdline, pid);
+                    return alloc_procfs_vnode(
+                        ctx,
+                        VnodeKind::Regular,
+                        ProcfsKind::PidCmdline,
+                        pid,
+                    );
                 }
                 if name_eq(name, name_len, b"comm") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::PidComm, pid);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidComm, pid);
+                }
+                if name_eq(name, name_len, b"statm") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidStatm, pid);
+                }
+                if name_eq(name, name_len, b"io") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidIo, pid);
+                }
+                if name_eq(name, name_len, b"smaps") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidSmaps, pid);
+                }
+                if name_eq(name, name_len, b"cgroup") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::PidCgroup, pid);
+                }
+                if name_eq(name, name_len, b"reservations") {
+                    return alloc_procfs_vnode(
+                        ctx,
+                        VnodeKind::Regular,
+                        ProcfsKind::PidReservations,
+                        pid,
+                    );
+                }
+                if name_eq(name, name_len, b"oom_score") {
+                    return alloc_procfs_vnode(
+                        ctx,
+                        VnodeKind::Regular,
+                        ProcfsKind::PidOomScore,
+                        pid,
+                    );
                 }
 
-                Ok(VnodeHandle::INVALID)
+                Ok(Ready(VnodeHandle::INVALID))
             }
 
             ProcfsKind::NetDir => {
                 if name_eq(name, name_len, b"route") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::NetRoute, 0);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::NetRoute, 0);
                 }
                 if name_eq(name, name_len, b"arp") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::NetArp, 0);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::NetArp, 0);
                 }
                 if name_eq(name, name_len, b"dev") {
-                    return alloc_procfs_vnode(ctx, VT_REG, ProcfsKind::NetDev, 0);
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::NetDev, 0);
+                }
+                if name_eq(name, name_len, b"hosts") {
+                    return alloc_procfs_vnode(ctx, VnodeKind::Regular, ProcfsKind::NetHosts, 0);
+                }
+                if name_eq(name, name_len, b"resolv.conf") {
+                    return alloc_procfs_vnode(
+                        ctx,
+                        VnodeKind::Regular,
+                        ProcfsKind::NetResolvConf,
+                        0,
+                    );
                 }
 
-                Ok(VnodeHandle::INVALID)
+                Ok(Ready(VnodeHandle::INVALID))
             }
 
             ProcfsKind::SysDir => {
-                // /proc/sys/ delegation: look up child in the sysctlfs MIB tree.
-                let node_ptr = (*dvd).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlNode;
+                let node_ptr = (*dir_vdata).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlNode;
                 if node_ptr.is_null() {
-                    return Ok(VnodeHandle::INVALID);
+                    return Ok(Ready(VnodeHandle::INVALID));
                 }
 
-                // Linux → FreeBSD namespace mapping: "kernel" → "kern".
                 let mapped_name: &[u8];
                 let mut name_buf_storage = [0u8; 32];
-                let name_slice = core::slice::from_raw_parts(name, name_len as usize);
+                let name_slice = ::core::slice::from_raw_parts(name, name_len as usize);
                 if name_slice == b"kernel" {
                     mapped_name = b"kern";
                 } else {
@@ -249,33 +314,80 @@ unsafe fn procfs_lookup(
                         name_buf_storage[..len].copy_from_slice(name_slice);
                         mapped_name = &name_buf_storage[..len];
                     } else {
-                        return Ok(VnodeHandle::INVALID);
+                        return Ok(Ready(VnodeHandle::INVALID));
                     }
                 }
 
                 let node = &*node_ptr;
 
-                // Try child node first (sub-directory).
                 if let Some(child) = node.find_child_node(mapped_name) {
                     return alloc_procfs_sys_vnode(
                         ctx,
-                        VT_DIR,
+                        VnodeKind::Directory,
                         ProcfsKind::SysDir,
                         child as *const _ as *const u8,
                     );
                 }
 
-                // Try leaf (regular file).
                 if let Some(leaf) = node.find_leaf(mapped_name) {
                     return alloc_procfs_sys_vnode(
                         ctx,
-                        VT_REG,
+                        VnodeKind::Regular,
                         ProcfsKind::SysLeaf,
                         leaf as *const _ as *const u8,
                     );
                 }
 
-                Ok(VnodeHandle::INVALID)
+                if let Some(dyn_dir) = node.find_dynamic(mapped_name) {
+                    return alloc_procfs_sys_vnode(
+                        ctx,
+                        VnodeKind::Directory,
+                        ProcfsKind::SysDynDir,
+                        dyn_dir as *const _ as *const u8,
+                    );
+                }
+
+                Ok(Ready(VnodeHandle::INVALID))
+            }
+
+            ProcfsKind::SysDynDir => {
+                let dyn_ptr = (*dir_vdata).sys_ptr as *const crate::fs::sysctlfs::tree::DynamicDir;
+                if dyn_ptr.is_null() {
+                    return Ok(Ready(VnodeHandle::INVALID));
+                }
+                let name_slice = ::core::slice::from_raw_parts(name, name_len as usize);
+                // Create the dyn leaf optimistically — existence + content
+                // resolve in the parked `read` (the `kern.proc.*` provider
+                // parks on init), so lookup must not call the provider here
+                // (that would block the reactor on init).
+                let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+                let fs_instance_id = (*ctx.mount).fs_instance_id;
+                (*vnode_ptr).kind = VnodeKind::Regular;
+                (*vnode_ptr).flags = VN_NOCACHE;
+                (*vnode_ptr).key = VnodeKey {
+                    fs_instance_id,
+                    backend_id: BackendNodeId::new(
+                        encode_sys_dynleaf_id((*dir_vdata).sys_ptr, name_slice),
+                        0,
+                    ),
+                };
+                (*vnode_ptr).backend_seq = 0;
+                (*vnode_ptr).mount = ctx.mount_handle;
+                (*vnode_ptr).fs_instance_id = fs_instance_id;
+                (*vnode_ptr).ops = (*ctx.vnode).ops;
+                (*vnode_ptr).nlink = 1;
+                let vdata = alloc_vdata(ctx.mount_data);
+                if vdata.is_null() {
+                    return Err(VfsError::NoMem);
+                }
+                (*vdata).kind = ProcfsKind::SysDynLeaf;
+                (*vdata).pid = 0;
+                (*vdata).sys_ptr = (*dir_vdata).sys_ptr;
+                let copy_len = (name_len as usize).min(32);
+                ::core::ptr::copy_nonoverlapping(name, (*vdata).dyn_name.as_mut_ptr(), copy_len);
+                (*vdata).dyn_name_len = copy_len as u8;
+                (*vnode_ptr).data = vdata as *mut u8;
+                Ok(Ready(vnode_h))
             }
 
             _ => Err(VfsError::NotDir),
@@ -283,34 +395,36 @@ unsafe fn procfs_lookup(
     }
 }
 
-// =========================================================================
-// MetaOps — Getattr
-// =========================================================================
-
-unsafe fn procfs_getattr(ctx: &VopContext, attr: *mut VAttr) -> VfsResult<()> {
+unsafe fn procfs_getattr(ctx: &mut OwnerVopCtx<'_>, attr: *mut VAttr) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata(ctx);
+        let vdata = vdata(ctx);
 
+        (*attr).fs_instance_id = (*ctx.vnode).fs_instance_id;
+        (*attr).backend_node_id = (*ctx.vnode).key.backend_id.id;
+        (*attr).backend_seq = (*ctx.vnode).backend_seq;
         (*attr).uid = 0;
         (*attr).gid = 0;
         (*attr).nlink = (*ctx.vnode).nlink;
         (*attr).atime = 0;
         (*attr).mtime = 0;
         (*attr).ctime = 0;
-        (*attr).btime = 0;
         (*attr).blocks = 0;
-        (*attr).dev_id = 0;
-        (*attr).rdev = 0;
         (*attr).size = 0;
 
-        match (*vd).kind {
-            ProcfsKind::Root | ProcfsKind::PidDir | ProcfsKind::NetDir | ProcfsKind::SysDir => {
-                (*attr).mode = S_IFDIR_L | 0o555;
+        match (*vdata).kind {
+            ProcfsKind::Root
+            | ProcfsKind::PidDir
+            | ProcfsKind::NetDir
+            | ProcfsKind::SysDir
+            | ProcfsKind::SysDynDir => {
+                (*attr).mode = MODE_TYPE_DIR | 0o555;
                 (*attr).nlink = 2;
+                (*attr).kind = VnodeKind::Directory;
             }
 
             ProcfsKind::SelfLink | ProcfsKind::PidExe => {
-                (*attr).mode = S_IFLNK_L | 0o777;
+                (*attr).mode = MODE_TYPE_LNK | 0o777;
+                (*attr).kind = VnodeKind::Symlink;
             }
 
             ProcfsKind::PidStat
@@ -318,52 +432,59 @@ unsafe fn procfs_getattr(ctx: &VopContext, attr: *mut VAttr) -> VfsResult<()> {
             | ProcfsKind::PidMaps
             | ProcfsKind::PidCmdline
             | ProcfsKind::PidComm
+            | ProcfsKind::PidStatm
+            | ProcfsKind::PidIo
+            | ProcfsKind::PidSmaps
+            | ProcfsKind::PidCgroup
+            | ProcfsKind::PidReservations
+            | ProcfsKind::PidOomScore
             | ProcfsKind::NetRoute
             | ProcfsKind::NetArp
             | ProcfsKind::NetDev
-            | ProcfsKind::SysLeaf => {
-                (*attr).mode = S_IFREG_L | 0o444;
+            | ProcfsKind::NetHosts
+            | ProcfsKind::NetResolvConf
+            | ProcfsKind::SysLeaf
+            | ProcfsKind::SysDynLeaf
+            | ProcfsKind::SysStat
+            | ProcfsKind::SysMeminfo
+            | ProcfsKind::SysUptime
+            | ProcfsKind::SysCpuinfo
+            | ProcfsKind::SysLoadavg => {
+                (*attr).mode = MODE_TYPE_REG | 0o444;
+                (*attr).kind = VnodeKind::Regular;
             }
         }
 
-        Ok(())
+        Ok(Ready(()))
     }
 }
 
-// =========================================================================
-// MetaOps — Access / Open / Close / Readlink / Inactive
-// =========================================================================
-
 unsafe fn procfs_access(
-    _ctx: &VopContext,
+    _ctx: &mut OwnerVopCtx<'_>,
     _mode: u32,
     _cred: *const VfsCred,
-) -> VfsResult<()> {
-    Ok(())
+) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-unsafe fn procfs_open(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+unsafe fn procfs_open(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-unsafe fn procfs_close(_ctx: &VopContext, _flags: u32) -> VfsResult<()> {
-    Ok(())
+unsafe fn procfs_close(_ctx: &mut OwnerVopCtx<'_>, _flags: u32) -> VopOutcome<()> {
+    Ok(Ready(()))
 }
 
-/// Read the target of a procfs symlink vnode.
-///
-/// - SelfLink → `/proc/<pid>` where pid comes from `cred.pid`.
-/// - PidExe → executable path from procmgr IPC.
 unsafe fn procfs_readlink(
-    ctx: &VopContext,
+    ctx: &mut OwnerVopCtx<'_>,
     buf: *mut u8,
     buf_len: usize,
     cred: *const VfsCred,
-) -> VfsResult<usize> {
+) -> VopOutcome<usize> {
     unsafe {
-        let vd = vdata(ctx);
+        let vdata = vdata(ctx);
 
-        match (*vd).kind {
+        match (*vdata).kind {
             ProcfsKind::SelfLink => {
                 let pid = if !cred.is_null() { (*cred).pid } else { 0 };
                 let prefix = b"/proc/";
@@ -396,19 +517,37 @@ unsafe fn procfs_readlink(
                 for i in 0..pid_len {
                     *buf.add(prefix.len() + i) = tmp[i];
                 }
-                Ok(total)
+                Ok(Ready(total))
             }
 
             ProcfsKind::PidExe => {
-                let pid = (*vd).pid;
-                let mut exe_path = [0u8; MAX_PATH_LEN];
-                let exe_len =
-                    proc_get_exe_path(pid, &mut exe_path).ok_or(VfsError::NotFound)?;
-                let copy = if exe_len < buf_len { exe_len } else { buf_len };
-                for i in 0..copy {
-                    *buf.add(i) = exe_path[i];
+                // Async: query init's `GET_EXE_PATH` without blocking the
+                // owner reactor. The readlink reply is emitted at
+                // finalize from the snapshot (`buf`/`buf_len` unused on
+                // this path — the inline emitter caps the wire length).
+                let _ = (buf, buf_len);
+                let pid = (*vdata).pid;
+                let client_id = if !cred.is_null() { (*cred).pid } else { 0 };
+                let plan = [crate::owner::init_rpc::InitStep {
+                    label: trona_protocol::init::INIT_GET_PROC_INFO,
+                    sub_op: trona_protocol::init::INIT_GET_PROC_INFO_SUB_GET_EXE_PATH,
+                    arg: pid as u64,
+                }];
+                let read_state = crate::owner::init_rpc::InitReadState::ProcExeReadlink {
+                    personality: crate::personality::Personality::Posix,
+                    path: [0u8; MAX_PATH_LEN],
+                    len: 0,
+                };
+                match crate::owner::init_rpc::begin_init_read_deferred(
+                    ctx.state,
+                    &plan,
+                    read_state,
+                    client_id,
+                    ctx.caller_badge,
+                ) {
+                    Some(op_h) => Ok(Parked(op_h)),
+                    None => Err(VfsError::Io),
                 }
-                Ok(copy)
             }
 
             _ => Err(VfsError::Inval),
@@ -416,139 +555,149 @@ unsafe fn procfs_readlink(
     }
 }
 
-unsafe fn procfs_inactive(_ctx: &VopContext) {}
+unsafe fn procfs_inactive(ctx: &mut OwnerVopCtx<'_>) -> VopOutcome<()> {
+    unsafe {
+        crate::owner::pager_rpc::release_mo_binding_for_vnode(ctx.state, ctx.handle);
+    }
+    Ok(Ready(()))
+}
 
-// =========================================================================
-// DataOps — Readdir
-// =========================================================================
-
-/// Enumerate directory entries.
-///
-/// `cookie` is an opaque cursor: 0 = start, incremented per entry.
-///
-/// - Root: ".", "..", "self", "net", "sys", then PIDs from procmgr.
-/// - PidDir: ".", "..", "stat", "status", "maps", "exe", "cmdline", "comm".
-/// - NetDir: ".", "..", "route", "arp", "dev".
-/// - SysDir: ".", "..", then child nodes + leaves from sysctlfs MIB tree.
 unsafe fn procfs_readdir(
-    ctx: &VopDataContext,
+    ctx: &VopDataCtx,
     cookie: *mut u64,
     emit: ReaddirEmit<'_>,
-) -> VfsResult<()> {
+) -> VopOutcome<()> {
     unsafe {
-        let vd = vdata_d(ctx);
+        let vdata = vdata_d(ctx);
         let mut pos = *cookie;
         let attr = VAttr::zeroed();
 
-        match (*vd).kind {
+        match (*vdata).kind {
             ProcfsKind::Root => {
                 let root_id = ctx.id;
 
-                // "."
                 if pos == 0 {
-                    if !emit(root_id, b".".as_ptr(), 1, 4 /* DT_DIR */, &attr) {
+                    if !emit(root_id, b".".as_ptr(), 1, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // ".."
                 if pos == 1 {
-                    if !emit(root_id, b"..".as_ptr(), 2, 4, &attr) {
+                    if !emit(root_id, b"..".as_ptr(), 2, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // "self"
                 if pos == 2 {
-                    if !emit(0, b"self".as_ptr(), 4, 10 /* DT_LNK */, &attr) {
+                    if !emit(0, b"self".as_ptr(), 4, DT_LNK, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // "net"
                 if pos == 3 {
-                    if !emit(0, b"net".as_ptr(), 3, 4 /* DT_DIR */, &attr) {
+                    if !emit(0, b"net".as_ptr(), 3, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // "sys"
                 if pos == 4 {
-                    if !emit(0, b"sys".as_ptr(), 3, 4 /* DT_DIR */, &attr) {
+                    if !emit(0, b"sys".as_ptr(), 3, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // PIDs from procmgr.
-                let mut pids = [0u32; 19];
-                let count = proc_list_pids(&mut pids);
-                let base = 5u64;
-                let idx_start = if pos >= base {
-                    (pos - base) as usize
-                } else {
-                    0
-                };
-                for i in idx_start..count {
-                    let entry_pos = base + i as u64;
+                let sys_entries: &[&[u8]] =
+                    &[b"stat", b"meminfo", b"uptime", b"cpuinfo", b"loadavg"];
+                let sys_base = 5u64;
+                for (i, name) in sys_entries.iter().enumerate() {
+                    let entry_pos = sys_base + i as u64;
                     if pos > entry_pos {
                         continue;
                     }
-
-                    let mut nbuf = [0u8; 10];
-                    let nlen = fmt_u32(pids[i], &mut nbuf);
-
-                    if !emit(
-                        pids[i] as u64,
-                        nbuf.as_ptr(),
-                        nlen as u8,
-                        4, // DT_DIR
-                        &attr,
-                    ) {
+                    if !emit(0, name.as_ptr(), name.len() as u8, DT_REG, &attr) {
                         *cookie = entry_pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos = entry_pos + 1;
                 }
 
-                *cookie = pos;
-                Ok(())
+                // The pid entries come from init's process table. Fetch
+                // them asynchronously — a blocking VFS→init query here would
+                // risk the init↔VFS reactor cycle. Park on init `LIST_PIDS`
+                // (inline regs); the finalize emits the single dirent at
+                // this cursor (procfs readdir is one entry per `getdents`).
+                // procfs is POSIX-only, so the reply framing is `PosixGetDents`.
+                let base = sys_base + sys_entries.len() as u64;
+                let Some(st) = ctx.state_mut() else {
+                    return Err(VfsError::Io);
+                };
+                let Some(open_h) = ctx.open_object else {
+                    return Err(VfsError::Io);
+                };
+                let plan = [crate::owner::init_rpc::InitStep {
+                    label: trona_protocol::init::INIT_GET_PROC_INFO,
+                    sub_op: trona_protocol::posix::INIT_GET_PROC_INFO_SUB_LIST_PIDS,
+                    arg: 0,
+                }];
+                match crate::owner::init_rpc::begin_init_read_deferred(
+                    st,
+                    &plan,
+                    crate::owner::init_rpc::InitReadState::Readdir {
+                        open_h,
+                        cursor: pos,
+                        base,
+                        reply: crate::ops::ReadDirReplyIntent::PosixGetDents,
+                        pids: [0u32; 32],
+                        pid_count: 0,
+                        dtype: DT_DIR,
+                    },
+                    0,
+                    ctx.caller_badge,
+                ) {
+                    Some(handle) => Ok(Parked(handle)),
+                    None => Err(VfsError::Io),
+                }
             }
 
             ProcfsKind::PidDir => {
                 let entries: &[(&[u8], u8)] = &[
-                    (b"stat", 8),    // DT_REG
-                    (b"status", 8),  // DT_REG
-                    (b"maps", 8),    // DT_REG
-                    (b"exe", 10),    // DT_LNK
-                    (b"cmdline", 8), // DT_REG
-                    (b"comm", 8),    // DT_REG
+                    (b"stat", DT_REG),
+                    (b"status", DT_REG),
+                    (b"maps", DT_REG),
+                    (b"exe", DT_LNK),
+                    (b"cmdline", DT_REG),
+                    (b"comm", DT_REG),
+                    (b"statm", DT_REG),
+                    (b"io", DT_REG),
+                    (b"smaps", DT_REG),
+                    (b"cgroup", DT_REG),
+                    (b"reservations", DT_REG),
+                    (b"oom_score", DT_REG),
                 ];
 
-                // "."
                 if pos == 0 {
-                    if !emit(ctx.id, b".".as_ptr(), 1, 4, &attr) {
+                    if !emit(ctx.id, b".".as_ptr(), 1, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // ".." — root id is encode_id(Root, 0) = 0.
                 if pos == 1 {
                     let root_id = encode_id(ProcfsKind::Root, 0);
-                    if !emit(root_id, b"..".as_ptr(), 2, 4, &attr) {
+                    if !emit(root_id, b"..".as_ptr(), 2, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
@@ -567,33 +716,31 @@ unsafe fn procfs_readdir(
                     let (name, dtype) = entries[i];
                     if !emit(0, name.as_ptr(), name.len() as u8, dtype, &attr) {
                         *cookie = entry_pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos = entry_pos + 1;
                 }
 
                 *cookie = pos;
-                Ok(())
+                Ok(Ready(()))
             }
 
             ProcfsKind::NetDir => {
-                let entries: &[&[u8]] = &[b"route", b"arp", b"dev"];
+                let entries: &[&[u8]] = &[b"route", b"arp", b"dev", b"hosts", b"resolv.conf"];
 
-                // "."
                 if pos == 0 {
-                    if !emit(ctx.id, b".".as_ptr(), 1, 4, &attr) {
+                    if !emit(ctx.id, b".".as_ptr(), 1, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // ".." — root id.
                 if pos == 1 {
                     let root_id = encode_id(ProcfsKind::Root, 0);
-                    if !emit(root_id, b"..".as_ptr(), 2, 4, &attr) {
+                    if !emit(root_id, b"..".as_ptr(), 2, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
@@ -610,92 +757,161 @@ unsafe fn procfs_readdir(
                         continue;
                     }
                     let name = entries[i];
-                    if !emit(
-                        0,
-                        name.as_ptr(),
-                        name.len() as u8,
-                        8, // DT_REG
-                        &attr,
-                    ) {
+                    if !emit(0, name.as_ptr(), name.len() as u8, DT_REG, &attr) {
                         *cookie = entry_pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos = entry_pos + 1;
                 }
 
                 *cookie = pos;
-                Ok(())
+                Ok(Ready(()))
             }
 
             ProcfsKind::SysDir => {
-                let node_ptr = (*vd).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlNode;
+                let node_ptr = (*vdata).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlNode;
                 if node_ptr.is_null() {
                     return Err(VfsError::NotDir);
                 }
                 let node = &*node_ptr;
+                let (node_count, leaf_count, dyn_count) = node.entry_counts();
 
-                // "."
                 if pos == 0 {
-                    if !emit(ctx.id, b".".as_ptr(), 1, 4, &attr) {
+                    if !emit(ctx.id, b".".as_ptr(), 1, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
-                // ".." — root id.
                 if pos == 1 {
                     let root_id = encode_id(ProcfsKind::Root, 0);
-                    if !emit(root_id, b"..".as_ptr(), 2, 4, &attr) {
+                    if !emit(root_id, b"..".as_ptr(), 2, DT_DIR, &attr) {
                         *cookie = pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos += 1;
                 }
 
                 let base = 2u64;
 
-                // Emit child nodes (directories). Apply reverse mapping:
-                // MIB "kern" → Linux "kernel".
-                let child_count = node.child_node_count;
-                for i in 0..child_count {
+                for i in 0..node_count {
                     let entry_pos = base + i as u64;
                     if pos > entry_pos {
                         continue;
                     }
-                    let child = &*node.child_nodes.add(i);
+                    let Some(child) = node.child_node_at(i) else {
+                        break;
+                    };
                     let child_name = &child.name[..child.name_len as usize];
                     let (emit_name, emit_len): (&[u8], u8) = if child_name == b"kern" {
                         (b"kernel", 6)
                     } else {
                         (child_name, child.name_len)
                     };
-                    if !emit(0, emit_name.as_ptr(), emit_len, 4 /* DT_DIR */, &attr) {
+                    if !emit(0, emit_name.as_ptr(), emit_len, DT_DIR, &attr) {
                         *cookie = entry_pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
                     }
                     pos = entry_pos + 1;
                 }
 
-                // Emit leaves (regular files).
-                let leaf_base = base + child_count as u64;
-                let leaf_count = node.leaf_count;
+                let leaf_base = base + node_count as u64;
                 for i in 0..leaf_count {
                     let entry_pos = leaf_base + i as u64;
                     if pos > entry_pos {
                         continue;
                     }
-                    let leaf = &node.leaves[i];
+                    let Some(leaf) = node.leaf_at(i) else {
+                        break;
+                    };
                     let leaf_name = &leaf.name[..leaf.name_len as usize];
-                    if !emit(0, leaf_name.as_ptr(), leaf.name_len, 8 /* DT_REG */, &attr) {
+                    if !emit(0, leaf_name.as_ptr(), leaf.name_len, DT_REG, &attr) {
                         *cookie = entry_pos + 1;
-                        return Ok(());
+                        return Ok(Ready(()));
+                    }
+                    pos = entry_pos + 1;
+                }
+
+                let dyn_base = leaf_base + leaf_count as u64;
+                for i in 0..dyn_count {
+                    let entry_pos = dyn_base + i as u64;
+                    if pos > entry_pos {
+                        continue;
+                    }
+                    let Some(dyn_dir) = node.dynamic_at(i) else {
+                        break;
+                    };
+                    if !emit(0, dyn_dir.name.as_ptr(), dyn_dir.name_len, DT_DIR, &attr) {
+                        *cookie = entry_pos + 1;
+                        return Ok(Ready(()));
                     }
                     pos = entry_pos + 1;
                 }
 
                 *cookie = pos;
-                Ok(())
+                Ok(Ready(()))
+            }
+
+            ProcfsKind::SysDynDir => {
+                let dyn_ptr = (*vdata).sys_ptr as *const crate::fs::sysctlfs::tree::DynamicDir;
+                if dyn_ptr.is_null() {
+                    return Err(VfsError::NotDir);
+                }
+                let dyn_dir = &*dyn_ptr;
+
+                if pos == 0 {
+                    if !emit(ctx.id, b".".as_ptr(), 1, DT_DIR, &attr) {
+                        *cookie = 1;
+                        return Ok(Ready(()));
+                    }
+                    pos += 1;
+                }
+                if pos == 1 {
+                    let root_id = encode_id(ProcfsKind::Root, 0);
+                    if !emit(root_id, b"..".as_ptr(), 2, DT_DIR, &attr) {
+                        *cookie = 2;
+                        return Ok(Ready(()));
+                    }
+                    pos += 1;
+                }
+                // Pid-enumerated dirs (`kern.proc.pid` / `.args` / `.pathname`)
+                // park on init and list the live pid set (one entry per
+                // getdents, like the procfs root); the filter dirs are not
+                // enumerated (FreeBSD `list`-empty convention).
+                if dyn_dir.enumerates_pids {
+                    let Some(open_h) = ctx.open_object else {
+                        return Err(VfsError::Io);
+                    };
+                    let Some(st) = ctx.state_mut() else {
+                        return Err(VfsError::Io);
+                    };
+                    let plan = [crate::owner::init_rpc::InitStep {
+                        label: trona_protocol::init::INIT_GET_PROC_INFO,
+                        sub_op: trona_protocol::posix::INIT_GET_PROC_INFO_SUB_LIST_PIDS,
+                        arg: 0,
+                    }];
+                    return match crate::owner::init_rpc::begin_init_read_deferred(
+                        st,
+                        &plan,
+                        crate::owner::init_rpc::InitReadState::Readdir {
+                            open_h,
+                            cursor: pos,
+                            base: 2,
+                            reply: crate::ops::ReadDirReplyIntent::PosixGetDents,
+                            pids: [0u32; 32],
+                            pid_count: 0,
+                            dtype: DT_REG,
+                        },
+                        0,
+                        ctx.caller_badge,
+                    ) {
+                        Some(handle) => Ok(Parked(handle)),
+                        None => Err(VfsError::Io),
+                    };
+                }
+                *cookie = pos;
+                Ok(Ready(()))
             }
 
             _ => Err(VfsError::NotDir),
@@ -703,49 +919,307 @@ unsafe fn procfs_readdir(
     }
 }
 
-// =========================================================================
-// DataOps — Read
-// =========================================================================
-
-/// Read from a procfs regular file vnode.
-///
-/// Content is generated into a stack buffer on every read call.
-unsafe fn procfs_read(
-    ctx: &VopDataContext,
-    offset: u64,
-    dst: *mut u8,
-    len: u64,
-) -> VfsResult<u64> {
+/// Park a procfs content read on init data: hand the query `plan` +
+/// typed `read_state` to `init_rpc`, returning `Parked` (the
+/// `do_read_fd_inline` `Parked` arm attaches the client lease + records
+/// the read-reply framing). One call site per init-backed `ProcfsKind`.
+unsafe fn park_proc_read(
+    ctx: &VopDataCtx,
+    pid: u32,
+    plan: &[crate::owner::init_rpc::InitStep],
+    read_state: crate::owner::init_rpc::InitReadState,
+) -> VopOutcome<u64> {
     unsafe {
-        let vd = vdata_d(ctx);
-        let pid = (*vd).pid;
+        let Some(st) = ctx.state_mut() else {
+            return Err(VfsError::Io);
+        };
+        match crate::owner::init_rpc::begin_init_read_deferred(
+            st,
+            plan,
+            read_state,
+            pid,
+            ctx.caller_badge,
+        ) {
+            Some(op_h) => Ok(Parked(op_h)),
+            None => Err(VfsError::Io),
+        }
+    }
+}
+
+unsafe fn procfs_read(ctx: &VopDataCtx, offset: u64, dst: *mut u8, len: u64) -> VopOutcome<u64> {
+    unsafe {
+        let vdata = vdata_d(ctx);
+        let pid = (*vdata).pid;
+
+        if (*vdata).kind == ProcfsKind::SysDynLeaf {
+            let dyn_ptr = (*vdata).sys_ptr as *const crate::fs::sysctlfs::tree::DynamicDir;
+            if dyn_ptr.is_null() {
+                return Err(VfsError::Io);
+            }
+            let dyn_dir = &*dyn_ptr;
+            let name = (*vdata).dyn_name.as_ptr();
+            let name_len = (*vdata).dyn_name_len as usize;
+            let caller_badge = ctx.caller_badge;
+            let Some(st) = ctx.state_mut() else {
+                return Err(VfsError::Io);
+            };
+            let mut sctx = SysctlCtx {
+                state: st,
+                caller_badge,
+                offset,
+                len,
+            };
+            let mut content = [0u8; 4096];
+            return match (dyn_dir.lookup)(&mut sctx, name, name_len, content.as_mut_ptr(), 4096) {
+                SysctlOutcome::Parked(h) => Ok(Parked(h)),
+                SysctlOutcome::Missing => Err(VfsError::Io),
+                SysctlOutcome::Ready(content_len) => {
+                    if offset as usize >= content_len {
+                        return Ok(Ready(0));
+                    }
+                    let available = content_len - offset as usize;
+                    let to_copy = (len as usize).min(available);
+                    ::core::ptr::copy_nonoverlapping(
+                        content.as_ptr().add(offset as usize),
+                        dst,
+                        to_copy,
+                    );
+                    Ok(Ready(to_copy as u64))
+                }
+            };
+        }
+
+        if (*vdata).kind == ProcfsKind::SysLeaf {
+            let leaf_ptr = (*vdata).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlLeaf;
+            if leaf_ptr.is_null() {
+                return Err(VfsError::Io);
+            }
+            let leaf = &*leaf_ptr;
+            let read_fn = match leaf.read_fn {
+                Some(f) => f,
+                None => return Ok(Ready(0)),
+            };
+            let caller_badge = ctx.caller_badge;
+            let Some(st) = ctx.state_mut() else {
+                return Err(VfsError::Io);
+            };
+            let mut sctx = SysctlCtx {
+                state: st,
+                caller_badge,
+                offset,
+                len,
+            };
+            let mut content = [0u8; 4096];
+            return match read_fn(&mut sctx, content.as_mut_ptr(), 4096) {
+                SysctlOutcome::Parked(h) => Ok(Parked(h)),
+                SysctlOutcome::Missing => Ok(Ready(0)),
+                SysctlOutcome::Ready(content_len) => {
+                    if offset as usize >= content_len {
+                        return Ok(Ready(0));
+                    }
+                    let available = content_len - offset as usize;
+                    let to_copy = (len as usize).min(available);
+                    ::core::ptr::copy_nonoverlapping(
+                        content.as_ptr().add(offset as usize),
+                        dst,
+                        to_copy,
+                    );
+                    Ok(Ready(to_copy as u64))
+                }
+            };
+        }
+
+        // procfs reads backed by init data park the owner reactor rather
+        // than blocking on `mp_call`: issue the init query plan and
+        // re-enter the formatter from the snapshot at finalize. The
+        // `do_read_fd_inline` `Parked` arm routes these (`Resume::Init`)
+        // via `attach_lease_if_init`, distinct from backend bulk reads.
+        {
+            use crate::owner::init_rpc::{InitReadState, InitStep, ProcReadKind, ProcReadResults};
+            use trona_protocol::init::{
+                INIT_ARGV_PAGE_BYTES, INIT_GET_PROC_INFO, INIT_GET_PROC_INFO_SUB_GET_ARGV,
+                INIT_GET_PROC_INFO_SUB_GET_PROC_INFO_FULL, INIT_GET_PROC_INFO_SUB_GET_PROC_TIMES,
+                INIT_GET_PROC_INFO_SUB_GET_SYSTEM_STATS,
+            };
+            match (*vdata).kind {
+                ProcfsKind::PidComm => {
+                    let plan = [InitStep {
+                        label: INIT_GET_PROC_INFO,
+                        sub_op: INIT_GET_PROC_INFO_SUB_GET_PROC_INFO_FULL,
+                        arg: pid as u64,
+                    }];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::Comm,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                ProcfsKind::PidStat => {
+                    let plan = [
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_PROC_INFO_FULL,
+                            arg: pid as u64,
+                        },
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_PROC_TIMES,
+                            arg: pid as u64,
+                        },
+                    ];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::PidStat,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                ProcfsKind::PidStatus => {
+                    let plan = [
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_PROC_INFO_FULL,
+                            arg: pid as u64,
+                        },
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_PROC_TIMES,
+                            arg: pid as u64,
+                        },
+                    ];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::PidStatus,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                ProcfsKind::SysLoadavg => {
+                    let plan = [InitStep {
+                        label: INIT_GET_PROC_INFO,
+                        sub_op: INIT_GET_PROC_INFO_SUB_GET_SYSTEM_STATS,
+                        arg: 0,
+                    }];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::SysLoadavg,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                ProcfsKind::SysStat => {
+                    let plan = [InitStep {
+                        label: INIT_GET_PROC_INFO,
+                        sub_op: INIT_GET_PROC_INFO_SUB_GET_SYSTEM_STATS,
+                        arg: 0,
+                    }];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::SysStat,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                ProcfsKind::PidCmdline => {
+                    // argv (up to ARGV_MAX) exceeds one MP record, so page it:
+                    // three GET_ARGV steps at byte offsets 0 / PAGE / 2*PAGE,
+                    // each carrying `(pid << 32) | offset`. The decode arm
+                    // reassembles the pages into the argv accumulator.
+                    let page = INIT_ARGV_PAGE_BYTES as u64;
+                    let base = (pid as u64) << 32;
+                    let plan = [
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_ARGV,
+                            arg: base,
+                        },
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_ARGV,
+                            arg: base | page,
+                        },
+                        InitStep {
+                            label: INIT_GET_PROC_INFO,
+                            sub_op: INIT_GET_PROC_INFO_SUB_GET_ARGV,
+                            arg: base | (2 * page),
+                        },
+                    ];
+                    return park_proc_read(
+                        ctx,
+                        pid,
+                        &plan,
+                        InitReadState::ProcRead {
+                            kind: ProcReadKind::Cmdline,
+                            pid,
+                            offset,
+                            len,
+                            intent: crate::ops::ReadReplyIntent::PosixRead,
+                            results: ProcReadResults::default(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
 
         let mut content = [0u8; PROC_TEXT_BUF_SIZE];
-        let content_len = match (*vd).kind {
-            ProcfsKind::PidStat => proc_gen_stat(pid, &mut content),
-            ProcfsKind::PidStatus => proc_gen_status(pid, &mut content),
+        let content_len = match (*vdata).kind {
             ProcfsKind::PidMaps => proc_gen_maps(pid, &mut content),
-            ProcfsKind::PidCmdline => proc_gen_cmdline(pid, &mut content),
-            ProcfsKind::PidComm => proc_gen_comm(pid, &mut content),
+            ProcfsKind::PidStatm => proc_gen_statm(pid, &mut content),
+            ProcfsKind::PidIo => proc_gen_io(pid, &mut content),
+            ProcfsKind::PidSmaps => proc_gen_smaps(pid, &mut content),
+            ProcfsKind::PidCgroup => proc_gen_cgroup(pid, &mut content),
+            ProcfsKind::PidReservations => proc_gen_reservations(pid, &mut content),
+            ProcfsKind::PidOomScore => proc_gen_oom_score(pid, &mut content),
+            ProcfsKind::SysMeminfo => super::sysnode::proc_gen_meminfo(&mut content),
+            ProcfsKind::SysUptime => super::sysnode::proc_gen_uptime(&mut content),
+            ProcfsKind::SysCpuinfo => super::sysnode::proc_gen_cpuinfo(&mut content),
             ProcfsKind::NetRoute => proc_gen_route(&mut content),
             ProcfsKind::NetArp => proc_gen_arp(&mut content),
             ProcfsKind::NetDev => proc_gen_net_dev(&mut content),
-            ProcfsKind::SysLeaf => {
-                let leaf_ptr = (*vd).sys_ptr as *const crate::fs::sysctlfs::tree::SysctlLeaf;
-                if leaf_ptr.is_null() {
-                    return Err(VfsError::Io);
-                }
-                let leaf = &*leaf_ptr;
-                match leaf.read_fn {
-                    Some(read_fn) => read_fn(content.as_mut_ptr(), PROC_TEXT_BUF_SIZE),
-                    None => 0,
-                }
-            }
+            ProcfsKind::NetHosts => proc_gen_hosts(&mut content),
+            ProcfsKind::NetResolvConf => proc_gen_resolv_conf(&mut content),
             _ => return Err(VfsError::IsDir),
         };
 
         if offset as usize >= content_len {
-            return Ok(0);
+            return Ok(Ready(0));
         }
 
         let available = content_len - offset as usize;
@@ -758,33 +1232,27 @@ unsafe fn procfs_read(
         for i in 0..to_copy {
             *dst.add(i) = content[offset as usize + i];
         }
-        Ok(to_copy as u64)
+        Ok(Ready(to_copy as u64))
     }
 }
 
-// =========================================================================
-// DataOps — Statfs
-// =========================================================================
-
-unsafe fn procfs_statfs(_ctx: &VopDataContext, out: *mut VStatfs) -> VfsResult<()> {
+unsafe fn procfs_statfs(_ctx: &VopDataCtx, out: *mut VStatfs) -> VopOutcome<()> {
     unsafe {
         (*out).bsize = 4096;
+        (*out).frsize = 4096;
         (*out).blocks = 0;
         (*out).bfree = 0;
         (*out).bavail = 0;
         (*out).files = 0;
         (*out).ffree = 0;
-        (*out).fs_type = [0; 16];
-        (&mut (*out).fs_type)[..6].copy_from_slice(b"procfs");
-        (*out).flags = 0;
-        (*out).name_max = 255;
-        Ok(())
+        (*out).favail = 0;
+        (*out).fsid = 0;
+        (*out).flag = 0;
+        (*out).namemax = 255;
+        (*out).set_fs_name(b"procfs");
+        Ok(Ready(()))
     }
 }
-
-// =========================================================================
-// Static dispatch table
-// =========================================================================
 
 pub(super) static PROCFS_VOPS: VopVector = VopVector {
     meta: VopMetaOps {

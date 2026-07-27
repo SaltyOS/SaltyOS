@@ -1,0 +1,5 @@
+[Unit]
+Name=namesrv.socket
+
+[Socket]
+Provider=namesrv

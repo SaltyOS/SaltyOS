@@ -7,8 +7,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::slot::{
-    free_slot, get_cap, get_meta, get_meta_mut, nullify_capability, CapSlot, SlotState,
-    INVALID_SLOT,
+    CapSlot, INVALID_SLOT, SlotState, free_slot, get_cap, get_meta, is_transit_pinned,
+    nullify_capability, update_meta,
 };
 
 /// CDT operations
@@ -24,11 +24,12 @@ impl CDT {
     ///
     /// Used for initial capabilities created from untyped memory.
     pub fn insert_root(slot: CapSlot) {
-        let meta = get_meta_mut(slot);
-        meta.cdt_parent = INVALID_SLOT;
-        meta.cdt_first_child = INVALID_SLOT;
-        meta.cdt_next = INVALID_SLOT;
-        meta.cdt_prev = INVALID_SLOT;
+        update_meta(slot, |meta| {
+            meta.cdt_parent = INVALID_SLOT;
+            meta.cdt_first_child = INVALID_SLOT;
+            meta.cdt_next = INVALID_SLOT;
+            meta.cdt_prev = INVALID_SLOT;
+        });
     }
 
     /// Insert child capability into CDT
@@ -36,26 +37,23 @@ impl CDT {
     /// Insert child_slot as a child of parent_slot.
     /// Time complexity: O(1)
     pub fn insert_child(parent_slot: CapSlot, child_slot: CapSlot) {
-        let parent_meta = get_meta_mut(parent_slot);
-        let child_meta = get_meta_mut(child_slot);
-
-        // Set child's parent
-        child_meta.cdt_parent = parent_slot;
-
         // Get parent's current first child
-        let old_first = parent_meta.cdt_first_child;
+        let old_first = get_meta(parent_slot).cdt_first_child;
 
         // Insert child at head of parent's child list
-        child_meta.cdt_next = old_first;
-        child_meta.cdt_prev = INVALID_SLOT;
+        update_meta(child_slot, |child_meta| {
+            child_meta.cdt_parent = parent_slot;
+            child_meta.cdt_next = old_first;
+            child_meta.cdt_prev = INVALID_SLOT;
+        });
 
         // Update old first child's prev pointer (if exists)
         if old_first != INVALID_SLOT {
-            get_meta_mut(old_first).cdt_prev = child_slot;
+            update_meta(old_first, |meta| meta.cdt_prev = child_slot);
         }
 
         // Update parent's first child
-        parent_meta.cdt_first_child = child_slot;
+        update_meta(parent_slot, |meta| meta.cdt_first_child = child_slot);
     }
 
     /// Remove capability from CDT
@@ -70,26 +68,88 @@ impl CDT {
         let prev = meta.cdt_prev;
         let next = meta.cdt_next;
 
-        let meta_mut = get_meta_mut(slot);
-
         // Update previous sibling's next pointer
         if prev != INVALID_SLOT {
-            get_meta_mut(prev).cdt_next = next;
+            update_meta(prev, |meta| meta.cdt_next = next);
         } else if parent != INVALID_SLOT {
             // We were first child - update parent
-            get_meta_mut(parent).cdt_first_child = next;
+            update_meta(parent, |meta| meta.cdt_first_child = next);
         }
 
         // Update next sibling's prev pointer
         if next != INVALID_SLOT {
-            get_meta_mut(next).cdt_prev = prev;
+            update_meta(next, |meta| meta.cdt_prev = prev);
         }
 
         // Clear all CDT links
-        meta_mut.cdt_parent = INVALID_SLOT;
-        meta_mut.cdt_first_child = INVALID_SLOT;
-        meta_mut.cdt_next = INVALID_SLOT;
-        meta_mut.cdt_prev = INVALID_SLOT;
+        update_meta(slot, |meta| {
+            meta.cdt_parent = INVALID_SLOT;
+            meta.cdt_first_child = INVALID_SLOT;
+            meta.cdt_next = INVALID_SLOT;
+            meta.cdt_prev = INVALID_SLOT;
+        });
+    }
+
+    /// Detach `slot` from its parent and sibling list, re-rooting it as
+    /// a CDT root while PRESERVING its own child subtree. Unlike
+    /// `remove`, which also clears `cdt_first_child` (orphaning the
+    /// subtree), this keeps the slot's children attached so an
+    /// in-transit (transit-pinned) cap survives a parent revoke / delete
+    /// with its derivations intact.
+    fn detach_to_root(slot: CapSlot) {
+        let meta = get_meta(slot);
+        let parent = meta.cdt_parent;
+        let prev = meta.cdt_prev;
+        let next = meta.cdt_next;
+
+        // Unlink from the sibling list / parent's first-child pointer.
+        if prev != INVALID_SLOT {
+            update_meta(prev, |meta| meta.cdt_next = next);
+        } else if parent != INVALID_SLOT {
+            update_meta(parent, |meta| meta.cdt_first_child = next);
+        }
+        if next != INVALID_SLOT {
+            update_meta(next, |meta| meta.cdt_prev = prev);
+        }
+
+        // Become a root: clear parent / sibling links but KEEP
+        // cdt_first_child so the subtree travels with this slot.
+        update_meta(slot, |meta| {
+            meta.cdt_parent = INVALID_SLOT;
+            meta.cdt_next = INVALID_SLOT;
+            meta.cdt_prev = INVALID_SLOT;
+        });
+    }
+
+    /// Re-parent every direct child of `slot` to `slot`'s own parent before
+    /// `slot` is torn down. A single delete preserves derivations, but
+    /// re-parenting ordinary derived caps to the grandparent — rather than
+    /// orphaning them as independent CDT roots — keeps them reachable from an
+    /// ancestor's `revoke`. This matches seL4's MDB relink on capability
+    /// delete, where `emptySlot` bypasses the deleted node by linking its
+    /// predecessor directly to its successor. A transit-pinned child is owned
+    /// by an in-flight IPC carrier and must survive a parent revoke / delete
+    /// with its subtree intact, so it is detached to a CDT root instead. When
+    /// `slot` is itself a root (no grandparent), ordinary children also stay
+    /// roots. No-op on the common childless path.
+    fn reparent_children(slot: CapSlot) {
+        let grandparent = get_meta(slot).cdt_parent;
+        let mut child = Self::first_child(slot);
+        while child != INVALID_SLOT {
+            let next = get_meta(child).cdt_next;
+            // Detach from `slot`'s child list first: this keeps the
+            // sibling-list walk consistent (it advances `slot`'s
+            // `cdt_first_child` and clears the next child's `cdt_prev`) and
+            // preserves the child's own subtree via `cdt_first_child`.
+            Self::detach_to_root(child);
+            // Ordinary derived caps re-parent to the grandparent so an
+            // ancestor revoke still reaches them; transit-pinned in-flight
+            // caps stay roots so their carrier can dispose of them.
+            if grandparent != INVALID_SLOT && !is_transit_pinned(child) {
+                Self::insert_child(grandparent, child);
+            }
+            child = next;
+        }
     }
 
     /// Check if capability has children
@@ -116,28 +176,48 @@ impl CDT {
     /// Time complexity: O(d) where d is number of descendants
     /// Space complexity: O(d) on stack (recursive calls)
     pub fn revoke(slot: CapSlot) {
-        // Recursively revoke all children first (depth-first)
+        crate::kernel::printk::ktrace!(|g| {
+            g.puts("[CDT] revoke slot=");
+            g.hex(slot as u64);
+            g.putc(b'\n');
+        });
+        // Revoke all children first (depth-first). A transit-pinned
+        // child is owned by an in-flight IPC carrier and must survive:
+        // detach it from this slot (so the loop makes progress and this
+        // slot can be deleted) and re-root it with its subtree intact.
+        // The carrier's unpin-and-delete path disposes of it when
+        // transit ends.
         while Self::has_children(slot) {
             let child = Self::first_child(slot);
-            Self::revoke(child); // Recursive, no queue needed
+            if is_transit_pinned(child) {
+                Self::detach_to_root(child);
+            } else {
+                Self::revoke(child); // Recursive, no queue needed
+            }
         }
 
-        // After all children are revoked, delete this capability
+        // After all children are revoked or re-rooted, delete this
+        // capability (a no-op if this slot is itself transit-pinned).
         Self::delete_capability(slot);
     }
 
-    /// Delete a single capability (full lifecycle)
+    /// Delete a single capability (per-cap bookkeeping only).
     ///
-    /// Performs complete cleanup:
-    /// 1. Remove from CDT
-    /// 2. Remove from untyped's child list (if applicable)
-    /// 3. Decrement object refcount (destroy if 0)
-    /// 4. Nullify capability
-    /// 5. Free the slot
+    /// Performs:
+    /// 1. Remove from CDT (cap-to-cap derivation tree).
+    /// 2. Decrement object refcount — when the LAST reference goes,
+    ///    the object enters the reaper queue, which performs every
+    ///    object-level cleanup step (unlink from parent untyped's
+    ///    children list, reclaim the carved phys range to
+    ///    `UntypedReserved`, release the root reservation if this is
+    ///    a root untyped, run the type-specific destructor, and push
+    ///    the freed bytes onto the parent's freelist). Per-cap state
+    ///    below is just slot bookkeeping.
+    /// 3. Nullify capability + free the slot.
     ///
     /// # Safety
-    /// Must be called under CAP_LOCK. Safe to call on already-deleted slots
-    /// (idempotent due to SlotState::Free guard).
+    /// Must be called under CAP_LOCK. Safe to call on already-deleted
+    /// slots (idempotent due to `SlotState::Free` guard).
     pub(crate) fn delete_capability(slot: CapSlot) {
         let meta = get_meta(slot);
 
@@ -148,17 +228,29 @@ impl CDT {
             return;
         }
 
-        // 1. Remove from CDT
-        Self::remove(slot);
-
-        // 2. Remove from untyped's child list (if applicable)
-        let ut_parent = meta.ut_parent;
-        if ut_parent != INVALID_SLOT {
-            // This is done by untyped module
-            super::untyped::UntypedTracker::remove_child(ut_parent, slot);
+        // A transit-pinned slot is owned by an in-flight IPC carrier.
+        // Leave it fully intact — CDT linkage, object refcount, capability
+        // payload, and slot identity (generation) — so a concurrent CSpace
+        // teardown cannot pull the cap out from under a deferred install.
+        // The carrier's unpin-and-delete path runs this again once transit
+        // ends.
+        if is_transit_pinned(slot) {
+            return;
         }
 
-        // 3. Release object (refcount--, destroy if 0)
+        // Re-parent every direct child to this slot's own parent before
+        // tearing this slot down, so no child keeps a dangling `cdt_parent`
+        // into this slot once it is freed and reused. A single delete
+        // preserves derivations; re-parenting ordinary derived caps to the
+        // grandparent (rather than orphaning them as roots) keeps them
+        // reachable from an ancestor's `revoke`, matching seL4's MDB relink.
+        // Transit-pinned in-flight caps are detached to a root so their
+        // carrier can dispose of them. `revoke` is the path that kills a
+        // subtree.
+        Self::reparent_children(slot);
+
+        Self::remove(slot);
+
         let cap = get_cap(slot);
         if !cap.is_null() {
             unsafe {
@@ -166,13 +258,16 @@ impl CDT {
             }
         }
 
-        // 4. Nullify capability
+        crate::kernel::printk::ktrace!(|g| {
+            g.puts("[CDT] delete slot=");
+            g.hex(slot as u64);
+            g.puts(" type=");
+            g.hex(cap.obj_type as u64);
+            g.puts(" gen=");
+            g.hex(super::slot::get_generation(slot));
+            g.putc(b'\n');
+        });
         nullify_capability(slot);
-
-        // 5. Clear ut_parent
-        get_meta_mut(slot).ut_parent = INVALID_SLOT;
-
-        // 6. Free the slot
         free_slot(slot);
     }
 
@@ -213,10 +308,9 @@ impl CDT {
     /// - All child->parent links are valid
     /// - Sibling lists are correctly linked
     /// - No cycles exist
-    #[cfg(debug_assertions)]
     pub fn verify_integrity() -> Result<(), super::cnode::CapError> {
-        use crate::cap::slot::{get_meta, max_slots};
         use super::cnode::CapError;
+        use crate::cap::slot::{get_meta, max_slots};
 
         for slot in 0..max_slots() {
             let slot = slot as CapSlot;
@@ -411,7 +505,7 @@ mod tests {
         CDT::insert_child(root, b);
 
         assert_eq!(CDT::descendant_count(root), 3); // A + A1 + B
-        assert_eq!(CDT::descendant_count(a), 1);    // A1
+        assert_eq!(CDT::descendant_count(a), 1); // A1
         assert_eq!(CDT::descendant_count(b), 0);
         assert_eq!(CDT::descendant_count(a1), 0);
 

@@ -79,88 +79,119 @@ Trade-off: More memory per capability, but simpler implementation and better deb
 
 ## Capability Types
 
-The `ObjectType` enum (defined in `kernite/src/cap/object.rs`) has 12 variants.
-The same discriminant values are used in both the `Capability.obj_type` field
-and the `KernelObject` header.
+The `ObjectType` enum (defined in `kernite/src/cap/object.rs`) has 25 variants
+(IDs 0–21 and 23–25; ID 22 is retired and not allocated). The same discriminant
+values are used in both the `Capability.obj_type` field and the `KernelObject`
+header. These IDs are ABI-stable; retired IDs are never reused.
 
 ```rust
 #[repr(u8)]
 pub enum ObjectType {
     /// Empty capability slot
-    Null = 0,
+    Null            = 0,
 
-    /// Untyped (raw) memory — can be retyped into other objects
-    Untyped = 1,
-
-    /// Synchronous IPC endpoint (rendezvous-style)
-    Endpoint = 2,
-
-    /// Asynchronous notification (bitmap signaling)
-    Notification = 3,
+    /// Untyped (raw) memory — retyped into other objects via UNTYPED_RETYPE
+    Untyped         = 1,
 
     /// Thread Control Block
-    Tcb = 4,
+    Tcb             = 2,
 
     /// Capability storage node (array of cap slots)
-    CNode = 5,
+    CNode           = 3,
 
     /// Virtual address space (page table root)
-    VSpace = 6,
+    VSpace          = 4,
 
     /// Physical memory frame (4KB page)
-    Frame = 7,
+    Frame           = 5,
 
-    /// Interrupt handler (routes IRQ to notification)
-    IrqHandler = 8,
+    /// Interrupt handler
+    IrqHandler      = 6,
 
     /// I/O port range (x86-specific)
-    IoPort = 9,
+    IoPort          = 7,
 
     /// Scheduling context (EDF parameters)
-    SchedContext = 10,
+    SchedContext    = 8,
 
-    /// Memory object (user page management, radix tree, COW)
-    MemoryObject = 11,
+    /// User page management, radix tree, COW
+    MemoryObject    = 9,
+
+    /// Bounded record ring for async event delivery
+    EventQueue      = 10,
+
+    /// State-mask registration on a watchable object
+    Watch           = 11,
+
+    /// Synchronous record-passing channel (side handle)
+    MessagePipe     = 12,
+
+    /// Bulk byte-stream / datagram channel (side handle)
+    DataPipe        = 13,
+
+    /// ns-precision deadline timer
+    Timer           = 14,
+
+    /// Kernel random number generator
+    KernelRng       = 15,
+
+    /// System-level control object
+    SystemControl   = 16,
+
+    /// Monotonic clock object
+    Clock           = 17,
+
+    /// System information object
+    SystemInfo      = 18,
+
+    /// Kernel debug interface
+    KernelDebug     = 19,
+
+    /// Shared core state for a MessagePipe pair
+    MessagePipeCore = 20,
+
+    /// Shared core state for a DataPipe pair
+    DataPipeCore    = 21,
+
+    // 22 is retired / gap — not allocated
+
+    /// Userspace pager (demand-fault handler)
+    Pager           = 23,
+
+    /// Device control object
+    DeviceControl   = 24,
+
+    /// Per-COW-tree serialization lock
+    VmHierarchyState = 25,
 }
 ```
 
 ## Capability Rights
 
 Rights are stored as a `u32` bitmap wrapper (`CapRights(u32)`) in
-`kernite/src/cap/mod.rs`. There are 15 defined rights. CNode operations
-(copy, mint, move, delete) are controlled by invoke labels and the
-GRANT/REVOKE rights, not separate CNode-specific right bits.
+`kernite/src/cap/mod.rs`. There are 11 defined rights occupying bits 0–10.
+Mint operations may only narrow rights; copy/move preserves them.
+CNode operations (copy, mint, move, delete) are controlled by invoke labels,
+not separate CNode-specific right bits.
 
 ```rust
 /// CapRights is a newtype wrapper around u32, with named constants.
 /// Defined in kernite/src/cap/mod.rs.
 pub struct CapRights(pub u32);
 
-// Common rights
-pub const READ:      CapRights = CapRights(1 << 0);
-pub const WRITE:     CapRights = CapRights(1 << 1);
-pub const EXECUTE:   CapRights = CapRights(1 << 2);
-pub const GRANT:     CapRights = CapRights(1 << 3);   // Can transfer cap via IPC
-pub const REVOKE:    CapRights = CapRights(1 << 4);   // Can revoke derived caps
+pub const READ:      CapRights = CapRights(1 << 0);   // Read data from object
+pub const WRITE:     CapRights = CapRights(1 << 1);   // Write data to object
+pub const EXECUTE:   CapRights = CapRights(1 << 2);   // Execute (code MO mapping)
+pub const GRANT:     CapRights = CapRights(1 << 3);   // Transfer cap via IPC
+pub const MAP:       CapRights = CapRights(1 << 4);   // Map object into VSpace
+pub const CONFIGURE: CapRights = CapRights(1 << 5);   // Configure object parameters
+pub const RESUME:    CapRights = CapRights(1 << 6);   // Resume/start a thread
+pub const DUPLICATE: CapRights = CapRights(1 << 7);   // Copy capability
+pub const SIGNAL:    CapRights = CapRights(1 << 8);   // Signal (write to EventQueue)
+pub const WAIT:      CapRights = CapRights(1 << 9);   // Wait on object state
+pub const TRANSFER:  CapRights = CapRights(1 << 10);  // Move cap as IPC carrier
 
-// Endpoint/IPC rights
-pub const SEND:      CapRights = CapRights(1 << 5);
-pub const RECV:      CapRights = CapRights(1 << 6);
-pub const CALL:      CapRights = CapRights(1 << 7);
-pub const REPLY:     CapRights = CapRights(1 << 8);
-
-// TCB rights
-pub const CONFIGURE: CapRights = CapRights(1 << 9);
-pub const SUSPEND:   CapRights = CapRights(1 << 10);
-pub const RESUME:    CapRights = CapRights(1 << 11);
-
-// Memory rights
-pub const MAP:       CapRights = CapRights(1 << 12);
-pub const UNMAP:     CapRights = CapRights(1 << 13);
-pub const RETYPE:    CapRights = CapRights(1 << 14);
-
-// All rights
-pub const ALL:       CapRights = CapRights(0xFFFFFFFF);
+pub const ALL:       CapRights = CapRights(0x7FF);
 ```
 
 ## CNode (Capability Node)
@@ -243,7 +274,7 @@ A task's CSpace can be a single CNode or a tree of CNodes:
         ▼                       ▼                       ▼
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
 │   Slot 0      │     │   Slot 1      │     │   Slot N      │
-│   Endpoint    │     │   → CNode     │     │   Frame       │
+│  MessagePipe  │     │   → CNode     │     │   Frame       │
 └───────────────┘     └───────┬───────┘     └───────────────┘
                               │
                               ▼
@@ -302,19 +333,18 @@ fn derive_cap(src: &Capability, new_rights: CapRights) -> Result<Capability, Cap
 
 ### Mint (Create Badged Capability)
 
-Minting sets a badge value on a capability copy. When a badged endpoint cap
-is used for IPC, the receiver sees the badge, allowing sender identification.
-Minting is a CNode invocation (label `CNODE_MINT`), not a method on Capability.
+Minting sets a badge value on a capability copy. When a badged MessagePipe cap
+is used for IPC, the receiver sees the badge in the received record, allowing
+sender identification. Minting is a CNode invocation (label `CNODE_MINT`), not
+a method on Capability.
 
 ```rust
 /// Mint: create a badged copy of a capability with (optionally reduced) rights.
-/// Typically used for endpoint capabilities to identify senders.
 fn cnode_mint(
     src: &Capability,
     new_rights: CapRights,
     badge: u64,
 ) -> Result<Capability, CapError> {
-    // Badge is typically used with endpoints, but not strictly enforced
     if (new_rights.0 & !src.rights.0) != 0 {
         return Err(CapError::InsufficientRights);
     }
@@ -511,30 +541,29 @@ initrd. Init is statically linked and is the first userspace process.
 ```rust
 // kernite/src/init.rs (simplified)
 
-/// Well-known capability slot assignments for the init task.
-/// These must match the constants in lib/trona/uapi/consts/kernel.rs.
-const CAP_SELF_TCB: usize       = 0;
-const CAP_SELF_VSPACE: usize    = 1;
-const CAP_SELF_CSPACE: usize    = 2;
-const CAP_PROCMGR_EP: usize     = 3;
-const CAP_VFS_EP: usize         = 4;
-const CAP_NAMESRV_EP: usize    = 5;
-const CAP_MMSRV_EP: usize       = 7;
-const CAP_COM1_IOPORT: usize    = 8;
-const CAP_CONSOLE_EP: usize     = 11;
-const CAP_UNTYPED_START: usize  = 16;
+/// ABI-stable well-known capability slots. Every thread starts with these
+/// three slots preinstalled. All other capabilities reach a process via the
+/// AT_SALTYOS_STARTUP startup descriptor and role-based getters in
+/// trona::caps::*; they are placed at spawner-chosen indices, not fixed slots.
+const CAP_SELF_TCB:    usize = 0;
+const CAP_SELF_VSPACE: usize = 1;
+const CAP_SELF_CSPACE: usize = 2;
+
+const CAP_UNTYPED_START: usize = 16;
 
 fn create_init_task(boot_info: &BootInfo) {
     // Retype untyped memory to create root CNode, TCB, VSpace, etc.
     // All objects are carved from untyped memory — no heap allocation.
 
-    // Insert well-known caps into init's CSpace
+    // Insert well-known caps into init's CSpace:
     // Slot 0: init's own TCB
     // Slot 1: init's VSpace
     // Slot 2: init's CNode root
-    // Slot 3-11: service endpoint caps (initially null, filled by init)
-    // Slot 8: COM1 I/O port range capability
     // Slot 16+: untyped memory capabilities for all usable physical regions
+    //
+    // Hardware caps (COM1 IoPort/IRQ, framebuffer untyped, PCI IoPort, etc.)
+    // and service MessagePipe caps are published via AT_SALTYOS_STARTUP using
+    // role IDs; slots beyond 2 are at spawner-chosen indices.
 
     let mut slot = CAP_UNTYPED_START;
     for region in boot_info.memory_regions() {
@@ -556,22 +585,21 @@ fn create_init_task(boot_info: &BootInfo) {
 
 CNode operations are performed via the Invoke syscall (number 9) with the
 CNode capability and an invoke label. Labels are defined in
-`lib/trona/uapi/consts/kernel.rs` (range `0x10`-`0x18`).
+`kernite/include/uapi/invoke.h` (range `0x20`-`0x27`).
 
 Arguments are passed in message registers (MR0-MR3 in CPU registers,
 MR4+ via IPC buffer).
 
 ```rust
-/// CNode invoke labels (from lib/trona/uapi/consts/kernel.rs)
-const CNODE_COPY:        u64 = 0x10;
-const CNODE_MINT:        u64 = 0x11;
-const CNODE_MOVE:        u64 = 0x12;
-const CNODE_MUTATE:      u64 = 0x13;
-const CNODE_DELETE:      u64 = 0x14;
-const CNODE_REVOKE:      u64 = 0x15;
-const CNODE_SAVE_CALLER: u64 = 0x16;
-const CNODE_SET_GUARD:   u64 = 0x17;
-const CNODE_GET_INFO:    u64 = 0x18;
+/// CNode invoke labels (from kernite/include/uapi/invoke.h)
+const CNODE_COPY:      u64 = 0x20;
+const CNODE_MINT:      u64 = 0x21;
+const CNODE_MOVE:      u64 = 0x22;
+const CNODE_MUTATE:    u64 = 0x23;
+const CNODE_DELETE:    u64 = 0x24;
+const CNODE_REVOKE:    u64 = 0x25;
+const CNODE_SET_GUARD: u64 = 0x26;
+const CNODE_GET_INFO:  u64 = 0x27;
 
 /// CNode capability invocation dispatch
 fn invoke_cnode(
@@ -604,9 +632,6 @@ fn invoke_cnode(
         CNODE_REVOKE => {
             cnode_revoke(cap, mr0)
         }
-        CNODE_SAVE_CALLER => {
-            cnode_save_caller(cap, mr0)
-        }
         CNODE_SET_GUARD => {
             cnode_set_guard(cap, mr0, mr1)
         }
@@ -622,29 +647,34 @@ fn invoke_cnode(
 
 MemoryObject (MO) operations manage user data pages. MO is created via
 `untyped_retype(OBJ_MEMORY_OBJECT)`. Labels defined in
-`lib/trona/uapi/consts/kernel.rs` (range `0x90`-`0x97`):
+`kernite/include/uapi/invoke.h` (range `0x100`-`0x10C`):
 
 | Label | Value | Operation | Description |
 |-------|-------|-----------|-------------|
-| `MO_COMMIT` | 0x90 | Commit pages | Allocate frames for page range (arg2=ut_cap, 0=PMM fallback) |
-| `MO_DECOMMIT` | 0x91 | Decommit pages | Release physical frames back to source |
-| `MO_GET_SIZE` | 0x92 | Get size | Return page count |
-| `MO_CLONE` | 0x93 | COW clone | Create copy-on-write snapshot child |
-| `MO_RESIZE` | 0x94 | Resize | Change page count |
-| `MO_READ` | 0x95 | Read page | Read data from MO page |
-| `MO_WRITE` | 0x96 | Write page | Write data to MO page |
-| `MO_HAS_PAGE` | 0x97 | Check page | Check if page is committed |
+| `MO_COMMIT` | 0x100 | Commit pages | Allocate frames for page range (arg2=ut_cap, 0=PMM fallback) |
+| `MO_DECOMMIT` | 0x101 | Decommit pages | Release physical frames back to source |
+| `MO_GET_SIZE` | 0x102 | Get size | Return page count |
+| `MO_CLONE` | 0x103 | COW clone | Create copy-on-write snapshot child |
+| `MO_RESIZE` | 0x104 | Resize | Change page count |
+| `MO_READ` | 0x105 | Read page | Read data from MO page |
+| `MO_WRITE` | 0x106 | Write page | Write data to MO page |
+| `MO_HAS_PAGE` | 0x107 | Check page | Check if page is committed |
+| `MO_GET_MAP_COUNT` | 0x108 | Map count | Count reverse-map entries |
+| `MO_UPDATE_PAGE_FLAGS` | 0x109 | Update flags | Update/query frame flags for a page |
+| `MO_ATTACH_PAGER` | 0x10A | Attach pager | Attach pager to MemoryObject |
+| `MO_SNAPSHOT` | 0x10B | Snapshot | Snapshot a MemoryObject |
+| `MO_CLONE_RANGE` | 0x10C | Clone range | COW clone a sub-range of a MemoryObject |
 
 ### VSpace MemoryObject Labels
 
 VSpace operations for MO-based mappings. Invoked on a VSpace capability
-(labels `0x97`, `0x99`-`0x9A`; unmapping uses the general `VSPACE_UNMAP` label):
+(labels `0x08F`-`0x091`; unmapping uses the general `VSPACE_UNMAP` label):
 
 | Label | Value | Operation | Description |
 |-------|-------|-----------|-------------|
-| `VSPACE_MAP_MO` | 0x97 | Map MO range | Map MO pages into VSpace at given VA |
-| `VSPACE_SHARE_RO_PAGE` | 0x99 | Share page RO | Share a read-only page between VSpaces |
-| `VSPACE_FORK_RANGE` | 0x9A | Fork range | COW-fork a VA range (used by fork()) |
+| `VSPACE_MAP_MO` | 0x08F | Map MO range | Map MO pages into VSpace at given VA |
+| `VSPACE_SHARE_RO_PAGE` | 0x090 | Share page RO | Share a read-only page between VSpaces |
+| `VSPACE_FORK_RANGE` | 0x091 | Fork range | COW-fork a VA range (used by fork()) |
 
 See [Memory Management](memory.md) for the full MO design.
 
@@ -661,7 +691,7 @@ Tasks can only access resources through capabilities they hold:
 
 A task can be confined by:
 1. Not giving it the GRANT right
-2. Not giving it capabilities to external endpoints
+2. Not giving it capabilities to server channels (MessagePipe caps)
 3. Controlling what capabilities it receives
 
 ### Revocation
@@ -685,26 +715,49 @@ This example shows the userland flow using trona invoke wrappers.
 ```rust
 // In init process (using trona invoke wrappers)
 
-// 1. Retype untyped memory to create an endpoint
+// 1. Retype untyped memory to create a MessagePipeCore and two side handles.
+//    The core carries the shared queue and flow-control state; the two sides
+//    are lightweight handles that reference it.
 trona_untyped_retype(
     untyped_cap,            // source untyped capability slot
-    OBJ_ENDPOINT,           // ObjectType::Endpoint = 2
-    0,                      // size_bits (unused for Endpoint)
+    OBJ_MESSAGE_PIPE_CORE,  // ObjectType::MessagePipeCore = 20
+    0,                      // size_bits (fixed-size object)
     1,                      // num_objects
     CAP_SELF_CSPACE,        // dest CNode (our own CSpace)
-    server_ep_slot,         // dest slot index
+    mp_core_slot,           // dest slot index
+);
+trona_untyped_retype(
+    untyped_cap,
+    OBJ_MESSAGE_PIPE,       // ObjectType::MessagePipe = 12
+    0,
+    1,
+    CAP_SELF_CSPACE,
+    server_side_slot,
+);
+trona_untyped_retype(
+    untyped_cap,
+    OBJ_MESSAGE_PIPE,
+    0,
+    1,
+    CAP_SELF_CSPACE,
+    client_side_slot,
 );
 
-// 2. Mint a badged copy for clients (send-only)
+// 2. Wire the pair: MP_PAIR binds the two side handles to the core,
+//    establishing the bidirectional channel.
+trona_mp_pair(mp_core_slot, server_side_slot, client_side_slot);
+
+// 3. Mint a badged copy of the client side for sender identification.
 trona_cnode_mint(
     CAP_SELF_CSPACE,        // dest CNode
-    client_ep_slot,         // dest slot
+    badged_client_slot,     // dest slot
     CAP_SELF_CSPACE,        // src CNode
-    server_ep_slot,         // src slot
-    RIGHTS_SEND,            // only send right
-    CLIENT_BADGE,           // badge value for sender identification
+    client_side_slot,       // src slot
+    RIGHTS_ALL,             // rights (attenuate as needed)
+    CLIENT_BADGE,           // badge value — seen by server in received record
 );
 
-// 3. Server recvs on endpoint, clients send
-// When a client sends, the server sees CLIENT_BADGE in the message badge
+// 4. Hand the badged client-side cap to the connecting process.
+//    Server calls MP_READ to receive records; clients call MP_WRITE / MP_CALL.
+//    The badge in each received record identifies which client sent it.
 ```

@@ -36,5 +36,9 @@ ZSTDEOF
 [env]
 EXTRA_CFLAGS = -DZSTD_NO_UNUSED_FUNCTIONS
 
-[install]
-libzstd.a = _build/build/cmake/lib/libzstd.a
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/man
+usr/share/doc

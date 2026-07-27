@@ -1,17 +1,42 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
-use trona::types::pe::*;
+use trona_kernel::core_types::pe::*;
+use trona_kernel::core_types::*;
 
-use trona::layout::VmLayoutPlan;
+use trona_runtime::spawn::layout::VmLayoutPlan;
 
 use crate::base::mmsrv_ipc;
+use crate::loader::elf_load::{exec_load_elf_from_vfs, exec_load_rtld_mmsrv_by_name};
 use crate::loader::mem_util::{
     alloc_staging_buffer, free_staging_buffer, volatile_copy, volatile_zero,
 };
-use crate::loader::elf_load::{
-    exec_load_elf_from_vfs, exec_load_rtld_mmsrv_by_name,
-};
+
+unsafe fn elf_compute_load_span(data: *const u8, len: usize) -> u64 {
+    unsafe {
+        use trona_loader::common::elf::header::{load_span, phdr_slice, validate_ehdr};
+        let ehdr = match validate_ehdr(data, len) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        let phdrs = match phdr_slice(data, len, ehdr) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let Some((lo, hi)) = load_span(phdrs) else {
+            return 0;
+        };
+        hi - lo
+    }
+}
+
+unsafe fn pe_compute_load_span(data: *const u8, len: usize) -> u64 {
+    unsafe {
+        match trona_loader::common::pe::header::validate(data, len) {
+            Ok(h) => h.opt.size_of_image as u64,
+            Err(_) => 0,
+        }
+    }
+}
 
 pub(crate) struct PeRuntimeSupportPlan {
     pub pe_rtld_cpio_path: [u8; 64],
@@ -35,22 +60,27 @@ pub(crate) unsafe fn plan_pe_runtime_support(
     initrd_size: usize,
 ) -> Option<PeRuntimeSupportPlan> {
     unsafe {
-        let pe_rtld_soname = b"ld-trona-pe.so";
+        let pe_rtld_soname = b"ldtrona-pe.so";
+        const LIB_PREFIX: &[u8] = b"/lib/";
         let mut pe_rtld_cpio_path = [0u8; 64];
-        let pe_rtld_cpio_len = trona_loader::elf_dynamic::build_initrd_lib_path(
-            pe_rtld_soname,
-            &mut pe_rtld_cpio_path,
-        );
-        let pe_rtld_vfs_path = b"/lib/ld-trona-pe.so";
+        let mut i = 0;
+        while i < LIB_PREFIX.len() {
+            pe_rtld_cpio_path[i] = LIB_PREFIX[i];
+            i += 1;
+        }
+        i = 0;
+        while i < pe_rtld_soname.len() {
+            pe_rtld_cpio_path[LIB_PREFIX.len() + i] = pe_rtld_soname[i];
+            i += 1;
+        }
+        let pe_rtld_cpio_len = LIB_PREFIX.len() + pe_rtld_soname.len();
+        let pe_rtld_vfs_path = b"/lib/ldtrona-pe.so";
         let mut pe_rtld_from_vfs = false;
         let pe_rtld_span = 'rtld_span: {
             if let Some(vfs_result) =
                 crate::loader::vfs_load::try_load_from_vfs(pe_rtld_vfs_path, pe_rtld_vfs_path.len())
             {
-                let span = trona_loader::elf_loader::elf_compute_load_span(
-                    vfs_result.data,
-                    vfs_result.data_len,
-                );
+                let span = elf_compute_load_span(vfs_result.data, vfs_result.data_len);
                 crate::loader::vfs_load::cleanup_vfs_load(vfs_result.data, vfs_result.alloc_size);
                 if span != 0 {
                     pe_rtld_from_vfs = true;
@@ -58,41 +88,42 @@ pub(crate) unsafe fn plan_pe_runtime_support(
                 }
             }
 
-            let mut pe_rtld_entry = CpioEntry::zeroed();
-            if pe_rtld_cpio_len == 0
-                || trona_loader::cpio::cpio_find_file(
-                    initrd,
-                    initrd_size,
-                    pe_rtld_cpio_path.as_ptr(),
-                    pe_rtld_cpio_len,
-                    &raw mut pe_rtld_entry,
-                ) == 0
-            {
+            if pe_rtld_cpio_len == 0 {
                 return None;
             }
+            let pe_rtld_entry = match trona_loader::common::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                &pe_rtld_cpio_path[..pe_rtld_cpio_len],
+            ) {
+                Some(e) => e,
+                None => return None,
+            };
 
-            trona_loader::elf_loader::elf_compute_load_span(
-                pe_rtld_entry.data,
-                pe_rtld_entry.data_len,
-            )
+            elf_compute_load_span(pe_rtld_entry.data, pe_rtld_entry.data_len)
         };
 
         let kernel32_soname = b"kernel32.dll";
         let mut kernel32_cpio_path = [0u8; 64];
-        let kernel32_cpio_len = trona_loader::elf_dynamic::build_initrd_lib_path(
-            kernel32_soname,
-            &mut kernel32_cpio_path,
-        );
+        let mut i = 0;
+        while i < LIB_PREFIX.len() {
+            kernel32_cpio_path[i] = LIB_PREFIX[i];
+            i += 1;
+        }
+        i = 0;
+        while i < kernel32_soname.len() {
+            kernel32_cpio_path[LIB_PREFIX.len() + i] = kernel32_soname[i];
+            i += 1;
+        }
+        let kernel32_cpio_len = LIB_PREFIX.len() + kernel32_soname.len();
         let kernel32_vfs_path = b"/lib/kernel32.dll";
         let mut kernel32_from_vfs = false;
         let kernel32_span = 'k32_span: {
-            if let Some(vfs_result) =
-                crate::loader::vfs_load::try_load_from_vfs(kernel32_vfs_path, kernel32_vfs_path.len())
-            {
-                let span = trona_loader::pe_loader::pe_compute_load_span(
-                    vfs_result.data,
-                    vfs_result.data_len,
-                );
+            if let Some(vfs_result) = crate::loader::vfs_load::try_load_from_vfs(
+                kernel32_vfs_path,
+                kernel32_vfs_path.len(),
+            ) {
+                let span = pe_compute_load_span(vfs_result.data, vfs_result.data_len);
                 crate::loader::vfs_load::cleanup_vfs_load(vfs_result.data, vfs_result.alloc_size);
                 if span != 0 {
                     kernel32_from_vfs = true;
@@ -100,17 +131,16 @@ pub(crate) unsafe fn plan_pe_runtime_support(
                 }
             }
 
-            let mut k32_entry = CpioEntry::zeroed();
-            if kernel32_cpio_len != 0
-                && trona_loader::cpio::cpio_find_file(
+            if kernel32_cpio_len != 0 {
+                if let Some(k32_entry) = trona_loader::common::cpio::cpio_find_file(
                     initrd,
                     initrd_size,
-                    kernel32_cpio_path.as_ptr(),
-                    kernel32_cpio_len,
-                    &raw mut k32_entry,
-                ) != 0
-            {
-                trona_loader::pe_loader::pe_compute_load_span(k32_entry.data, k32_entry.data_len)
+                    &kernel32_cpio_path[..kernel32_cpio_len],
+                ) {
+                    pe_compute_load_span(k32_entry.data, k32_entry.data_len)
+                } else {
+                    0
+                }
             } else {
                 0
             }
@@ -143,7 +173,7 @@ pub(crate) unsafe fn load_pe_runtime_support(
         let pe_result =
             exec_load_pe_mmsrv(data, data_len, layout.elf_code.base, pid, child_vspace).ok()?;
 
-        let pe_rtld_vfs_path = b"/lib/ld-trona-pe.so";
+        let pe_rtld_vfs_path = b"/lib/ldtrona-pe.so";
         let rtld_result = if support.pe_rtld_from_vfs {
             exec_load_elf_from_vfs(pe_rtld_vfs_path, layout.rtld.base, pid, child_vspace)?
         } else {
@@ -194,13 +224,12 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
     child_vspace: Cap,
 ) -> Result<PeLoadResult, i32> {
     unsafe {
-        let mut info = trona_loader::pe_loader::PeInfo::zeroed();
-        let err = trona_loader::pe_loader::pe_validate(data, data_len, &raw mut info);
-        if err != 0 {
-            return Err(err);
-        }
+        let info = match trona_loader::common::pe::header::validate(data, data_len) {
+            Ok(h) => h,
+            Err(_) => return Err(-1),
+        };
 
-        let image_size = info.size_of_image as u64;
+        let image_size = info.opt.size_of_image as u64;
         let total_pages = ((image_size + 4095) / 4096) as usize;
         if total_pages == 0 {
             return Err(-1);
@@ -222,7 +251,7 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
 
                 volatile_zero(stage, chunk_len);
 
-                let header_bytes = core::cmp::min(info.size_of_headers as usize, data_len);
+                let header_bytes = core::cmp::min(info.opt.size_of_headers as usize, data_len);
                 let header_copy_start = chunk_rva;
                 let header_copy_end = core::cmp::min(chunk_rva + chunk_len, header_bytes);
                 if header_copy_start < header_copy_end {
@@ -233,9 +262,9 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
                     );
                 }
 
-                for sec_idx in 0..info.number_of_sections as usize {
-                    let sec_off = info.section_headers_offset
-                        + sec_idx * core::mem::size_of::<SectionHeader>();
+                for sec_idx in 0..info.num_sections {
+                    let sec_off =
+                        info.section_offset + sec_idx * core::mem::size_of::<SectionHeader>();
                     let sec = core::ptr::read_unaligned(data.add(sec_off) as *const SectionHeader);
                     let sec_rva = sec.virtual_address as usize;
                     let sec_raw_off = sec.pointer_to_raw_data as usize;
@@ -271,6 +300,40 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
                 }
 
                 if page_off == 0 {
+                    // PE images collapse .text/.rdata/.data into one writable
+                    // region because the PE loader materializes relocations
+                    // and IAT fix-ups in place before dropping write.
+                    // Pick the dominant classification from section
+                    // characteristics so procfs VmExe/VmData/VmLib reflect
+                    // the image's nature rather than always labeling it as
+                    // VmData:
+                    //   any executable section  -> IMAGE_TEXT
+                    //   else any writable       -> IMAGE_DATA
+                    //   else                    -> IMAGE_RO
+                    const REGION_TYPE_IMAGE_TEXT: u64 = 8;
+                    const REGION_TYPE_IMAGE_DATA: u64 = 9;
+                    const REGION_TYPE_IMAGE_RO: u64 = 6;
+                    let mut has_exec = false;
+                    let mut has_write = false;
+                    for sec_idx in 0..info.num_sections {
+                        let sec_off =
+                            info.section_offset + sec_idx * core::mem::size_of::<SectionHeader>();
+                        let sec =
+                            core::ptr::read_unaligned(data.add(sec_off) as *const SectionHeader);
+                        if sec.characteristics & trona_protocol::win32::IMAGE_SCN_MEM_EXECUTE != 0 {
+                            has_exec = true;
+                        }
+                        if sec.characteristics & trona_protocol::win32::IMAGE_SCN_MEM_WRITE != 0 {
+                            has_write = true;
+                        }
+                    }
+                    let region_type = if has_exec {
+                        REGION_TYPE_IMAGE_TEXT
+                    } else if has_write {
+                        REGION_TYPE_IMAGE_DATA
+                    } else {
+                        REGION_TYPE_IMAGE_RO
+                    };
                     let region_base = mmsrv_ipc::alloc_private_copy_from_client_region_to_mmsrv(
                         pid,
                         load_base,
@@ -278,7 +341,8 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
                         chunk_vaddr,
                         stage as u64,
                         chunk_count as u64,
-                        trona::VSPACE_FLAG_WRITABLE | trona::VSPACE_FLAG_USER,
+                        uapi::KERNITE_PAGE_FLAG_WRITABLE | uapi::KERNITE_PAGE_FLAG_USER,
+                        region_type,
                     )
                     .map_err(|_| -2)?;
                     if region_base != load_base {
@@ -306,7 +370,7 @@ pub(crate) unsafe fn exec_load_pe_mmsrv(
         free_staging_buffer(stage, MAX_CHUNK);
         load_status?;
 
-        let entry_va = load_base + info.entry_point_rva as u64;
+        let entry_va = load_base + info.opt.address_of_entry_point as u64;
         Ok(PeLoadResult {
             entry: entry_va,
             base: load_base,
@@ -325,20 +389,19 @@ pub(crate) unsafe fn exec_load_pe_mmsrv_by_name(
     child_vspace: Cap,
 ) -> Option<PeLoadResult> {
     unsafe {
-        let mut pe_entry = CpioEntry::zeroed();
-        if trona_loader::cpio::cpio_find_file(
+        let pe_entry = match trona_loader::common::cpio::cpio_find_file(
             initrd,
             initrd_size,
-            pe_name,
-            pe_name_len,
-            &raw mut pe_entry,
-        ) == 0
-        {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] exec: PE image not found in initrd\n");
-            });
-            return None;
-        }
+            core::slice::from_raw_parts(pe_name, pe_name_len),
+        ) {
+            Some(e) => e,
+            None => {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] exec: PE image not found in initrd\n");
+                });
+                return None;
+            }
+        };
 
         match exec_load_pe_mmsrv(
             pe_entry.data,
@@ -349,7 +412,7 @@ pub(crate) unsafe fn exec_load_pe_mmsrv_by_name(
         ) {
             Ok(result) => Some(result),
             Err(err) => {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] exec: PE image load failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -374,7 +437,7 @@ pub(crate) unsafe fn exec_load_pe_from_vfs(
         match load_result {
             Ok(r) => Some(r),
             Err(err) => {
-                trona::uerror!(|_lb| {
+                trona_runtime::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] exec: VFS PE load failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");

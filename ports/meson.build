@@ -3,10 +3,14 @@
 #
 # Discovers ports by scanning for <name>/<name>.port files.
 # Parses [depends] sections from each port file for build ordering.
-# Port manifests are consumed by mkrootfs/rootfs profile assembly.
+# Each port_<name> custom_target outputs a single manifest file; actual
+# artifacts live under ports/<name>/stage-<arch>/ and are overlaid into
+# build-<arch>/sysroot by the port tool itself. mkrootfs consumes the
+# stage tree directly.
 #
 # Two-pass approach:
-#   Pass 1: discover ports, parse [depends] build deps
+#   Pass 1: discover ports, parse [depends] build deps (names only — the
+#           port tool enforces version constraints internally)
 #   Pass 2: topological sort, then create custom_targets with resolved deps
 
 fs_mod = import('fs')
@@ -22,13 +26,14 @@ endforeach
 
 port_depends = []
 
-# Pass 1: parse metadata from each port file
+# Pass 1: parse [depends] build deps for ordering.
+# Each dep entry may carry a version constraint (e.g. "ncurses >= 6.5"),
+# but for ordering we only need the leading name token.
 foreach pname : port_names
   port_file = pname / pname + '.port'
   port_content = fs_mod.read(port_file)
   lines = port_content.strip().split('\n')
 
-  # Parse [depends] section for build dependencies
   _in_depends = false
   _build_deps = []
   foreach line : lines
@@ -48,9 +53,14 @@ foreach pname : port_names
       _dparts = _s.split('=')
       if _dparts.length() > 1
         foreach _dep : _dparts[1].strip().split(',')
-          _d = _dep.strip()
-          if _d != ''
-            _build_deps += _d
+          _token = _dep.strip()
+          if _token != ''
+            # Strip anything after the first whitespace/comparator so we
+            # keep only the port name for meson's dep graph.
+            _name = _token.split(' ')[0].split('>')[0].split('<')[0].split('=')[0].split('!')[0].strip()
+            if _name != ''
+              _build_deps += _name
+            endif
           endif
         endforeach
       endif
@@ -61,7 +71,6 @@ foreach pname : port_names
 endforeach
 
 # Pass 2: topological sort (Kahn's algorithm).
-# Repeatedly pick ports whose dependencies have all been placed already.
 _remaining = port_names
 _ordered_ports = []
 _max_iter = port_names.length() * port_names.length() + 1
@@ -111,7 +120,7 @@ foreach pname : _ordered_ports
   endforeach
 
   _pt = custom_target('port_' + pname,
-    output: [pname + '.manifest'],
+    output: pname + '.manifest',
     depends: [port_tool, libtrona_so, libc_so, libcxx_so, crt_start_obj, sysroot_target] + _extra_deps,
     depend_files: files(port_file) + basaltc_header_files,
     command: [port_tool, 'build',

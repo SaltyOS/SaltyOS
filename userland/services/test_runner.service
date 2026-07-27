@@ -1,13 +1,35 @@
 [Service]
 Name=test_runner
 Binary=/bin/test_runner
-Type=simple
+Type=oneshot
 Restart=no
 
 [Dependencies]
-After=procmgr vfs posix_getty dnssrv saltyfs rootfs.target
+# test_runner only talks to COM1 / supervisor control / vfs; it does not need a
+# controlling TTY, so posix_getty is deliberately excluded here. This
+# keeps test orchestration independent of login-prompt health.
+After=vfs dnssrv saltyfs rootfs.target
 Before=
+Requires=namesrv.socket
+RequiresInterface=vfs:process-client mmsrv:process-client
 
 [Capabilities]
-# test_runner resolves dnssrv dynamically via namesrv lookup; all other
-# system roles flow through procmgr's populate_cap_table by default.
+# test_runner resolves dnssrv dynamically via namesrv lookup and uses POSIX
+# filesystem calls through vfs.
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

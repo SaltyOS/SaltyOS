@@ -21,7 +21,7 @@ option('build_kernel',
 
 option('build_userland',
   type: 'boolean',
-  value: false,
+  value: true,
   description: 'Build userland components')
 
 option('build_ports',
@@ -52,6 +52,11 @@ option('userland_log_level',
   choices: ['error', 'warn', 'info', 'debug', 'trace'],
   value: 'info',
   description: 'Userland log verbosity level')
+
+option('userland_aslr',
+  type: 'boolean',
+  value: true,
+  description: 'Enable randomized userland virtual-address layouts')
 
 option('kernel_debug_modules',
   type: 'string',
@@ -84,15 +89,6 @@ option('build_libcxx',
   value: 'auto',
   description: 'Build libc++.so from toolchain/llvm-project sources (auto=detect, true=require, false=skip)')
 
-# VFS worker pool
-option('vfs_worker_pool',
-  type: 'boolean',
-  value: false,
-  description: 'Enable multi-threaded worker pool for the VFS server')
-
-option('vfs_worker_count_override',
-  type: 'integer',
-  min: 0,
-  max: 32,
-  value: 0,
-  description: 'Override VFS worker count (0 = auto)')
+# VFS worker pool is always on — `owner::worker::spawn_workers` spawns
+# the asymmetric data-plane pool at VFS boot. The size lives in
+# `MAX_WORKERS` in `owner/worker.rs`, not here.

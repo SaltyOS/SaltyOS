@@ -1,368 +1,258 @@
-# SaltyOS ABI Specification
+# kernite ABI Specification
 
-This document defines the low-level Application Binary Interface (ABI) between
-userspace and the SaltyOS kernel. It covers system call calling conventions for
-both supported architectures, the IPC buffer layout, message info encoding, and
-VSpace page mapping flags.
+The kernite ABI is the linkage contract between userland and the
+microkernel. The single source of truth is the C UAPI headers in
+`kernite/include/uapi/` (umbrella `kernite.h`), generated into Rust
+via bindgen; everything in this document mirrors values and types
+defined there.
 
-For the full system call table and capability invocation reference, see
-[syscalls.md](syscalls.md).
+For the full invoke-label reference, see [syscalls.md](syscalls.md).
 
----
+## Object model
 
-## 1. System Call Calling Conventions
-
-SaltyOS provides a single system call entry point per architecture. The syscall
-number selects the operation; arguments are passed in registers.
-
-### 1.1 x86_64
-
-**Entry instruction:** `syscall`
-
-#### Register Convention
-
-| Register | Role |
-|----------|------|
-| RAX | System call number (0-27) |
-| RDI | Argument 0 (capability pointer) |
-| RSI | Argument 1 (msg_info / label) |
-| RDX | Argument 2 (MR0 / arg0) |
-| R10 | Argument 3 (MR1 / arg1) -- RCX is clobbered by `syscall` |
-| R8 | Argument 4 (MR2 / arg2) |
-| R9 | Argument 5 (MR3 / arg3) |
-
-#### Return Convention
-
-| Register | Role |
-|----------|------|
-| RAX | Error code (0 = success, see [Error Codes](#5-error-codes)) |
-| RDX | Return value (syscall-specific payload) |
-
-#### Clobbered Registers
-
-The `syscall` instruction clobbers RCX (saved RIP) and R11 (saved RFLAGS).
-Userspace wrappers must move RCX to R10 before entry:
-
-```nasm
-; User-space syscall wrapper
-syscall_invoke:
-    mov r10, rcx        ; Save arg3 (RCX clobbered by SYSCALL)
-    syscall
-    ret
-```
-
-#### Kernel-Internal Mapping
-
-Assembly in `kernite/src/arch/x86_64/syscall.S` remaps user registers to
-System V AMD64 calling convention before calling `syscall_handle_rust`:
+Every kernel resource is a typed object, identified to userland by an
+`OBJ_*` discriminant. Capabilities are user-visible handles to those
+objects; rights and badges live on the capability slot. Objects are
+created by retyping memory out of an `Untyped` region
+(`UNTYPED_RETYPE`).
 
 ```
-User register   Kernel parameter   System V register
-─────────────   ────────────────   ─────────────────
-RAX             syscall number     RDI
-RDI             cap_ptr            RSI
-RSI             arg0 (msg_info)    RDX
-RDX             arg1               RCX
-R10             arg2               R8
-R8              arg3               R9
-R9              arg4               stack
+OBJ_NULL             = 0   // not a valid retype target
+OBJ_UNTYPED          = 1
+OBJ_TCB              = 2
+OBJ_CNODE            = 3
+OBJ_VSPACE           = 4
+OBJ_FRAME            = 5
+OBJ_IRQ_HANDLER      = 6
+OBJ_IO_PORT          = 7
+OBJ_SCHED_CONTEXT    = 8
+OBJ_MEMORY_OBJECT    = 9
+OBJ_EVENT_QUEUE      = 10
+OBJ_WATCH            = 11
+OBJ_MESSAGE_PIPE     = 12
+OBJ_DATA_PIPE        = 13
+OBJ_TIMER            = 14
+OBJ_KERNEL_RNG       = 15
+OBJ_SYSTEM_CONTROL   = 16
+OBJ_CLOCK            = 17
+OBJ_SYSTEM_INFO      = 18
+OBJ_KERNEL_DEBUG     = 19
+OBJ_MESSAGE_PIPE_CORE  = 20
+OBJ_DATA_PIPE_CORE     = 21
+// 22 is retired/gap
+OBJ_PAGER              = 23
+OBJ_DEVICE_CONTROL     = 24
+OBJ_VM_HIERARCHY_STATE = 25
 ```
 
-The `SyscallResult` struct (`{ error: u64, value: u64 }`) is returned in
-RAX:RDX per the System V AMD64 ABI for two-member structs.
+`MessagePipe` / `DataPipe` are bidirectional and created as a peer
+pair from a single retype. `Watch` is a one-shot or repeating
+state-flag watcher. `Timer` fires monotonic-deadline events into a
+bound `EventQueue`. The kernel-authority caps (`KernelRng`,
+`SystemControl`, `Clock`, `SystemInfo`, `KernelDebug`) carry no
+per-instance state — they grant the right to perform a system-wide
+operation.
 
----
+## State flags
 
-### 1.2 aarch64
-
-**Entry instruction:** `svc #0`
-
-#### Register Convention
-
-| Register | Role |
-|----------|------|
-| x8 | System call number (0-27) |
-| x0 | Argument 0 (capability pointer) |
-| x1 | Argument 1 (msg_info / label) |
-| x2 | Argument 2 (MR0 / arg0) |
-| x3 | Argument 3 (MR1 / arg1) |
-| x4 | Argument 4 (MR2 / arg2) |
-| x5 | Argument 5 (MR3 / arg3) |
-
-#### Return Convention
-
-| Register | Role |
-|----------|------|
-| x0 | Error code (0 = success, see [Error Codes](#5-error-codes)) |
-| x1 | Return value (syscall-specific payload) |
-
-#### Notes
-
-- The SVC exception (EC=0x15) is handled in `kernite/src/arch/aarch64/exceptions.rs`.
-- x0-x5 map directly to AAPCS64 function arguments, so no register remapping
-  is needed before calling `syscall_handle_rust`.
-- Return values are written back to the exception frame's x0 and x1 slots via
-  `restore_el0_frame_from_current_tcb(frame, result.error, result.value)`.
-
----
-
-### 1.3 IPC Fastpath
-
-For performance-critical IPC operations, the kernel provides an assembly-level
-fastpath that bypasses the full slowpath dispatch. The fastpath is attempted for:
-
-- **Call** (syscall 2)
-- **ReplyRecv** (syscall 3)
-- **ReplyRecvAny** (syscall 24)
-
-The fastpath bails to the slowpath when:
-- `extra_caps > 0` (capability transfer required)
-- `length > 4` (message exceeds inline registers)
-- No waiting partner on the endpoint
-- Cross-CPU transfer (remote endpoint)
-- Thread has a pending fault
-
-On x86_64, the fastpath is dispatched in `syscall.S` before entering the C/Rust
-slowpath. On aarch64, the dispatch occurs in the SVC handler in `exceptions.rs`
-before calling `syscall_handle_rust`.
-
----
-
-## 2. IPC Buffer Layout
-
-Every thread has a single IPC buffer page (4096 bytes) mapped into its virtual
-address space. The kernel and userspace share this page for extended IPC data
-that does not fit in registers.
-
-### 2.1 Structure
+Watchable objects expose a 64-bit `state_flags` word. Userland
+registers a `Watch` against a `(state_flags, mask)` pair; when any
+masked bit becomes asserted in the object's state, an `EventRecord` is
+enqueued into the watch's bound `EventQueue`.
 
 ```
-Offset  Size     Field
-──────  ───────  ──────────────────────────────────────────────────
-0x000   176 B    msg[22]         Message buffer (label, length, MR0-MR19)
-0x0B0     8 B    badge           Received sender badge
-0x0B8    32 B    caps[4]         Capability slots to transfer (sender-side)
-0x0D8     8 B    receive_cnode   CNode capability for receiving caps
-0x0E0     8 B    receive_index   Starting slot index in receive CNode
-0x0E8     8 B    receive_depth   CNode depth for cap lookup
-0x0F0  3824 B    reserved[478]   Extended payload / invoke helper area
-──────  ───────  ──────────────────────────────────────────────────
-Total: 4096 B    (one 4KB page)
+STATE_READABLE          = 1 << 0
+STATE_WRITABLE          = 1 << 1
+STATE_PEER_CLOSED       = 1 << 2
+STATE_CLOSED            = 1 << 3
+STATE_ERROR             = 1 << 4
+STATE_HANGUP            = 1 << 5
+STATE_OVERRUN           = 1 << 6
+STATE_SIGNALED          = 1 << 7
+STATE_TIMED_OUT         = 1 << 8
+STATE_READ_THRESHOLD    = 1 << 9   // DataPipe RX bytes >= rx_threshold
+STATE_WRITE_THRESHOLD   = 1 << 10  // DataPipe TX free >= tx_threshold
 ```
 
-### 2.2 msg[] Array Overlay
+The semantics are object-typed:
 
-The `msg[22]` array is overlaid by the userland `trona_msg` structure:
+| Object        | Bits asserted |
+|---------------|---------------|
+| `EventQueue`  | `READABLE` while non-empty; `CLOSED` on destroy. |
+| `MessagePipe` | `READABLE` / `WRITABLE` track queue level; `PEER_CLOSED` set when the other end half-closes. |
+| `DataPipe`    | Same as `MessagePipe`, byte-level. |
+| `Timer`       | `SIGNALED` set on each fire; userland clears via `Watch` ack or `TIMER_SET`. |
+| `IrqHandler`  | `SIGNALED` set on IRQ assertion; `IRQ_HANDLER_ACK` clears. |
 
-| Index | Field | Description |
-|-------|-------|-------------|
-| 0 | `label` | Application-defined message label |
-| 1 | `length` | Number of message registers used |
-| 2-21 | `regs[0..19]` | Message registers MR0 through MR19 |
+## EventRecord wire format
 
-MR0-MR3 are passed in CPU registers (fastpath). MR4-MR19 overflow to the IPC
-buffer when `length > 4`.
-
-### 2.3 Capability Transfer
-
-To transfer capabilities during IPC:
-
-1. **Sender** writes source capability slot indices into `caps[0..3]` and sets
-   `extra_caps` in the message info word.
-2. **Receiver** pre-configures `receive_cnode`, `receive_index`, and
-   `receive_depth` to specify where received capabilities should be placed.
-
-Up to 4 capabilities can be transferred per IPC operation.
-
-### 2.4 Reserved Area
-
-The `reserved[478]` area (word offsets 30-507) is used by:
-
-- **RecvAny/ReplyRecvAny** syscalls: endpoint capability pointers are read from
-  `reserved[0..N-1]` where N is the endpoint count. For `ReplyRecvAnyTimed`,
-  the timeout is read from `reserved[N]`.
-- **VSPACE_WALK** invoke: writes physical address / flags tuples starting at
-  word offset 30.
-- **Invoke extensions**: various capability invocations use this area for
-  bulk data transfer.
-
----
-
-## 3. Message Info Encoding
-
-All IPC syscalls (Send, Recv, Call, ReplyRecv, NBSend, and their variants) use a
-packed 64-bit `msg_info` word.
-
-### 3.1 Bit Layout
+`EQ_WAIT` and `EQ_POLL` deliver one `kernite_event_record` per call.
+The kernel writes the record into `reserved[]` in the IPC buffer at
+`KERNITE_IPC_RESERVED_EVENT_RECORD_BASE`. The struct layout is:
 
 ```
- 63       52  51                 12  11      7  6        0
-┌───────────┬────────────────────┬──────────┬───────────┐
-│ Reserved  │       Label        │ExtraCaps │  Length   │
-│  (zero)   │     (40 bits)      │ (5 bits) │ (7 bits) │
-└───────────┴────────────────────┴──────────┴───────────┘
+struct kernite_event_record {
+    kind       : u32   // EVENT_TYPE_*
+    status     : u32   // EVENT_STATUS_*
+    cookie     : u64   // opaque caller-supplied tag
+    object_id  : u64   // watched-object identity (Watch arms)
+    state_set  : u64   // STATE_* bits asserted
+    state_seen : u64   // STATE_* bits userland already knew about
+    payload0   : u64
+    payload1   : u64
+    payload2   : u64
+}
 ```
 
-### 3.2 Field Definitions
+`kind` (`EVENT_TYPE_*`):
 
-| Field | Bits | Width | Range | Description |
-|-------|------|-------|-------|-------------|
-| Length | 6:0 | 7 | 0-127 | Number of message registers used |
-| ExtraCaps | 11:7 | 5 | 0-31 | Number of capabilities to transfer via IPC buffer |
-| Label | 51:12 | 40 | -- | Application-defined message label |
-| Reserved | 63:52 | 12 | 0 | Must be zero |
-
-### 3.3 Construction
-
-```c
-#define TRONA_MSGINFO(label, length, extra_caps) \
-    (((uint64_t)(label) << 12) | \
-     ((uint64_t)(extra_caps) << 7) | \
-     ((uint64_t)(length) & 0x7F))
+```
+EVENT_TYPE_NONE           = 0
+EVENT_TYPE_STATE          = 1   // state_flags transition
+EVENT_TYPE_IRQ            = 2
+EVENT_TYPE_TIMER          = 3
+EVENT_TYPE_PIPE           = 4   // MP/DP record arrival
+EVENT_TYPE_USER           = 5   // userland-pushed record
+EVENT_TYPE_OVERFLOW       = 6   // dropped-event marker
+EVENT_TYPE_PAGER_REQUEST  = 7   // file-backed page fault — vfs supplies
 ```
 
-### 3.4 Extraction
+`status` (`EVENT_STATUS_*`):
 
-```c
-#define TRONA_MSGINFO_LENGTH(info)     ((info) & 0x7F)
-#define TRONA_MSGINFO_EXTRA_CAPS(info) (((info) >> 7) & 0x1F)
-#define TRONA_MSGINFO_LABEL(info)      (((info) >> 12) & 0xFFFFFFFFFF)
+```
+EVENT_STATUS_OK            = 0
+EVENT_STATUS_CANCELLED     = 1
+EVENT_STATUS_PEER_CLOSE    = 2
+EVENT_STATUS_OBJECT_CLOSED = 3
+EVENT_STATUS_DROPPED       = 4
 ```
 
-### 3.5 Invoke Label Convention
+An `OVERFLOW` record signals that one or more events were dropped;
+after delivering it the queue resumes normal record delivery.
 
-For capability invocations (syscall 9), the `label` field of msg_info carries
-the invoke operation code. See [syscalls.md](syscalls.md) for the complete
-invoke label table.
+## MessagePipe wire format
 
----
+`MP_WRITE` / `MP_READ` operate on `kernite_mp_record` structs:
 
-## 4. VSpace Page Flags
+```
+struct kernite_mp_record {
+    label     : u64        // arbitrary message label
+    length    : u64        // count of valid words in words[]
+    cap_count : u64        // count of carrier caps
+    flags     : u64        // KERNITE_MP_FLAG_*
+    badge     : u64        // sender opaque tag (set by kernel on read)
+    txid      : u64        // MP_CALL correlation id
+    words     : [u64; 32]  // inline message payload
+}
+```
 
-Page mapping operations (`VSpace_Map`, `VSpace_MapDemand`, `VSpace_Protect`,
-etc.) accept a `flags` argument as a bitmask.
+MP record flags (`KERNITE_MP_FLAG_*`):
 
-### 4.1 Flag Definitions
+```
+MP_FLAG_NONE   = 0
+MP_FLAG_CALL   = 1 << 0   // sender expects reply
+MP_FLAG_REPLY  = 1 << 1   // this record is a reply
+MP_FLAG_FAULT  = 1 << 2   // kernel-injected fault record
+```
 
-| Bit | Constant | Value | Description |
-|-----|----------|-------|-------------|
-| 0 | `VSPACE_FLAG_WRITABLE` | 0x01 | Page is writable |
-| 1 | `VSPACE_FLAG_USER` | 0x02 | Page is accessible from user mode (EL0) |
-| 2 | `VSPACE_FLAG_EXECUTABLE` | 0x04 | Page is executable (NX/XN cleared) |
-| 3 | `VSPACE_FLAG_CACHE_DISABLE` | 0x08 | Disable caching (for MMIO) |
-| 4 | `VSPACE_FLAG_WRITE_THROUGH` | 0x10 | Write-through caching |
-| 5 | `VSPACE_FLAG_COW` | 0x20 | Copy-on-write: shared read-only until written |
+`txid` correlates `MP_CALL` senders with their eventual reply. The
+kernel generates sync call txids with bit 63 set
+(`KERNITE_MP_TXID_KERNEL_BIT`); userspace async request/reply txids
+must keep bit 63 clear so a user write cannot forge a sync reply.
+`txid == 0` is the "no correlation" sentinel.
 
-### 4.2 Common Flag Combinations
+Capability transfer happens out-of-band: senders pass cap CSpace
+indices in their IPC buffer's `caps[]` area; the kernel mints those
+into hidden carriers at `MP_WRITE` time. Receivers see installed
+receive-side slot indices in their own IPC buffer's `caps[]` area at
+`MP_READ` time, sourced from `receive_cnode`/`receive_index`/`receive_depth`.
 
-| Use Case | Flags | Value |
-|----------|-------|-------|
-| User code (RX) | USER \| EXECUTABLE | 0x06 |
-| User data (RW) | USER \| WRITABLE | 0x03 |
-| User read-only | USER | 0x02 |
-| User COW | USER \| WRITABLE \| COW | 0x23 |
-| Device MMIO | USER \| WRITABLE \| CACHE_DISABLE \| WRITE_THROUGH | 0x1B |
+## IPC buffer layout
 
-### 4.3 Architecture Translation
+Each TCB has a 4 KiB IPC buffer mapped at `TCB_SET_IPC_BUFFER`. Layout:
 
-These flags use architecture-neutral bit positions. The kernel translates them
-to hardware-specific page table entry formats:
+```
+offset 0x000  msg[34]        (overlay: label, length, regs[0..31])  272 bytes
+offset 0x110  badge          (set by kernel on inbound)                8 bytes
+offset 0x118  mp_flags       (KERNITE_MP_FLAG_* from inbound record)   8 bytes
+offset 0x120  caps[4]        (cap slot indices for transfer)           32 bytes
+offset 0x140  receive_cnode                                             8 bytes
+offset 0x148  receive_index                                             8 bytes
+offset 0x150  receive_depth                                             8 bytes
+offset 0x158  mp_txid        (MP_CALL correlation id)                  8 bytes
+offset 0x160  reserved[468]  (per-syscall extension; see below)     3744 bytes
+```
 
-- **x86_64:** Flags map directly to x86 PTE bits (Present, R/W, U/S, PCD, PWT, NX).
-- **aarch64:** The paging module (`kernite/src/arch/aarch64/paging.rs`)
-  translates logical x86-style flags to ARM hardware descriptors (AP, UXN, PXN,
-  AttrIndx for MAIR). Shared kernel code (vspace.rs) always operates on the
-  logical format; the translation is transparent.
+`msg[]` is the spillover area for messages whose `length > 4`.
+`mp_flags` surfaces the `flags` field of the inbound `kernite_mp_record`
+so receivers can inspect call/reply/fault bits without parsing the raw record.
+`mp_txid` carries the correlation id for `MP_CALL`; servers copy it into
+reply records so the kernel can wake the parked caller.
+`caps[]` is the four-slot capture/destination array for cap transfer.
+`reserved[]` is the per-call extension area; well-known indices:
 
----
+```
+reserved[0]  KERNITE_IPC_RESERVED_RECEIVE_SLOT_DEPTH  nested receive-slot depth
+reserved[1]  KERNITE_IPC_RESERVED_RECEIVED_CAP_COUNT  count of caps installed by kernel
+reserved[2]  KERNITE_IPC_RESERVED_EVENT_RECORD_BASE   kernite_event_record (9 u64 words)
+```
 
-## 5. Error Codes
+## VSpace page flags
 
-System calls return error codes in RAX (x86_64) or x0 (aarch64). All codes are
-positive integers.
+Mapping ops (`VSPACE_MAP`, `VSPACE_PROTECT`, …) take a flags word:
 
-| Code | Name | Description |
-|------|------|-------------|
-| 0 | `TRONA_OK` | Success |
-| 1 | `TRONA_INVALID_CAPABILITY` | Capability is null or invalid type |
-| 2 | `TRONA_INVALID_OPERATION` | Wrong object type or unsupported operation |
-| 3 | `TRONA_INSUFFICIENT_RIGHTS` | Capability lacks required rights |
-| 4 | `TRONA_INVALID_ARGUMENT` | Bad argument value |
-| 5 | `TRONA_OUT_OF_MEMORY` | No memory available |
-| 6 | `TRONA_NOT_FOUND` | Object not found (empty slot, unmapped page) |
-| 7 | `TRONA_BUSY` | Resource is busy (e.g., thread is Running) |
-| 8 | `TRONA_ALREADY_EXISTS` | Resource already exists (mapped page, occupied slot) |
-| 9 | `TRONA_WOULD_BLOCK` | Non-blocking operation has no work |
-| 10 | `TRONA_BAD_ADDRESS` | Invalid memory address |
-| 11 | `TRONA_OUT_OF_RANGE` | Value exceeds valid range |
-| 12 | `TRONA_CANCELLED` | Operation was cancelled or timed out |
-| 13 | `TRONA_RESTART` | Syscall should be restarted |
-| 14 | `TRONA_DEADLOCK` | Deadlock detected |
-| 15 | `TRONA_INTERRUPTED` | Interrupted by notification dispatch |
-| 0x10 | `TRONA_IN_PROGRESS` | Async operation in progress |
-| 0x80 | `TRONA_PENDING` | Deferred result pending |
+```
+PAGE_FLAG_WRITABLE     = 1 << 0
+PAGE_FLAG_USER         = 1 << 1
+PAGE_FLAG_EXECUTABLE   = 1 << 2
+PAGE_FLAG_COW          = 1 << 3
+PAGE_FLAG_DEMAND       = 1 << 4
+PAGE_FLAG_NOCACHE      = 1 << 5
+// bit 6 reserved
+PAGE_FLAG_WRITETHROUGH = 1 << 7
+```
 
----
+Region kinds (`KERNITE_REGION_KIND_*`) passed alongside the flags word
+to attribute mappings:
 
-## 6. Kernel Object Types
+```
+REGION_KIND_NONE       = 0
+REGION_KIND_IMAGE_TEXT = 1
+REGION_KIND_IMAGE_DATA = 2
+REGION_KIND_IMAGE_BSS  = 3
+REGION_KIND_HEAP       = 4
+REGION_KIND_STACK      = 5
+REGION_KIND_MMAP       = 6
+REGION_KIND_SHARED_LIB = 7
+```
 
-Object type constants for `Untyped_Retype` (invoke label 0x20):
+## Well-known capability slots
 
-| Value | Name | Description |
-|-------|------|-------------|
-| 1 | `OBJ_UNTYPED` | Raw physical memory |
-| 2 | `OBJ_ENDPOINT` | Synchronous IPC channel |
-| 3 | `OBJ_NOTIFICATION` | Async signaling primitive |
-| 4 | `OBJ_TCB` | Thread control block |
-| 5 | `OBJ_CNODE` | Capability storage node |
-| 6 | `OBJ_VSPACE` | Virtual address space (page table root) |
-| 7 | `OBJ_FRAME` | Physical memory page (min size_bits=12 for 4KB) |
-| 8 | `OBJ_IRQ_HANDLER` | Interrupt handler object |
-| 9 | `OBJ_IO_PORT` | I/O port range (x86_64 only) |
-| 10 | `OBJ_SCHED_CONTEXT` | Scheduling parameters |
-| 11 | `OBJ_MEMORY_OBJECT` | Memory object (page-granular backing store) |
+Every thread starts with three capability slots preinstalled in its
+CSpace. All other caps reach the thread via the userland startup
+descriptor (Trona startup block — userland concern, not kernite ABI).
 
----
+```
+CAP_SELF_TCB    = 0
+CAP_SELF_VSPACE = 1
+CAP_SELF_CSPACE = 2
+```
 
-## 7. Capability Rights
+## ABI version
 
-Capabilities carry a rights bitmask that restricts permitted operations.
+`SYS_INVOKE` against `CAP_SELF_TCB` with label `TCB_GET_ABI_VERSION`
+(`0x66`) returns the running kernel's ABI version word. Userland
+verifies the version on startup and refuses to proceed on mismatch.
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `CAP_RIGHTS_ALL` | 0xFFFF_FFFF | All rights granted |
+```
+KERNITE_ABI_MAJOR   = 0
+KERNITE_ABI_MINOR   = 0
+KERNITE_ABI_PATCH   = 2
+KERNITE_ABI_VERSION = 0x0000000000000002  // (major << 32) | (minor << 16) | patch
+```
 
-Individual rights (READ, WRITE, GRANT, etc.) are checked by invoke handlers.
-The `CNode_Copy` operation accepts a rights mask to restrict the copy.
+## Boot handoff
 
----
-
-## 8. Well-Known Virtual Addresses
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `BOOTINFO_VADDR` | 0x0000_0000_001F_F000 | BootInfo structure (init task only) |
-| `INITRD_VADDR` | 0x0000_0000_0100_0000 | Initrd CPIO archive mapping |
-| `SCRATCH_VADDR` | 0x0000_0000_0200_0000 | Scratch memory region |
-
----
-
-## 9. Subsystem IDs
-
-Used by procmgr to track per-process personality state:
-
-| Value | Name | Description |
-|-------|------|-------------|
-| 0 | `SUBSYSTEM_POSIX` | POSIX personality |
-| 1 | `SUBSYSTEM_WIN32` | Win32 personality |
-| 2 | `SUBSYSTEM_STARNITE` | Starnite Linux compatibility (planned) |
-
----
-
-## Cross-References
-
-- [System Call Reference](syscalls.md) -- full syscall table and invoke labels
-- [Boot Protocol](boot_protocol.md) -- kernel entry state and BootInfo ABI
-- [trona API Reference](trona-api.md) -- userspace syscall wrappers
-- [Capability Design](../design/capability.md) -- capability model details
-- [IPC Design](../design/ipc.md) -- IPC protocol design
+`BOOTINFO_VADDR` and `BOOTINFO_MAGIC` define the location and
+sentinel of the bootloader-built BootInfo TLV. The detailed TLV
+schema lives in [boot_protocol.md](boot_protocol.md).

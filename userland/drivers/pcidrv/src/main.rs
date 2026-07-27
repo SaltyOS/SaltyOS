@@ -18,20 +18,20 @@
 //!   Label 5 = PCI_GET_BAR_CAP: MR0=bus, MR1=dev, MR2=func, MR3=bar_idx
 //!       -> MR0=bar_phys, MR1=bar_size, MR2=bar_is_io, extra_cap #0
 //!
-//! Cap layout (set by init service file):
-//!   0  = self TCB
-//!   1  = self VSpace
-//!   2  = self CSpace
-//!   3  = server endpoint
-//!   14 = readiness notification
-//!   64 = PCI config space cap (IoPort on x86_64, ECAM device untyped on aarch64)
-//!   65 = name service endpoint
+//! Capability access:
+//!   CAP_SELF_* slots 0..=2 are ABI-stable.
+//!   Service/runtime attachments such as the service endpoint, readiness
+//!   notification, PCI config access, namesrv, and device_control are resolved
+//!   through trona role getters rather than fixed startup slots.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
 extern crate trona_posix;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "arch/x86_64.rs"]
@@ -40,31 +40,76 @@ mod arch;
 #[path = "arch/aarch64.rs"]
 mod arch;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::common::{
+    TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_NOT_FOUND, TRONA_OK, TRONA_OUT_OF_MEMORY,
+};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::pci::*;
+use trona_runtime::core::slot_alloc::{OwnedCap, TransferCap};
 
 const CAP_SELF_CSPACE: u64 = 2;
+const PCI_IRQ_LEVEL_TRIGGERED: u64 = 1;
 
-// namesrv EP is delivered via `NeedEP=namesrv:65` in pcidrv.service; init
-// also pushes `ROLE_NAMESRV_CLIENT` into the startup cap_table (see
-// `ini::system_role_for_bare_name`) so the slot is reachable via the
-// substrate getter regardless of the specific NeedEP assignment.
-// IRQ control cap is delivered via `CopyCap=11:66` from init's slot 11
-// (CAP_IRQ_CONTROL in kernite/init.rs). It is not a role-bearing
-// system cap — there is no `trona::caps::irq_control()` getter — so the
-// slot number remains hardcoded here.
-const CAP_IRQ_CONTROL: u64 = 66;
+#[inline]
+fn device_control_cap() -> CapRef {
+    trona_runtime::client::caps::device_control().cap_ref()
+}
+
+fn create_ioport_cap(
+    control_cap: CapRef,
+    base_port: u64,
+    num_ports: u64,
+    dest_cspace: u64,
+    dest_slot: u64,
+) -> i32 {
+    invoke::device_control_create_ioport_depth(
+        control_cap,
+        base_port,
+        num_ports,
+        trona_runtime::core::slot_alloc::resolved_cap_ref(dest_cspace),
+        dest_slot,
+        trona_runtime::core::slot_alloc::slot_invoke_depth(dest_slot),
+    )
+}
+
+fn create_device_untyped_cap(
+    control_cap: CapRef,
+    phys: u64,
+    size_bits: u64,
+    dest_cspace: u64,
+    dest_slot: u64,
+) -> i32 {
+    invoke::device_control_create_device_untyped_depth(
+        control_cap,
+        phys,
+        size_bits,
+        trona_runtime::core::slot_alloc::resolved_cap_ref(dest_cspace),
+        dest_slot,
+        trona_runtime::core::slot_alloc::slot_invoke_depth(dest_slot),
+    )
+}
+
+fn create_irq_handler_cap(control_cap: CapRef, irq: u64, dest_cspace: u64, dest_slot: u64) -> i32 {
+    invoke::device_control_create_irq_handler_depth(
+        control_cap,
+        irq,
+        trona_runtime::core::slot_alloc::resolved_cap_ref(dest_cspace),
+        dest_slot,
+        PCI_IRQ_LEVEL_TRIGGERED,
+        trona_runtime::core::slot_alloc::slot_invoke_depth(dest_slot),
+    )
+}
+
+#[inline]
+fn alloc_runtime_slot() -> Option<trona_runtime::core::slot_alloc::OwnedSlot> {
+    trona_runtime::core::slot_alloc::alloc_slot()
+}
 
 const MAX_PCI_DEVICES: usize = 64;
 
-/// Next dynamic cap slot for IoPort caps created at runtime
-static mut NEXT_CAP_SLOT: u64 = 80;
-
-#[derive(Clone, Copy)]
 struct PciDevice {
     bus: u8,
     dev: u8,
@@ -78,9 +123,9 @@ struct PciDevice {
     /// Combined 64-bit physical addresses (handles 64-bit BARs)
     bar_phys: [u64; 6],
     bar_sizes: [u32; 6],
-    ioport_slots: [u64; 6],
-    devut_slots: [u64; 6],
-    irq_handler_slot: u64,
+    ioport_slots: [OwnedCap; 6],
+    devut_slots: [OwnedCap; 6],
+    irq_handler_slot: OwnedCap,
     active: bool,
 }
 
@@ -98,23 +143,90 @@ impl PciDevice {
             bars: [0; 6],
             bar_phys: [0; 6],
             bar_sizes: [0; 6],
-            ioport_slots: [0; 6],
-            devut_slots: [0; 6],
-            irq_handler_slot: 0,
+            ioport_slots: [const { OwnedCap::null() }; 6],
+            devut_slots: [const { OwnedCap::null() }; 6],
+            irq_handler_slot: OwnedCap::null(),
             active: false,
         }
     }
 }
 
-static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::zeroed(); MAX_PCI_DEVICES];
+static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [const { PciDevice::zeroed() }; MAX_PCI_DEVICES];
 static mut DEVICE_COUNT: usize = 0;
 
 fn ipc_ctx() -> *mut IpcContext {
     trona_posix::tls::current_ipc_ctx()
 }
 
-fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
+const MAX_REPLY_CAPS: usize = trona_kernel::uapi::KERNITE_IPC_MAX_CAPS as usize;
+
+struct PciReply {
+    msg: TronaMsg,
+    temp_caps: [Option<TransferCap>; MAX_REPLY_CAPS],
+    temp_count: usize,
+}
+
+impl PciReply {
+    fn new(msg: TronaMsg) -> Self {
+        Self {
+            msg,
+            temp_caps: [const { None }; MAX_REPLY_CAPS],
+            temp_count: 0,
+        }
+    }
+
+    fn error(label: u64) -> Self {
+        let mut msg = TronaMsg::zeroed();
+        msg.label = label;
+        Self::new(msg)
+    }
+
+    fn attach_cap_copy(&mut self, src_slot: u64) -> bool {
+        if src_slot == 0 || self.temp_count >= MAX_REPLY_CAPS {
+            return false;
+        }
+        let Some(temp) = trona_runtime::core::slot_alloc::alloc_slot() else {
+            return false;
+        };
+        let err = invoke::cnode_copy_ref(
+            CapRef::flat(CAP_SELF_CSPACE),
+            trona_runtime::core::slot_alloc::resolved_cap_ref(src_slot),
+            CapRef::flat(CAP_SELF_CSPACE),
+            trona_runtime::core::slot_alloc::resolved_cap_ref(temp.addr()),
+            // Device/MMIO caps egressed to clients never confer EXECUTE — a
+            // client may not map device memory executable (W^X).
+            (trona_kernel::uapi::KERNITE_RIGHT_ALL & !trona_kernel::uapi::KERNITE_RIGHT_EXECUTE)
+                as u64,
+        );
+        if err != 0 {
+            // copy failed: `temp` (OwnedSlot) Drop frees the empty slot.
+            return false;
+        }
+        // The copy landed a cap; adopt the slot as an OwnedCap and stage it for
+        // transfer (signals intent to send via IPC).
+        let tc = temp.assume_filled().into_transfer();
+        unsafe {
+            ipc::set_send_cap_ctx(ipc_ctx(), self.temp_count as i32, tc.slot());
+        }
+        self.temp_caps[self.temp_count] = Some(tc);
+        self.temp_count += 1;
+        true
+    }
+
+    fn release_temp_caps(&mut self, abort: bool) {
+        if self.temp_count != 0 && abort {
+            // On abort the IPC send did not happen, so clear the staged caps
+            // to avoid a stale send context on the next call.
+            unsafe {
+                ipc::clear_send_caps_ctx(ipc_ctx());
+            }
+        }
+        // Drop all TransferCaps; Drop impl calls delete_and_free.
+        for i in 0..MAX_REPLY_CAPS {
+            self.temp_caps[i] = None;
+        }
+        self.temp_count = 0;
+    }
 }
 
 /// Probe one PCI BAR size by writing all 1s and reading back.
@@ -136,7 +248,9 @@ fn probe_bar_size(bus: u8, dev: u8, func: u8, bar_idx: u8) -> u32 {
 
 /// Scan PCI bus 0, devices 0-31, all functions (multi-function aware).
 fn scan_bus() {
-    trona::uinfo!(|_lb| { _lb.str(b"[pcidrv] Scanning PCI bus 0...\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[pcidrv] Scanning PCI bus 0...\n");
+    });
 
     let mut count = 0usize;
     for dev in 0u8..32 {
@@ -234,14 +348,20 @@ fn scan_bus() {
                     if bar_raw != 0 && bar_size != 0 && (bar_raw & 1) != 0 {
                         let base_port = entry.bar_phys[bar_idx as usize];
                         let num_ports = bar_size as u64;
-                        let slot = *(&raw const NEXT_CAP_SLOT);
-                        *(&raw mut NEXT_CAP_SLOT) = slot + 1;
-                        let err = invoke::ioport_create(
-                            CAP_IRQ_CONTROL, base_port, num_ports,
-                            CAP_SELF_CSPACE, slot,
+                        let Some(slot) = alloc_runtime_slot() else {
+                            continue;
+                        };
+                        let err = create_ioport_cap(
+                            device_control_cap(),
+                            base_port,
+                            num_ports,
+                            CAP_SELF_CSPACE,
+                            slot.addr(),
                         );
                         if err == 0 {
-                            entry.ioport_slots[bar_idx as usize] = slot;
+                            entry.ioport_slots[bar_idx as usize] = slot.assume_filled();
+                        } else {
+                            // create failed: `slot` (OwnedSlot) Drop frees the empty slot.
                         }
                     }
                 }
@@ -253,14 +373,20 @@ fn scan_bus() {
                     let phys = entry.bar_phys[bar_idx as usize];
                     if phys != 0 && bar_size != 0 && (bar_raw & 1) == 0 {
                         let size_bits = ceil_log2(bar_size as u64);
-                        let slot = *(&raw const NEXT_CAP_SLOT);
-                        *(&raw mut NEXT_CAP_SLOT) = slot + 1;
-                        let err = invoke::device_untyped_create(
-                            CAP_IRQ_CONTROL, phys, size_bits as u64,
-                            CAP_SELF_CSPACE, slot,
+                        let Some(slot) = alloc_runtime_slot() else {
+                            continue;
+                        };
+                        let err = create_device_untyped_cap(
+                            device_control_cap(),
+                            phys,
+                            size_bits as u64,
+                            CAP_SELF_CSPACE,
+                            slot.addr(),
                         );
                         if err == 0 {
-                            entry.devut_slots[bar_idx as usize] = slot;
+                            entry.devut_slots[bar_idx as usize] = slot.assume_filled();
+                        } else {
+                            // create failed: `slot` (OwnedSlot) Drop frees the empty slot.
                         }
                     }
                 }
@@ -269,27 +395,30 @@ fn scan_bus() {
                 let effective_irq = arch::resolve_pci_irq(dev, func, irq_line);
                 if effective_irq != 0 && effective_irq != 0xFF {
                     entry.irq_line = effective_irq;
-                    let slot = *(&raw const NEXT_CAP_SLOT);
-                    *(&raw mut NEXT_CAP_SLOT) = slot + 1;
-                    let err = invoke::irq_control_get(
-                        CAP_IRQ_CONTROL, effective_irq as u64,
-                        CAP_SELF_CSPACE, slot,
-                    );
-                    if err == 0 {
-                        entry.irq_handler_slot = slot;
-                    } else {
-                        trona::uwarn!(|_lb| {
-                            _lb.str(b"[pcidrv] irq_control_get IRQ ");
-                            _lb.dec(effective_irq as u64);
-                            _lb.str(b" failed: ");
-                            _lb.dec(err as u64);
-                            _lb.putc(b'\n');
-                        });
+                    if let Some(slot) = alloc_runtime_slot() {
+                        let err = create_irq_handler_cap(
+                            device_control_cap(),
+                            effective_irq as u64,
+                            CAP_SELF_CSPACE,
+                            slot.addr(),
+                        );
+                        if err == 0 {
+                            entry.irq_handler_slot = slot.assume_filled();
+                        } else {
+                            // create failed: `slot` (OwnedSlot) Drop frees the empty slot.
+                            trona_runtime::uwarn!(|_lb| {
+                                _lb.str(b"[pcidrv] device_control IRQ ");
+                                _lb.dec(effective_irq as u64);
+                                _lb.str(b" failed: ");
+                                _lb.dec(err as u64);
+                                _lb.putc(b'\n');
+                            });
+                        }
                     }
                 }
             }
 
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[pcidrv]   ");
                 _lb.hex(vid as u64);
                 _lb.putc(b':');
@@ -313,9 +442,11 @@ fn scan_bus() {
         }
     }
 
-    unsafe { *(&raw mut DEVICE_COUNT) = count; }
+    unsafe {
+        *(&raw mut DEVICE_COUNT) = count;
+    }
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[pcidrv] Found ");
         _lb.dec(count as u64);
         _lb.str(b" PCI device(s)\n");
@@ -336,23 +467,43 @@ fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 
 /// Register with name service.
 fn register_namesrv() -> bool {
-    trona::udebug!(|_lb| { _lb.str(b"[pcidrv] Registering with namesrv\n"); });
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
+
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[pcidrv] Registering with namesrv\n");
+    });
     let name = b"pcidrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = NS_REGISTER;
+    msg.label = NAMESRV_REGISTER;
     msg.regs[0] = name.len() as u64;
-    msg.length = 1 + (name.len() as u64 + 7) / 8;
+    let Some(publish_tc) = trona_runtime::client::caps::service_client_ep_for_transfer() else {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[pcidrv] No service client ep to publish\n");
+        });
+        return false;
+    };
     unsafe {
         let dst = &raw mut msg.regs[1] as *mut u8;
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.slot());
+    }
+    msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    msg.length = (REGISTER_FLAGS_REG + 1) as u64;
+    unsafe {
         let mut reply = TronaMsg::zeroed();
-        let err =
-            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
+        let err = ipc::mp_call_ctx(
+            ipc_ctx(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        drop(publish_tc);
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[pcidrv] namesrv register failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" label=");
@@ -362,12 +513,14 @@ fn register_namesrv() -> bool {
             return false;
         }
     }
-    trona::uinfo!(|_lb| { _lb.str(b"[pcidrv] registered with namesrv\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[pcidrv] registered with namesrv\n");
+    });
     true
 }
 
 /// Handle PCI_FIND_DEVICE request.
-fn handle_find_device(msg: &TronaMsg) -> TronaMsg {
+fn handle_find_device(msg: &TronaMsg) -> PciReply {
     let vendor_id = msg.regs[0] as u16;
     let device_id = msg.regs[1] as u16;
 
@@ -392,20 +545,70 @@ fn handle_find_device(msg: &TronaMsg) -> TronaMsg {
             reply.length = 0;
         }
     }
-    reply
+    PciReply::new(reply)
 }
 
-/// Handle PCI_GET_CAPS request.
-/// Enable PCI Memory Space + Bus Master for the given device.
-/// Idempotent — skips the write if both bits are already set.
-fn ensure_bus_master(bus: u8, dev: u8, func: u8) {
-    let cmd = arch::pci_read32(bus, dev, func, 0x04) & 0xFFFF;
-    if cmd & 0x6 != 0x6 {
-        arch::pci_write32(bus, dev, func, 0x04, (cmd | 0x6) as u32);
+const PCI_COMMAND_IO_SPACE: u16 = 1 << 0;
+const PCI_COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
+
+/// Enable the PCI command bits needed to access a specific BAR.
+/// Preserves the upper status half of the command/status register.
+fn ensure_bar_access(bus: u8, dev: u8, func: u8, bar_raw: u32, bar_size: u32) {
+    if bar_raw == 0 || bar_size == 0 {
+        return;
     }
+
+    let mut required = PCI_COMMAND_BUS_MASTER;
+    if (bar_raw & 1) != 0 {
+        required |= PCI_COMMAND_IO_SPACE;
+    } else {
+        required |= PCI_COMMAND_MEMORY_SPACE;
+    }
+
+    let cmd_status = arch::pci_read32(bus, dev, func, 0x04);
+    let cmd = (cmd_status & 0xFFFF) as u16;
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[pcidrv] ensure_bar_access ");
+        _lb.dec(bus as u64);
+        _lb.putc(b':');
+        _lb.dec(dev as u64);
+        _lb.putc(b':');
+        _lb.dec(func as u64);
+        _lb.str(b" bar_raw=");
+        _lb.hex(bar_raw as u64);
+        _lb.str(b" bar_size=");
+        _lb.hex(bar_size as u64);
+        _lb.str(b" cmd=");
+        _lb.hex(cmd as u64);
+        _lb.str(b" required=");
+        _lb.hex(required as u64);
+        _lb.putc(b'\n');
+    });
+    if (cmd & required) == required {
+        return;
+    }
+
+    let new_cmd = cmd | required;
+    let new_cmd_status = (cmd_status & !0xFFFF) | new_cmd as u32;
+    arch::pci_write32(bus, dev, func, 0x04, new_cmd_status);
+    let _readback = arch::pci_read32(bus, dev, func, 0x04);
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[pcidrv] ensure_bar_access updated ");
+        _lb.dec(bus as u64);
+        _lb.putc(b':');
+        _lb.dec(dev as u64);
+        _lb.putc(b':');
+        _lb.dec(func as u64);
+        _lb.str(b" new_cmd=");
+        _lb.hex(new_cmd as u64);
+        _lb.str(b" readback=");
+        _lb.hex(_readback as u64);
+        _lb.putc(b'\n');
+    });
 }
 
-fn handle_get_caps(msg: &TronaMsg) -> TronaMsg {
+fn handle_get_caps(msg: &TronaMsg) -> PciReply {
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
     let func = msg.regs[2] as u8;
@@ -426,17 +629,17 @@ fn handle_get_caps(msg: &TronaMsg) -> TronaMsg {
         Some(i) => i,
         None => {
             reply.label = TRONA_NOT_FOUND;
-            return reply;
+            return PciReply::new(reply);
         }
     };
 
     let d = unsafe { &*(&raw const DEVICES[idx]) };
 
-    ensure_bus_master(bus, dev, func);
-
     let bar0 = d.bars[0];
     let bar0_size = d.bar_sizes[0];
     let bar0_phys = d.bar_phys[0];
+    ensure_bar_access(bus, dev, func, bar0, bar0_size);
+
     let bar0_is_io = bar0 != 0 && bar0_size != 0 && (bar0 & 1) != 0;
     if bar0_phys != 0 && bar0_size != 0 && !bar0_is_io {
         // MMIO BAR (using 64-bit physical address)
@@ -455,33 +658,69 @@ fn handle_get_caps(msg: &TronaMsg) -> TronaMsg {
     // regs[4] = BAR type: 0=MMIO, 1=I/O
     reply.regs[4] = if bar0_is_io { 1 } else { 0 };
     // regs[5] = has IRQ handler cap: 0=no, 1=yes (extra cap #1)
-    reply.regs[5] = if d.irq_handler_slot != 0 { 1 } else { 0 };
+    reply.regs[5] = if d.irq_handler_slot.as_raw() != 0 {
+        1
+    } else {
+        0
+    };
     reply.label = 0;
     reply.length = 6;
 
-    // Transfer IoPort cap for I/O BAR or device untyped cap for MMIO BAR (extra cap #0)
-    if bar0_is_io && d.ioport_slots[0] != 0 {
-        unsafe {
-            ipc::set_send_cap_ctx(ipc_ctx(), 0, d.ioport_slots[0]);
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[pcidrv] GET_CAPS ");
+        _lb.dec(bus as u64);
+        _lb.putc(b':');
+        _lb.dec(dev as u64);
+        _lb.putc(b':');
+        _lb.dec(func as u64);
+        _lb.str(b" bar0_raw=");
+        _lb.hex(bar0 as u64);
+        _lb.str(b" bar0_phys=");
+        _lb.hex(bar0_phys);
+        _lb.str(b" bar0_size=");
+        _lb.hex(bar0_size as u64);
+        _lb.str(b" bar0_is_io=");
+        _lb.dec(bar0_is_io as u64);
+        _lb.str(b" ioport_slot=");
+        _lb.hex(d.ioport_slots[0].as_raw());
+        _lb.str(b" devut_slot=");
+        _lb.hex(d.devut_slots[0].as_raw());
+        _lb.str(b" irq=");
+        _lb.dec(d.irq_line as u64);
+        _lb.str(b" irq_slot=");
+        _lb.hex(d.irq_handler_slot.as_raw());
+        _lb.putc(b'\n');
+    });
+
+    let mut out = PciReply::new(reply);
+    if bar0_is_io {
+        if d.ioport_slots[0].as_raw() == 0 {
+            return PciReply::error(TRONA_INVALID_OPERATION);
         }
-    } else if !bar0_is_io && d.devut_slots[0] != 0 {
-        unsafe {
-            ipc::set_send_cap_ctx(ipc_ctx(), 0, d.devut_slots[0]);
+        if !out.attach_cap_copy(d.ioport_slots[0].as_raw()) {
+            out.release_temp_caps(true);
+            return PciReply::error(TRONA_OUT_OF_MEMORY);
+        }
+    } else if bar0_phys != 0 && bar0_size != 0 {
+        if d.devut_slots[0].as_raw() == 0 {
+            return PciReply::error(TRONA_INVALID_OPERATION);
+        }
+        if !out.attach_cap_copy(d.devut_slots[0].as_raw()) {
+            out.release_temp_caps(true);
+            return PciReply::error(TRONA_OUT_OF_MEMORY);
         }
     }
 
-    // Transfer IRQ handler cap (extra cap #1)
-    if d.irq_handler_slot != 0 {
-        unsafe {
-            ipc::set_send_cap_ctx(ipc_ctx(), 1, d.irq_handler_slot);
-        }
+    if d.irq_handler_slot.as_raw() != 0 && !out.attach_cap_copy(d.irq_handler_slot.as_raw()) {
+        out.release_temp_caps(true);
+        return PciReply::error(TRONA_OUT_OF_MEMORY);
     }
 
-    reply
+    out
 }
 
 /// Handle PCI_LIST request.
-fn handle_list() -> TronaMsg {
+fn handle_list() -> PciReply {
     let count = unsafe { *(&raw const DEVICE_COUNT) };
     let mut reply = TronaMsg::zeroed();
     reply.label = 0;
@@ -498,7 +737,7 @@ fn handle_list() -> TronaMsg {
             reply.regs[base + 2] = d.bars[0] as u64;
         }
     }
-    reply
+    PciReply::new(reply)
 }
 
 fn ceil_log2(n: u64) -> u8 {
@@ -511,11 +750,11 @@ fn ceil_log2(n: u64) -> u8 {
 /// PCI_GET_BAR_CAP: Get device untyped (or IoPort) cap for a specific BAR.
 /// Request: MR0=bus, MR1=dev, MR2=func, MR3=bar_idx
 /// Reply: MR0=bar_phys, MR1=bar_size, MR2=bar_is_io + extra_cap #0
-fn handle_get_bar_cap(msg: &TronaMsg) -> TronaMsg {
+fn handle_get_bar_cap(msg: &TronaMsg) -> PciReply {
     let mut reply = TronaMsg::zeroed();
     if msg.length < 4 {
         reply.label = TRONA_INVALID_ARGUMENT;
-        return reply;
+        return PciReply::new(reply);
     }
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
@@ -524,7 +763,7 @@ fn handle_get_bar_cap(msg: &TronaMsg) -> TronaMsg {
 
     if bar_idx >= 6 {
         reply.label = TRONA_INVALID_ARGUMENT;
-        return reply;
+        return PciReply::new(reply);
     }
 
     let count = unsafe { *(&raw const DEVICE_COUNT) };
@@ -541,21 +780,20 @@ fn handle_get_bar_cap(msg: &TronaMsg) -> TronaMsg {
         Some(i) => i,
         None => {
             reply.label = TRONA_NOT_FOUND;
-            return reply;
+            return PciReply::new(reply);
         }
     };
 
     let d = unsafe { &*(&raw const DEVICES[idx]) };
 
-    ensure_bus_master(bus, dev, func);
-
     let bar_raw = d.bars[bar_idx];
     let bar_size = d.bar_sizes[bar_idx];
     let phys = d.bar_phys[bar_idx];
+    ensure_bar_access(bus, dev, func, bar_raw, bar_size);
 
     if phys == 0 && bar_size == 0 {
         reply.label = TRONA_NOT_FOUND;
-        return reply;
+        return PciReply::new(reply);
     }
 
     let is_io = (bar_raw & 1) != 0;
@@ -566,22 +804,56 @@ fn handle_get_bar_cap(msg: &TronaMsg) -> TronaMsg {
     reply.regs[1] = bar_size as u64;
     reply.regs[2] = if is_io { 1 } else { 0 };
 
-    // Transfer the appropriate cap
-    if is_io && d.ioport_slots[bar_idx] != 0 {
-        unsafe { ipc::set_send_cap_ctx(ipc_ctx(), 0, d.ioport_slots[bar_idx]); }
-    } else if !is_io && d.devut_slots[bar_idx] != 0 {
-        unsafe { ipc::set_send_cap_ctx(ipc_ctx(), 0, d.devut_slots[bar_idx]); }
-    }
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[pcidrv] GET_BAR_CAP ");
+        _lb.dec(bus as u64);
+        _lb.putc(b':');
+        _lb.dec(dev as u64);
+        _lb.putc(b':');
+        _lb.dec(func as u64);
+        _lb.str(b" bar=");
+        _lb.dec(bar_idx as u64);
+        _lb.str(b" raw=");
+        _lb.hex(bar_raw as u64);
+        if bar_idx + 1 < 6 {
+            _lb.str(b" raw_next=");
+            _lb.hex(d.bars[bar_idx + 1] as u64);
+        }
+        _lb.str(b" phys=");
+        _lb.hex(phys);
+        _lb.str(b" size=");
+        _lb.hex(bar_size as u64);
+        _lb.str(b" is_io=");
+        _lb.dec(is_io as u64);
+        _lb.str(b" ioport_slot=");
+        _lb.hex(d.ioport_slots[bar_idx].as_raw());
+        _lb.str(b" devut_slot=");
+        _lb.hex(d.devut_slots[bar_idx].as_raw());
+        _lb.putc(b'\n');
+    });
 
-    reply
+    let cap_slot = if is_io {
+        d.ioport_slots[bar_idx].as_raw()
+    } else {
+        d.devut_slots[bar_idx].as_raw()
+    };
+    if cap_slot == 0 {
+        return PciReply::error(TRONA_INVALID_OPERATION);
+    }
+    let mut out = PciReply::new(reply);
+    if !out.attach_cap_copy(cap_slot) {
+        out.release_temp_caps(true);
+        return PciReply::error(TRONA_OUT_OF_MEMORY);
+    }
+    out
 }
 
 /// PCI_READ_CONFIG32: Read a 32-bit word from PCI config space.
-fn handle_read_config32(msg: &TronaMsg) -> TronaMsg {
+fn handle_read_config32(msg: &TronaMsg) -> PciReply {
     let mut reply = TronaMsg::zeroed();
     if msg.length < 4 {
         reply.label = TRONA_INVALID_ARGUMENT;
-        return reply;
+        return PciReply::new(reply);
     }
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
@@ -589,15 +861,15 @@ fn handle_read_config32(msg: &TronaMsg) -> TronaMsg {
     let offset = msg.regs[3] as u8;
     reply.regs[0] = arch::pci_read32(bus, dev, func, offset) as u64;
     reply.length = 1;
-    reply
+    PciReply::new(reply)
 }
 
 /// PCI_WRITE_CONFIG32: Write a 32-bit word to PCI config space.
-fn handle_write_config32(msg: &TronaMsg) -> TronaMsg {
+fn handle_write_config32(msg: &TronaMsg) -> PciReply {
     let mut reply = TronaMsg::zeroed();
     if msg.length < 5 {
         reply.label = TRONA_INVALID_ARGUMENT;
-        return reply;
+        return PciReply::new(reply);
     }
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
@@ -605,62 +877,163 @@ fn handle_write_config32(msg: &TronaMsg) -> TronaMsg {
     let offset = msg.regs[3] as u8;
     let value = msg.regs[4] as u32;
     arch::pci_write32(bus, dev, func, offset, value);
-    reply
+    PciReply::new(reply)
 }
 
-/// Server main loop.
+/// Cookie for the single service-pipe `STATE_READABLE` Watch (kind 0, slot
+/// 0, generation 1). pcidrv has one event source, so the cookie is constant.
+const PCIDRV_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+
+/// Single-source reactor dispatcher. The only armed event is `STATE_READABLE`
+/// on the service pipe; each inbound record is routed by PCI label and the
+/// reply rides back on the same pipe (txid-correlated).
+struct PcidrvDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    scratch: Cap,
+}
+
+impl trona_server::event_loop::EqDispatcher for PcidrvDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
+    }
+
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        let mut reply = match msg.label {
+            PCI_FIND_DEVICE => handle_find_device(msg),
+            PCI_GET_CAPS => handle_get_caps(msg),
+            PCI_LIST => handle_list(),
+            PCI_READ_CONFIG32 => handle_read_config32(msg),
+            PCI_WRITE_CONFIG32 => handle_write_config32(msg),
+            PCI_GET_BAR_CAP => handle_get_bar_cap(msg),
+            _ => PciReply::error(TRONA_INVALID_OPERATION),
+        };
+        // SAFETY: `ipc_ctx()` is this thread's IPC context; the reply rides
+        // the service pipe correlated to the just-read request's txid.
+        let err = unsafe { ipc::mp_write_reply_ctx(ipc_ctx(), self.recv_ep, &raw const reply.msg) };
+        reply.release_temp_caps(err != 0);
+        0
+    }
+
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        // SAFETY: re-arm the sticky cap-receive scratch before each MP_READ.
+        unsafe {
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                ipc_ctx(),
+                CAP_SELF_CSPACE,
+                self.scratch,
+                0,
+            );
+        }
+        true
+    }
+
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        // One-shot Watch is consumed on fire; re-arm the service pipe's
+        // READABLE edge onto the reactor EQ.
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+            PCIDRV_SERVICE_COOKIE,
+        )
+    }
+
+    fn handle_overflow(&mut self, _dropped: u64) {}
+
+    fn handle_timer(&mut self, _cookie: u64) {}
+}
+
+/// Server main loop: a single-source `EventLoop` reactor. Blocks on the
+/// reactor `EventQueue` (`EQ_WAIT`), drains the service pipe when it becomes
+/// readable, dispatches by label, and replies. Replaces the former
+/// `mp_write_reply_read` tight loop, which spun on `WOULD_BLOCK` once
+/// `MP_READ` became non-blocking.
 fn server_loop() -> ! {
-    trona::uinfo!(|_lb| { _lb.str(b"[pcidrv] Entering server loop\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[pcidrv] Entering server loop\n");
+    });
 
     let ctx = ipc_ctx();
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-    unsafe { ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge); }
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+
+    // Self-provision the reactor's EventQueue + Watch from rsrcsrv (general
+    // services spawn after rsrcsrv is live, so no init pre-provisioning).
+    let eq = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_EVENT_QUEUE as u64,
+        4,
+    );
+    let watch = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_WATCH as u64,
+        0,
+    );
+    let (eq, watch) = match (eq, watch) {
+        (Some(eq), Some(watch)) => (eq, watch),
+        _ => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[pcidrv] reactor EventQueue/Watch alloc failed\n");
+            });
+            idle();
+        }
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+    let scratch = trona_runtime::core::slot_alloc::slot_alloc_or_idle(b"pcidrv recv scratch");
+
+    // Arm the service pipe's READABLE edge onto the reactor EQ.
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+        PCIDRV_SERVICE_COOKIE,
+    );
+
+    // The EQ / Watch live for the process lifetime; suppress their OwnedCap
+    // drop so the caps are never torn down under the running reactor.
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+
+    let dispatcher = PcidrvDispatcher {
+        recv_ep,
+        watch_cap,
+        eq_cap,
+        scratch,
+    };
+    let mut reactor = trona_server::event_loop::EventLoop::new(eq_cap, dispatcher);
 
     loop {
-        let reply = match msg.label {
-            PCI_FIND_DEVICE => handle_find_device(&msg),
-            PCI_GET_CAPS => handle_get_caps(&msg),
-            PCI_LIST => handle_list(),
-            PCI_READ_CONFIG32 => handle_read_config32(&msg),
-            PCI_WRITE_CONFIG32 => handle_write_config32(&msg),
-            PCI_GET_BAR_CAP => handle_get_bar_cap(&msg),
-            _ => {
-                let mut r = TronaMsg::zeroed();
-                r.label = TRONA_INVALID_OPERATION;
-                r
-            }
-        };
-
-        msg = TronaMsg::zeroed();
-        badge = 0;
+        // SAFETY: `ctx` is this thread's IPC context; arm the cap-receive
+        // scratch, then block on the EQ and dispatch one ready event.
         unsafe {
-            ipc::reply_recv_ctx(
-                ctx,
-                trona::caps::service_ep(),
-                &raw const reply,
-                &raw mut msg,
-                &raw mut badge,
-            );
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, scratch, 0);
+            let _ = reactor.run_iteration(ctx);
         }
     }
 }
-
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    trona::uinfo!(|_lb| { _lb.str(b"[pcidrv] PCI Enumeration Server starting\n"); });
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[pcidrv] PCI Enumeration Server starting\n");
+    });
 
     arch::pci_init();
     scan_bus();
     if !register_namesrv() {
         idle();
     }
-    signal_ready();
     server_loop()
 }
 
 fn idle() -> ! {
     loop {
-        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona_kernel::syscall::yield_now();
     }
 }

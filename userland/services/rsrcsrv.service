@@ -1,14 +1,25 @@
 [Service]
 Name=rsrcsrv
 Binary=/bin/rsrcsrv
-Type=notify
+Type=broker
 Restart=always
-PreProcmgr=yes
 Role=authority
 CNodeBits=14
 
 [Dependencies]
-Before=namesrv mmsrv vfs procmgr
+After=namesrv
+Before=mmsrv vfs
 
 [Capabilities]
-CopySharedLibCaps=yes
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

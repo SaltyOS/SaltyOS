@@ -1,0 +1,6 @@
+[Unit]
+Name=netsrv-ep.socket
+
+[Socket]
+Provider=netsrv
+Alias=netsrv_ep

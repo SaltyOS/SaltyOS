@@ -5,30 +5,35 @@
 //! Clients send DNS_RESOLVE requests; dnssrv checks its cache first, then
 //! forwards cache misses to netsrv via NET_DNS_RESOLVE / NET_DNS_RESOLVE_PTR.
 //!
-//! Startup caps are role-based. System caps come from `trona::caps::*()`,
-//! and the service-local netsrv dependency comes from generated `svc_caps::*()`.
+//! Startup caps are role-based. System caps come from `trona_runtime::client::caps::*()`;
+//! the service-local `netsrv_ep` dependency is resolved through the
+//! `trona_runtime::local_cap!` macro declared below.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
 extern crate trona_posix;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::*;
-use trona::serial;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::ipc;
+use trona_protocol::common::{
+    TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_NOT_FOUND, TRONA_OK,
+};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::netsrv::{NET_DNS_RESOLVE, NET_DNS_RESOLVE_PTR};
+use trona_protocol::posix::{DNS_CACHE_FLUSH, DNS_RESOLVE, DNS_REVERSE_LOOKUP};
+use trona_runtime::debug::serial;
 
-// ---------------------------------------------------------------------------
-// Capability slot layout
-// ---------------------------------------------------------------------------
+// Service-local cap: `Require=netsrv-ep.socket` in `dnssrv.service`.
+trona_runtime::local_cap!(pub(crate) netsrv_ep = "dnssrv:netsrv_ep");
 
-const CAP_SELF_CSPACE: u64 = 2;
-
-// System roles (`namesrv`, `mmsrv`) via substrate `trona::caps::*` getters;
-// service-local role `Require=netsrv:netsrv_ep` via generated `svc_caps`.
+// System roles (`namesrv`, `mmsrv`) via substrate `trona_runtime::client::caps::*` getters;
+// the service-local `Require=netsrv-ep.socket` dependency is resolved
+// through the `trona_runtime::local_cap!` macro above (`netsrv_ep`).
 
 // ---------------------------------------------------------------------------
 // DNS cache
@@ -65,10 +70,9 @@ impl DnsCacheEntry {
 static mut DNS_CACHE: [DnsCacheEntry; DNS_CACHE_SIZE] = {
     const ZERO: DnsCacheEntry = DnsCacheEntry::zeroed();
     [
-        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
-        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
-        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
-        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+        ZERO, ZERO,
     ]
 };
 
@@ -84,13 +88,8 @@ fn ipc_ctx() -> *mut IpcContext {
     trona_posix::tls::current_ipc_ctx()
 }
 
-fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
-}
-
 fn clock_monotonic_ns() -> u64 {
-    let r = trona::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
-    if r.error != 0 { 0 } else { r.value }
+    trona_kernel::syscall::clock_read_monotonic(trona_runtime::client::caps::clock_cap().addr())
 }
 
 fn hostname_eq(a: &[u8], b: &[u8]) -> bool {
@@ -215,11 +214,14 @@ fn cache_flush() {
 // ---------------------------------------------------------------------------
 
 fn register_namesrv() {
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
+
     let name = b"dnssrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = NS_REGISTER;
+    msg.label = NAMESRV_REGISTER;
     msg.regs[0] = name.len() as u64;
-    msg.length = 1 + (name.len() as u64 + 7) / 8;
+    let publish_tc = trona_runtime::client::caps::service_client_ep_for_transfer();
     // SAFETY: Writing name bytes into message register space; IPC context valid.
     unsafe {
         let dst = &raw mut msg.regs[1] as *mut u8;
@@ -228,14 +230,20 @@ fn register_namesrv() {
             *dst.add(i) = name[i];
             i += 1;
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.as_ref().map_or(0, |t| t.slot()));
+    }
+    msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    msg.length = (REGISTER_FLAGS_REG + 1) as u64;
+    unsafe {
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
+        let err = ipc::mp_call_ctx(
             ipc_ctx(),
-            trona::caps::namesrv_ep(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
+        drop(publish_tc);
         if err != 0 || reply.label != TRONA_OK {
             puts(b"[dnssrv] namesrv registration failed\n");
         } else {
@@ -264,7 +272,7 @@ fn handle_resolve(msg: &TronaMsg, reply: &mut TronaMsg) {
 
     // 1. Check cache
     if let Some((ip_count, ips)) = cache_lookup(&hostname[..hostname_len]) {
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[dnssrv] cache hit host_len=");
             _lb.dec(hostname_len as u64);
             _lb.str(b" count=");
@@ -284,7 +292,7 @@ fn handle_resolve(msg: &TronaMsg, reply: &mut TronaMsg) {
     }
 
     // 2. Cache miss: forward to netsrv
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[dnssrv] resolve miss host_len=");
         _lb.dec(hostname_len as u64);
         _lb.putc(b'\n');
@@ -302,14 +310,15 @@ fn handle_resolve(msg: &TronaMsg, reply: &mut TronaMsg) {
     let mut netsrv_reply = TronaMsg::zeroed();
     // SAFETY: IPC context valid; CAP_NETSRV_EP is the netsrv endpoint.
     let err = unsafe {
-        ipc::call_ctx(
+        ipc::mp_call_ctx(
             ipc_ctx(),
-            svc_caps::netsrv_ep(),
+            netsrv_ep().addr(),
             &raw const netsrv_msg,
             &raw mut netsrv_reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         )
     };
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[dnssrv] netsrv reply err=");
         _lb.dec(err as u64);
         _lb.str(b" label=");
@@ -335,7 +344,7 @@ fn handle_resolve(msg: &TronaMsg, reply: &mut TronaMsg) {
         ips[i] = netsrv_reply.regs[2 + i] as u32;
         i += 1;
     }
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[dnssrv] resolve done count=");
         _lb.dec(ip_count as u64);
         _lb.str(b" ttl=");
@@ -374,11 +383,12 @@ fn handle_reverse(msg: &TronaMsg, reply: &mut TronaMsg) {
     let mut netsrv_reply = TronaMsg::zeroed();
     // SAFETY: IPC context valid; CAP_NETSRV_EP is the netsrv endpoint.
     let err = unsafe {
-        ipc::call_ctx(
+        ipc::mp_call_ctx(
             ipc_ctx(),
-            svc_caps::netsrv_ep(),
+            netsrv_ep().addr(),
             &raw const netsrv_msg,
             &raw mut netsrv_reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         )
     };
     if err != 0 || netsrv_reply.label != TRONA_OK {
@@ -412,51 +422,136 @@ fn handle_reverse(msg: &TronaMsg, reply: &mut TronaMsg) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Cookie for the single service-pipe `STATE_READABLE` Watch (kind 0, slot 0,
+/// generation 1). dnssrv has one event source, so the cookie is constant.
+const DNSSRV_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+
+/// Single-source reactor dispatcher: routes the one armed event by DNS label
+/// and replies on the same service pipe (txid-correlated). Cache misses call
+/// netsrv synchronously inside the handler — fine on the single reactor thread.
+struct DnssrvDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    scratch: Cap,
+}
+
+impl trona_server::event_loop::EqDispatcher for DnssrvDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
+    }
+
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        let mut reply = TronaMsg::zeroed();
+        match msg.label {
+            DNS_RESOLVE => handle_resolve(msg, &mut reply),
+            DNS_CACHE_FLUSH => handle_cache_flush(&mut reply),
+            DNS_REVERSE_LOOKUP => handle_reverse(msg, &mut reply),
+            _ => reply.label = TRONA_INVALID_OPERATION,
+        }
+        // SAFETY: `ipc_ctx()` is this thread's IPC context; the reply rides the
+        // service pipe correlated to the just-read request's txid.
+        let _ = unsafe { ipc::mp_write_reply_ctx(ipc_ctx(), self.recv_ep, &raw const reply) };
+        0
+    }
+
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        // SAFETY: re-arm the sticky cap-receive scratch before each MP_READ.
+        unsafe {
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                ipc_ctx(),
+                trona_kernel::uapi::KERNITE_CAP_SELF_CSPACE as u64,
+                self.scratch,
+                0,
+            );
+        }
+        true
+    }
+
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+            DNSSRV_SERVICE_COOKIE,
+        )
+    }
+
+    fn handle_overflow(&mut self, _dropped: u64) {}
+
+    fn handle_timer(&mut self, _cookie: u64) {}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[dnssrv] DNS Resolver Service starting\n");
 
-    // Register with name service
+    // Register with name service; unit_mgr observes the publish event as readiness.
     register_namesrv();
-
-    // Signal readiness to init
-    signal_ready();
 
     puts(b"[dnssrv] Entering event loop\n");
 
-    // Main event loop: recv / reply_recv pattern
+    // Single-source EventLoop reactor: block on a self-allocated EventQueue
+    // (rsrcsrv-minted) with a Watch on the service pipe's READABLE edge, then
+    // drain + dispatch. Replaces the former mp_write_reply_read loop, which
+    // spun on WOULD_BLOCK once MP_READ became non-blocking.
     let ctx = ipc_ctx();
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-
-    // SAFETY: IPC context valid; CAP_SERVER_EP is our service endpoint.
-    unsafe {
-        ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge);
-    }
-
-    loop {
-        let mut reply = TronaMsg::zeroed();
-
-        match msg.label {
-            DNS_RESOLVE => handle_resolve(&msg, &mut reply),
-            DNS_CACHE_FLUSH => handle_cache_flush(&mut reply),
-            DNS_REVERSE_LOOKUP => handle_reverse(&msg, &mut reply),
-            _ => {
-                reply.label = TRONA_INVALID_OPERATION;
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+    let eq = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_EVENT_QUEUE as u64,
+        4,
+    );
+    let watch = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_WATCH as u64,
+        0,
+    );
+    let (eq, watch) = match (eq, watch) {
+        (Some(eq), Some(watch)) => (eq, watch),
+        _ => {
+            puts(b"[dnssrv] reactor EventQueue/Watch alloc failed\n");
+            loop {
+                let _ = trona_kernel::syscall::yield_now();
             }
         }
-
-        msg = TronaMsg::zeroed();
-        badge = 0;
-        // SAFETY: IPC context valid; reply_recv atomically replies + waits.
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+    let scratch = trona_runtime::core::slot_alloc::slot_alloc_or_idle(b"dnssrv recv scratch");
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+        DNSSRV_SERVICE_COOKIE,
+    );
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+    let mut reactor = trona_server::event_loop::EventLoop::new(
+        eq_cap,
+        DnssrvDispatcher {
+            recv_ep,
+            watch_cap,
+            eq_cap,
+            scratch,
+        },
+    );
+    loop {
+        // SAFETY: `ctx` is this thread's IPC context; arm the cap-receive
+        // scratch, then block on the EQ and dispatch one ready event.
         unsafe {
-            ipc::reply_recv_ctx(
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
                 ctx,
-                trona::caps::service_ep(),
-                &raw const reply,
-                &raw mut msg,
-                &raw mut badge,
+                trona_kernel::uapi::KERNITE_CAP_SELF_CSPACE as u64,
+                scratch,
+                0,
             );
+            let _ = reactor.run_iteration(ctx);
         }
     }
 }

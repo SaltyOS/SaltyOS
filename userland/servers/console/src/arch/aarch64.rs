@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! aarch64 console hardware — PL011 UART I/O via device untyped + MMIO.
 
-use trona::consts::kernel::*;
-use trona::invoke;
-
-// Cap layout (set up by init for the console server)
-const CAP_SELF_TCB: u64 = 0;
-const CAP_SELF_VSPACE: u64 = 1;
-const CAP_UART_DEVUT: u64 = 64;  // Device untyped for PL011 (phys 0x0900_0000)
-const CAP_IRQ: u64 = 65;         // UART IRQ handler
-const CAP_NTFN: u64 = 66;        // UART IRQ notification
+use trona_kernel::core_types::CapRef;
+use trona_kernel::invoke;
+use trona_kernel::uapi::*;
 
 // Virtual address where PL011 registers are mapped.
 // Keep this well above the low-ASLR ELF/rtld/shared-lib window.
@@ -22,7 +16,7 @@ const UARTIMSC: usize = 0x038;
 const UARTICR: usize = 0x044;
 
 // UARTFR bits
-const UARTFR_RXFE: u32 = 1 << 4;  // RX FIFO empty
+const UARTFR_RXFE: u32 = 1 << 4; // RX FIFO empty
 
 static mut UART_BASE: *mut u8 = core::ptr::null_mut();
 static mut UART_READY: bool = false;
@@ -61,10 +55,16 @@ unsafe fn mmio_write32(offset: usize, val: u32) {
 
 /// Map the PL011 UART device untyped into our VSpace and store the base address.
 pub fn serial_init() {
-    let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_CACHE_DISABLE;
-    let err = invoke::vspace_map_device(CAP_SELF_VSPACE, CAP_UART_DEVUT, 0, UART_MMIO_VADDR, flags);
+    let flags = KERNITE_PAGE_FLAG_WRITABLE | KERNITE_PAGE_FLAG_USER | KERNITE_PAGE_FLAG_NOCACHE;
+    let err = invoke::vspace_map_device(
+        CapRef::flat(KERNITE_CAP_SELF_VSPACE as u64),
+        trona_runtime::client::caps::com1_ioport().cap_ref(),
+        0,
+        UART_MMIO_VADDR,
+        flags,
+    );
     if err != 0 {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[CONSOLE] FAIL: PL011 device map failed err=");
             _lb.hex(err as u64);
             _lb.str(b"\n");
@@ -83,25 +83,23 @@ pub fn serial_init() {
         *&raw mut UART_READY = true;
     }
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[CONSOLE] PL011 UART mapped\n");
     });
 }
 
-/// Set up UART IRQ notification and enable PL011 RX interrupt.
+/// Set up UART hardware. IRQ delivery is pending the console
+/// EventQueue/Watch conversion; input is drained opportunistically.
 pub fn irq_setup() {
     // If MMIO mapping is unavailable, keep the service alive in output-only mode.
     unsafe {
         if !*(&raw const UART_READY) {
-            trona::uwarn!(|_lb| {
+            trona_runtime::uwarn!(|_lb| {
                 _lb.str(b"[CONSOLE] UART input disabled\n");
             });
             return;
         }
     }
-
-    invoke::irq_handler_set_notification(CAP_IRQ, CAP_NTFN);
-    invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_NTFN);
 
     // Enable RX interrupt (RXIM = bit 4) and receive timeout (RTIM = bit 6).
     // RTIM fires when the RX FIFO has data below the trigger level after a
@@ -116,7 +114,24 @@ pub fn irq_setup() {
     // Prime IRQ delivery: the first ack enables INTID 33 in the GIC
     // distributor. Without this, the GIC blocks the PL011 interrupt
     // and the console never receives input notifications.
-    invoke::irq_handler_ack(CAP_IRQ);
+    invoke::irq_ack(trona_runtime::client::caps::com1_irq().cap_ref());
+}
+
+/// Bind the PL011 (COM1) IRQ handler to the reactor's `EventQueue` so fired
+/// interrupts arrive as `EVENT_TYPE_IRQ` records (carrying `cookie`) on the
+/// priority interrupt lane. No-op when UART input is unavailable.
+pub fn bind_input_irqs(eq_cap: u64, cookie: u64) {
+    unsafe {
+        if !*(&raw const UART_READY) {
+            return;
+        }
+    }
+    let eq = trona_kernel::core_types::CapRef::flat(eq_cap);
+    let _ = invoke::irq_bind_eq(
+        trona_runtime::client::caps::com1_irq().cap_ref(),
+        eq,
+        cookie,
+    );
 }
 
 /// Drain PL011 RX FIFO into `buf`. Returns the number of bytes read.
@@ -134,7 +149,9 @@ pub fn drain_input(buf: &mut [u8]) -> usize {
     unsafe {
         loop {
             let fr = mmio_read32(UARTFR);
-            if (fr & UARTFR_RXFE) != 0 { break; }
+            if (fr & UARTFR_RXFE) != 0 {
+                break;
+            }
             let dr = mmio_read32(UARTDR) as u8;
             if count < buf.len() {
                 buf[count] = dr;
@@ -159,5 +176,5 @@ pub fn ack_irqs() {
     unsafe {
         mmio_write32(UARTICR, 0x7FF);
     }
-    invoke::irq_handler_ack(CAP_IRQ);
+    invoke::irq_ack(trona_runtime::client::caps::com1_irq().cap_ref());
 }

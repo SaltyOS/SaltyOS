@@ -6,12 +6,15 @@
 
 # Core system services (boot-essential)
 subdir('core/init')
-# rtld is now built from lib/trona/rtld/ (ld_trona_so)
+# rtld is now built from lib/trona/loader/ (ld_trona_so)
 subdir('core/namesrv')
 subdir('core/rsrcsrv')
 subdir('core/mmsrv')
-subdir('core/procmgr')
+subdir('core/logsrv')
 subdir('core/vfs')
+subdir('core/ldsrv')
+# core/procmgr is archived for history only; init owns the active spawn /
+# lifecycle path and procmgr's legacy ABI is intentionally not built.
 
 # Higher-level system servers
 subdir('servers/console')

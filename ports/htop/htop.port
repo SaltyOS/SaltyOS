@@ -1,0 +1,71 @@
+[port]
+name = htop
+version = 3.5.0
+description = Interactive process viewer
+homepage = https://htop.dev/
+license = GPL-2.0-or-later
+
+[source]
+url = https://github.com/htop-dev/htop/releases/download/${version}/htop-${version}.tar.xz
+subdir = htop-${version}
+sha256 = b6586e405c5223ebe5ac7828df21edad45cbf90288088bd1b18ad8fa700ffa05
+
+[build]
+type = autotools
+configure =
+    -C
+    --enable-unicode
+    --disable-hwloc
+    --disable-capabilities
+    --disable-delayacct
+    --disable-sensors
+    --disable-openvz
+    --disable-vserver
+    --disable-static
+
+[depends]
+build = ncurses >= 6.5
+
+[options]
+autoreconf = true
+
+[env]
+CFLAGS_FOR_BUILD =
+EXTRA_CFLAGS = -D_GNU_SOURCE
+EXTRA_LIBS = -lncursesw
+
+[autoconf_cache]
+# POSIX / filesystem features provided by basaltc.
+ac_cv_func_openat = yes
+ac_cv_func_fstatat = yes
+ac_cv_func_readlinkat = yes
+ac_cv_func_getpwuid = yes
+ac_cv_func_getpwnam = yes
+ac_cv_func_strchrnul = yes
+ac_cv_func_setpriority = yes
+
+# /proc files SaltyOS procfs now provides (Linux projection from
+# sysctlfs MIB + procmgr IPC).
+ac_cv_file__proc_stat = yes
+ac_cv_file__proc_meminfo = yes
+ac_cv_file__proc_uptime = yes
+ac_cv_file__proc_loadavg = yes
+ac_cv_file__proc_cpuinfo = yes
+
+# utmpx is not provided by basaltc; htop degrades gracefully without it.
+ac_cv_header_utmpx_h = no
+
+# Not implemented (SaltyOS has no demand paging / hwloc / NUMA / sensors).
+ac_cv_header_sys_capability_h = no
+ac_cv_header_numa_h = no
+ac_cv_header_hwloc_h = no
+ac_cv_header_sensors_sensors_h = no
+
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/applications
+usr/share/icons
+usr/share/man
+usr/share/pixmaps

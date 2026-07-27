@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Shared per-socket option storage and translation.
 
-use trona::consts::kernel::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK_GETTIME, TRONA_INVALID_ARGUMENT,
-    TRONA_INVALID_OPERATION, TRONA_OK,
+use trona_protocol::common::{TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_OK};
+use trona_protocol::posix_abi::socket::{
+    AF_INET, IP_TTL, IPPROTO_IP, SO_BROADCAST, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_RCVBUF,
+    SO_REUSEADDR, SO_SNDBUF, SO_TIMESTAMP, SO_TS_CLOCK, SO_TS_MONOTONIC, SO_TYPE, SOCK_DGRAM,
+    SOCK_RAW, SOCK_STREAM, SOL_SOCKET,
 };
-use trona::consts::posix::{
-    AF_INET, IPPROTO_IP, IP_TTL, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_SOCKET,
-    SO_BROADCAST, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_RCVBUF, SO_REUSEADDR,
-    SO_SNDBUF, SO_TIMESTAMP, SO_TS_CLOCK, SO_TS_MONOTONIC, SO_TYPE,
-};
-use trona_posix::consts::*;
+use trona_protocol::posix_abi::time::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 
 pub(crate) const DEFAULT_IP_TTL: u8 = 64;
 pub(crate) const TIMESTAMP_NONE_NS: u64 = u64::MAX;
@@ -65,11 +62,11 @@ pub(crate) fn sample_timestamp_ns(opts: &SocketOptions) -> u64 {
         return TIMESTAMP_NONE_NS;
     };
 
-    let r = trona::syscall::syscall(SYS_CLOCK_GETTIME, clock_id as u64, 0, 0, 0, 0, 0);
-    if r.error != 0 {
-        TIMESTAMP_NONE_NS
-    } else {
-        r.value
+    let clock_cap = trona_runtime::client::caps::clock_cap().addr();
+    match clock_id {
+        CLOCK_MONOTONIC => trona_kernel::syscall::clock_read_monotonic(clock_cap),
+        CLOCK_REALTIME => trona_kernel::syscall::clock_read_realtime(clock_cap),
+        _ => TIMESTAMP_NONE_NS,
     }
 }
 

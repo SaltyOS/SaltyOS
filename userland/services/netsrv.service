@@ -1,16 +1,29 @@
 [Service]
 Name=netsrv
 Binary=/bin/netsrv
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
 After=netdrv namesrv rsrcsrv mmsrv saltyfs vfs
+Requires=namesrv.socket netdrv-ep.socket
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# System roles via trona::caps::* (procmgr's populate_cap_table path);
-# service-local via generated svc_caps::* — procmgr's resolve_local_requires
-# looks `netdrv` up in PROVIDER_REGISTRY and mints a per-consumer-badged
-# copy into the netsrv child cspace.
-Require=namesrv
-Require=netdrv:netdrv_ep
+
+[Memory]
+StackReserveKiB=2048
+StackPrefaultKiB=16
+StackGuardKiB=4
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

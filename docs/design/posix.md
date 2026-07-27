@@ -18,10 +18,10 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 |    basaltc (C stdlib)     |  trona (Rust)                |
 |         [POSIX calls -> IPC + capabilities]               |
 +----------------------------------------------------------+
-|  VFS  |  ProcMgr  |  Console  |  netsrv  |  Drivers      |
+|  VFS  |  init (supervisor)  |  Console  |  netsrv  |  Drivers  |
 +----------------------------------------------------------+
 |                 SaltyOS Microkernel                       |
-|  [Endpoints, Notifications, CNodes, VSpace, MemoryObject] |
+|  [MessagePipe, DataPipe, EventQueue, Watch, CNode, VSpace, MO] |
 +----------------------------------------------------------+
 ```
 
@@ -40,7 +40,7 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 SaltyOS uses a two-layer userspace library stack:
 
-- **trona** (`lib/trona/`, Rust): System library with 5 crates -- substrate (syscalls, IPC, invoke), posix (file, socket, poll, mm, signals, pthread, dns), loader (ELF/PE), uapi (shared constants/types/protocols), and win32 (Win32 personality support). Compiled as `libtrona.so` (shared) and linked statically into `init`.
+- **trona** (`lib/trona/`, Rust): System library with 6 crates -- kernel (ABI layer, bindgen consts from `kernite/include/uapi/*.h`), protocol (IPC labels/types), server (server helpers, cap table), runtime (slot allocator, cap ownership), posix (file, socket, poll, mm, signals, pthread, dns), and loader (ELF/PE dynamic linkers). Compiled as `libtrona.so` (shared) and linked statically into `init`.
 - **basaltc** (`lib/basalt/c/`, C): Standard C library (40 Rust modules) built on top of trona, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, socket, inet, pthread, iconv, and more.
 
 **How POSIX calls work**:
@@ -57,7 +57,7 @@ pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
 | Server | POSIX Functions |
 |--------|-----------------|
 | **VFS** (`core/vfs/`) | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate, AF_INET socket proxy (forwarded to netsrv) |
-| **ProcMgr** (`core/procmgr/`) | fork, exec, exit, wait, getpid, kill, signal delivery, process groups, personality state (POSIX/Win32) |
+| **init** (`core/init/`) | fork, exec, exit, wait, getpid, kill, signal delivery, process groups, personality state (POSIX/Win32) |
 | **Console** (`servers/console/`) | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
 | **posix_ttysrv** (`servers/posix/posix_ttysrv/`) | TTY daemon with SHM ring buffer for terminal I/O |
 | **posix_getty** (`servers/posix/posix_getty/`) | Getty (login prompt) |
@@ -106,11 +106,11 @@ Application                  trona                    VFS Server
 **Process**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `exit`, `_exit` | Implemented | procmgr + posix.h |
-| `getpid`, `getppid` | Implemented | procmgr + posix.h |
-| `fork` | Implemented | procmgr + posix.h + fork.S |
-| `exec*` family | Implemented | procmgr + posix.h |
-| `wait`, `waitpid` | Implemented | procmgr + posix.h (WNOHANG, pid=-1) |
+| `exit`, `_exit` | Implemented | init + posix.h |
+| `getpid`, `getppid` | Implemented | init + posix.h |
+| `fork` | Implemented | init + posix.h + fork.S |
+| `exec*` family | Implemented | init + posix.h |
+| `wait`, `waitpid` | Implemented | init + posix.h (WNOHANG, pid=-1) |
 
 **Memory**:
 | Function | Status | Notes |
@@ -151,8 +151,8 @@ Application                  trona                    VFS Server
 **Signals**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `kill` | Implemented | Via ProcMgr IPC, pid==0 kills process group |
-| `signal` | Implemented | Notification-based delivery |
+| `kill` | Implemented | Via init IPC, pid==0 kills process group |
+| `signal` | Implemented | MessagePipe-based delivery |
 | `sigaction` | Implemented | sa_mask, SA_RESETHAND, pending re-raise |
 | `sigprocmask` | Implemented | Syncs with trona globals |
 
@@ -259,7 +259,7 @@ netdrv (drivers/netdrv/ — virtio-net driver)
 
 SaltyOS uses:
 ```
-ProcMgr grants NET_RAW capability to /usr/bin/ping at exec time
+init grants NET_RAW capability to /usr/bin/ping at exec time
 ```
 
 **GUI Impact**: None. Modern graphics stacks don't require setuid:
@@ -304,22 +304,22 @@ Operations:
 | `close(fd)` | Delete capability from CNode |
 | `fork()` fd inheritance | Copy capabilities to child's CNode |
 
-### Unix Sockets = Endpoints
+### Unix Sockets
 
 | POSIX | SaltyOS |
 |-------|---------|
-| `socket(AF_UNIX, SOCK_STREAM)` | Create Endpoint |
-| `bind("/path")` | Register with nameserver |
-| `connect("/path")` | Lookup endpoint, connect |
-| `sendmsg` with `SCM_RIGHTS` | Transfer capability via IPC |
+| `socket(AF_UNIX, SOCK_STREAM)` | VFS-managed socket object (MessagePipe-backed) |
+| `bind("/path")` | Register with VFS / nameserver |
+| `connect("/path")` | Look up the socket, connect via VFS |
+| `sendmsg` with `SCM_RIGHTS` | Transfer capability via MessagePipe cap-transfer |
 
-### Signals = Notifications
+### Signals
 
 | POSIX | SaltyOS |
 |-------|---------|
-| `kill(pid, SIGTERM)` | Signal notification to target process |
-| `signal(SIGCHLD, handler)` | Bind notification, poll in event loop |
-| `sigwait()` | Wait on notification |
+| `kill(pid, SIGTERM)` | Deliver via MessagePipe to the target (through init) |
+| `signal(SIGCHLD, handler)` | Register a handler; the trampoline consumes the signal pipe via its EventQueue |
+| `sigwait()` | `EQ_WAIT` on the signal EventQueue |
 
 ### Shared Memory
 
@@ -366,8 +366,8 @@ Modern X11 (Xorg 1.15+) no longer requires:
 Phase 1: Core POSIX                              [DONE]
 ├── trona (Rust) + basaltc (C stdlib)
 ├── VFS server (file I/O, ramfs, devfs)
-├── ProcMgr (fork, exec, wait, kill)
-└── Signal delivery (notification-based)
+├── init (fork, exec, wait, kill)
+└── Signal delivery (MessagePipe-based)
 
 Phase 2: GUI-Ready                                [DONE]
 ├── Unix domain sockets (AF_UNIX)

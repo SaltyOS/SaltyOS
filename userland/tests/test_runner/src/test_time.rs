@@ -1,9 +1,8 @@
 //! Time API test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::serial;
-use trona::types::core::Timespec;
-use trona_posix::proc as posix;
+use trona_posix::Timespec;
+use trona_runtime::debug::serial;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -22,7 +21,7 @@ fn test_clock_monotonic() -> bool {
 
     // Yield a few times to advance clock
     for _ in 0..10 {
-        trona::syscall::syscall(trona::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona_kernel::syscall::yield_now();
     }
 
     let ret = unsafe { trona_posix::posix_clock_gettime(0, &raw mut ts2) };

@@ -125,18 +125,23 @@ pub fn start_timer() {
 
 /// Send End-Of-Interrupt to the master PIC
 fn pic_eoi() {
-    unsafe { outb(0x20, 0x20); }
+    unsafe {
+        outb(0x20, 0x20);
+    }
 }
 
 /// PIT interrupt handler (PIC+PIT fallback mode)
 ///
 /// Called by the IRQ0 handler when using the PIT as the primary timer.
-/// Sends PIC EOI before scheduler notification to prevent lost interrupts
-/// if timer_tick() triggers a context switch that never returns.
-pub fn timer_handler() {
+/// Sends PIC EOI before driving the scheduler tick to prevent lost
+/// interrupts if `timer_tick()` triggers a context switch that never
+/// returns. `frame` still carries the interrupted-mode hint for the
+/// scheduler's timer API.
+pub fn timer_handler(frame: *const super::idt::InterruptFrame) {
     TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
     pic_eoi();
-    crate::sched::timer_tick();
+    let user_mode = unsafe { (*frame).interrupted_user_mode() };
+    crate::event::timer::dispatch_tick(user_mode);
 }
 
 /// Calibrate using PIT
@@ -179,7 +184,7 @@ pub fn delay_us(microseconds: u32) {
     if microseconds < 10 {
         let iterations = microseconds * 30;
         for _ in 0..iterations {
-            unsafe { core::arch::asm!("nop") };
+            core::hint::spin_loop();
         }
         return;
     }

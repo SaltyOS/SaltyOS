@@ -3,51 +3,123 @@
 //!
 //! Runs as a userspace process and owns the full TCP/UDP/IP/ARP/ICMP protocol
 //! stack. Communicates with netdrv (hardware driver) via SHM ring buffers and
-//! notification signaling. Exposes a NET_* IPC interface for VFS to forward
+//! MessagePipe kicks. Exposes a NET_* IPC interface for VFS to forward
 //! POSIX socket operations.
 //!
-//! Startup caps are role-based. System caps come from `trona::caps::*()`,
-//! the netdrv dependency comes from generated `svc_caps::*()`, and a few
-//! runtime-allocated callback/notification slots remain file-local.
+//! Startup caps are role-based. System caps come from `trona_runtime::client::caps::*()`;
+//! the service-local `netdrv_ep` dependency is resolved through the
+//! `trona_runtime::local_cap!` macro declared below, and a few runtime-allocated
+//! callback and receive-scratch slots remain file-local.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
 extern crate trona_posix;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 mod net;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::serial;
-use trona::types::core::*;
-use trona_posix::consts::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::common::{
+    TRONA_ALREADY_EXISTS, TRONA_BUSY, TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION,
+    TRONA_NOT_FOUND, TRONA_NOT_SUPPORTED, TRONA_OK, TRONA_OUT_OF_MEMORY, TRONA_PENDING,
+    TRONA_TIMED_OUT,
+};
+use trona_protocol::correlation::{
+    CORRELATION_BACKEND_NETSRV, CORRELATION_CLASS_NET, CORRELATION_HEADER_REG_COUNT,
+    CORRELATION_HEADER_REG_START, CORRELATION_KIND_COMPLETION, CORRELATION_KIND_REQUEST,
+    CorrelationHeader, ensure_correlation_wire_length,
+};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::netsrv::*;
+use trona_protocol::posix::{
+    INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, INET_OP_RECVFROM, INET_RECV_FLAG_PEEK,
+    INET_RECV_FLAG_WANT_ADDR, INET_RECV_FLAG_WANT_TIMESTAMP, INET_RECV_TIMESTAMP_NONE,
+    TRONA_CONN_REFUSED, TRONA_CONN_RESET, TRONA_DNS_NXDOMAIN, TRONA_DNS_SERVER_FAIL,
+    TRONA_HOST_UNREACHABLE, TRONA_NET_UNREACHABLE, TRONA_NOT_CONNECTED, TRONA_PROTO_NOT_SUPPORTED,
+};
+use trona_protocol::posix_abi::socket::*;
+use trona_protocol::vfs::backend::{
+    BACKEND_FEATURE_ASYNC_V1, BACKEND_FEATURE_INCARNATION_SEQ, BACKEND_FEATURE_INLINE_TRANSFER,
+    VFS_BACKEND_OPEN_SESSION, VFS_BACKEND_REPLY_BUSY, VFS_BACKEND_REPLY_INVALID,
+    VFS_BACKEND_REPLY_IO_ERROR, VFS_BACKEND_REPLY_NO_SPACE, VFS_BACKEND_REPLY_NOT_FOUND,
+    VFS_BACKEND_REPLY_NOT_SUPPORTED, VFS_BACKEND_REPLY_OK,
+};
+use trona_runtime::core::slot_alloc::OwnedCap;
+use trona_runtime::debug::serial;
+use uapi::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
 // ---------------------------------------------------------------------------
 
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 // All cross-service caps are reached via the role-based startup capability
-// table. System roles flow through `trona::caps::*`; the service-local
-// `Require=netdrv:netdrv_ep` flows through generated `svc_caps::*`.
-const CAP_RX_NOTIFICATION: u64 = 80;
-const CAP_TX_NOTIFICATION: u64 = 82;
-const CAP_VFS_CALLBACK_EP: u64 = 83;
-const CAP_VFS_CALLBACK_BADGED_EP: u64 = 84;
-const CAP_REPLY_TEMP: u64 = 89;
+// table. System roles flow through `trona_runtime::client::caps::*`; the service-local
+// `Require=netdrv-ep.socket` is resolved via the `trona_runtime::local_cap!`
+// macro below (`netdrv_ep`).
+
+// Service-local cap: `Require=netdrv-ep.socket` in `netsrv.service`.
+trona_runtime::local_cap!(pub(crate) netdrv_ep = "netsrv:netdrv_ep");
+//
+// The slots below are server-private (VFS-facing callback endpoint,
+// its badged minted copy, and receive scratch). They
+// were previously hard-coded to slots 80..=84 inside RTLD's frame pool
+// window, which silently depended on the shared-library loader not
+// having claimed those exact slots yet. They are now dynamically
+// allocated at startup from `trona_runtime::core::slot_alloc` and cached in
+// `static mut` cells, so the server cannot collide with RTLD.
+static mut CAP_VFS_CALLBACK_EP_SLOT: u64 = 0;
+static mut CAP_VFS_CALLBACK_BADGED_EP_SLOT: u64 = 0;
+/// Stable receive scratch for the service-EP IPC dispatch loop.
+/// Sender payload caps (e.g. NET_REGISTER_VFS's VFS callback EP)
+/// deposit here; replies go back through the service MessagePipe
+/// endpoint with `reply-marked MP_WRITE`.
+static mut CAP_RECV_SCRATCH_SLOT: u64 = 0;
 const NETSRV_CALLBACK_BADGE: u64 = 0x4E37D;
+
+/// Allocate the server-private slots from `trona_runtime::core::slot_alloc`
+/// once at startup.
+fn init_private_slots() {
+    unsafe {
+        *&raw mut CAP_VFS_CALLBACK_EP_SLOT =
+            trona_runtime::core::slot_alloc::slot_alloc_or_idle(b"netsrv vfs-callback-ep");
+        *&raw mut CAP_VFS_CALLBACK_BADGED_EP_SLOT =
+            trona_runtime::core::slot_alloc::slot_alloc_or_idle(b"netsrv vfs-callback-badged-ep");
+        // Reserve 2 consecutive slots for current and future
+        // payload-cap receives.
+        *&raw mut CAP_RECV_SCRATCH_SLOT =
+            trona_runtime::core::slot_alloc::slot_alloc_consecutive_or_idle(
+                2,
+                b"netsrv recv-scratch",
+            );
+    }
+}
+
+fn cap_vfs_callback_ep() -> u64 {
+    unsafe { ::core::ptr::read_volatile(&raw const CAP_VFS_CALLBACK_EP_SLOT) }
+}
+
+#[inline]
+fn cap_vfs_callback_badged_ep() -> u64 {
+    unsafe { ::core::ptr::read_volatile(&raw const CAP_VFS_CALLBACK_BADGED_EP_SLOT) }
+}
+
+#[inline]
+pub(crate) fn cap_recv_scratch_slot() -> u64 {
+    unsafe { ::core::ptr::read_volatile(&raw const CAP_RECV_SCRATCH_SLOT) }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
+const SHM_MAP_HINT: u64 = 0;
 const NET_SHM_ID: u64 = 0x4E455400; // "NET\0"
 const SHM_HEADER_BYTES: u64 = 0x1000;
 const SHM_SLOT_BYTES: u64 = 2048;
@@ -56,8 +128,11 @@ const SHM_TX_SLOT_COUNT: u64 = 32;
 const SHM_TX_OFFSET: u64 = SHM_HEADER_BYTES + (SHM_RX_SLOT_COUNT * SHM_SLOT_BYTES);
 const NET_SHM_BYTES: u64 = SHM_TX_OFFSET + (SHM_TX_SLOT_COUNT * SHM_SLOT_BYTES);
 const NET_SHM_PAGES: u64 = (NET_SHM_BYTES + 4095) / 4096;
-const RX_BADGE: u64 = 0x1;
-const TX_BADGE: u64 = 0x2;
+/// Upper bound on how long the reactor's progress timer sleeps when no DNS/DHCP/TCP timer is
+/// pending. The RX kick is sent non-blocking and may be dropped while our pipe
+/// is full, so we never block forever: an idle loop still wakes at this cadence
+/// to run a progress sweep that drains any stranded SHM RX.
+const SAFETY_TICK_NS: u64 = 1_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -65,17 +140,76 @@ const TX_BADGE: u64 = 0x2;
 
 static mut MAC_ADDR: [u8; 6] = [0; 6];
 static mut VFS_REGISTERED: bool = false;
-/// Guard: true while processing a synchronous IPC handler that must not
-/// trigger VFS callbacks. See `notify_vfs_completion()` assertion.
-static mut IN_SYNC_HANDLER: bool = false;
+static mut VFS_SESSION_ID: u32 = 0;
+static mut VFS_SESSION_LIVE_GEN: u64 = 0;
 static mut SHM_BASE: u64 = 0;
+static mut SHM_IDX: u64 = 0;
+static mut SHM_CAP: Option<OwnedCap> = None;
 static mut SELF_TEST_PHASE: u8 = 0;
 static mut SELF_TEST_TICKS: u32 = 0;
 static mut LOGGED_RX_FRAME: bool = false;
 static mut LOGGED_UNKNOWN_ETHERTYPE: bool = false;
+static mut LOGGED_NETWORK_CONFIG: bool = false;
 static mut LOGGED_IPV4_PACKETS: u8 = 0;
 static mut LOGGED_INET_IPC: u8 = 0;
 static mut LOGGED_INET_RECV_RESULTS: u8 = 0;
+
+/// Duplicate `src` into a freshly-allocated slot and return it as an `OwnedCap`.
+///
+/// The caller converts to `TransferCap` (`.into_transfer()`) when passing the
+/// copy to `shm_map` or IPC; Drop handles cleanup on both the success and
+/// error paths.
+fn copy_cap_to_temp(src: &OwnedCap, label: &'static [u8]) -> Option<OwnedCap> {
+    let temp = trona_runtime::core::slot_alloc::alloc_slot_or_idle(label);
+    let src_slot = src.as_raw();
+    let err = invoke::cnode_copy_ref(
+        CapRef::flat(CAP_SELF_CSPACE),
+        trona_runtime::core::slot_alloc::resolved_cap_ref(src_slot),
+        CapRef::flat(CAP_SELF_CSPACE),
+        trona_runtime::core::slot_alloc::resolved_cap_ref(temp.addr()),
+        KERNITE_RIGHT_ALL as u64,
+    );
+    if err != 0 {
+        // copy failed: `temp` (OwnedSlot) Drop frees the empty slot.
+        return None;
+    }
+    // The copy landed a cap; adopt the slot as an OwnedCap.
+    Some(temp.assume_filled())
+}
+
+#[derive(Clone, Copy)]
+struct PendingCorrelation {
+    live: bool,
+    conn_id: u32,
+    op_type: u8,
+    _pad: [u8; 3],
+    header: CorrelationHeader,
+}
+
+impl PendingCorrelation {
+    const EMPTY: Self = Self {
+        live: false,
+        conn_id: 0,
+        op_type: 0,
+        _pad: [0; 3],
+        header: CorrelationHeader {
+            class: 0,
+            backend: 0,
+            kind: 0,
+            flags: 0,
+            session: 0,
+            opcode: 0,
+            _reserved0: 0,
+            token: 0,
+            request_seq: 0,
+            request_seq_secondary: 0,
+        },
+    };
+}
+
+const PENDING_CORRELATION_SLOTS: usize = 128;
+static mut PENDING_CORRELATIONS: [PendingCorrelation; PENDING_CORRELATION_SLOTS] =
+    [PendingCorrelation::EMPTY; PENDING_CORRELATION_SLOTS];
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -86,7 +220,7 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    trona_posix::tls::current_ipc_ctx()
+    trona_runtime::current_ipc_ctx()
 }
 
 pub(crate) fn mac_addr() -> [u8; 6] {
@@ -94,11 +228,176 @@ pub(crate) fn mac_addr() -> [u8; 6] {
     unsafe { *(&raw const MAC_ADDR) }
 }
 
-fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
+fn decode_request_correlation(msg: &TronaMsg) -> Option<CorrelationHeader> {
+    if (msg.length as usize) < (CORRELATION_HEADER_REG_START + CORRELATION_HEADER_REG_COUNT) {
+        return None;
+    }
+    let words = [
+        msg.regs[CORRELATION_HEADER_REG_START],
+        msg.regs[CORRELATION_HEADER_REG_START + 1],
+        msg.regs[CORRELATION_HEADER_REG_START + 2],
+        msg.regs[CORRELATION_HEADER_REG_START + 3],
+    ];
+    let header = CorrelationHeader::decode_words(words);
+    if header.kind != CORRELATION_KIND_REQUEST
+        || header.class != CORRELATION_CLASS_NET
+        || header.backend != CORRELATION_BACKEND_NETSRV
+        || header.token == 0
+    {
+        return None;
+    }
+    Some(header)
 }
 
-fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
+fn stamp_completion_correlation(reply: &mut TronaMsg, request: CorrelationHeader) {
+    let words = CorrelationHeader {
+        kind: CORRELATION_KIND_COMPLETION,
+        ..request
+    }
+    .encode_words();
+    reply.regs[CORRELATION_HEADER_REG_START] = words[0];
+    reply.regs[CORRELATION_HEADER_REG_START + 1] = words[1];
+    reply.regs[CORRELATION_HEADER_REG_START + 2] = words[2];
+    reply.regs[CORRELATION_HEADER_REG_START + 3] = words[3];
+    ensure_correlation_wire_length(&mut reply.length);
+}
+
+fn save_pending_correlation(conn_id: u32, op_type: u8, header: CorrelationHeader) {
+    unsafe {
+        let table = &mut *(&raw mut PENDING_CORRELATIONS);
+        let mut empty = PENDING_CORRELATION_SLOTS;
+        let mut i = 0usize;
+        while i < PENDING_CORRELATION_SLOTS {
+            if table[i].live && table[i].conn_id == conn_id && table[i].op_type == op_type {
+                table[i].header = header;
+                return;
+            }
+            if !table[i].live && empty == PENDING_CORRELATION_SLOTS {
+                empty = i;
+            }
+            i += 1;
+        }
+        if empty != PENDING_CORRELATION_SLOTS {
+            table[empty] = PendingCorrelation {
+                live: true,
+                conn_id,
+                op_type,
+                _pad: [0; 3],
+                header,
+            };
+        } else {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netsrv] pending correlation table full conn=");
+                _lb.dec(conn_id as u64);
+                _lb.str(b" op=");
+                _lb.dec(op_type as u64);
+                _lb.putc(b'\n');
+            });
+        }
+    }
+}
+
+fn take_pending_correlation(conn_id: u32, op_type: u8) -> Option<CorrelationHeader> {
+    unsafe {
+        let table = &mut *(&raw mut PENDING_CORRELATIONS);
+        let mut i = 0usize;
+        while i < PENDING_CORRELATION_SLOTS {
+            if table[i].live && table[i].conn_id == conn_id && table[i].op_type == op_type {
+                let header = table[i].header;
+                table[i] = PendingCorrelation::EMPTY;
+                return Some(header);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn backend_reply_label(label: u64) -> u64 {
+    match label {
+        TRONA_OK => VFS_BACKEND_REPLY_OK,
+        TRONA_INVALID_ARGUMENT => VFS_BACKEND_REPLY_INVALID,
+        TRONA_OUT_OF_MEMORY => VFS_BACKEND_REPLY_NO_SPACE,
+        TRONA_NOT_FOUND | TRONA_NOT_CONNECTED => VFS_BACKEND_REPLY_NOT_FOUND,
+        TRONA_BUSY | TRONA_ALREADY_EXISTS => VFS_BACKEND_REPLY_BUSY,
+        TRONA_INVALID_OPERATION | TRONA_NOT_SUPPORTED | TRONA_PROTO_NOT_SUPPORTED => {
+            VFS_BACKEND_REPLY_NOT_SUPPORTED
+        }
+        TRONA_CONN_REFUSED
+        | TRONA_CONN_RESET
+        | TRONA_HOST_UNREACHABLE
+        | TRONA_NET_UNREACHABLE
+        | TRONA_TIMED_OUT => VFS_BACKEND_REPLY_IO_ERROR,
+        _ => VFS_BACKEND_REPLY_IO_ERROR,
+    }
+}
+
+fn install_vfs_callback_cap(mint_badged_alias: bool) -> Result<(), u64> {
+    let _ = trona_kernel::syscall::invoke(
+        CAP_SELF_CSPACE,
+        KERNITE_INV_CNODE_DELETE as u64,
+        cap_vfs_callback_ep(),
+        0,
+        0,
+        0,
+    );
+    let _ = trona_kernel::syscall::invoke(
+        CAP_SELF_CSPACE,
+        KERNITE_INV_CNODE_DELETE as u64,
+        cap_vfs_callback_badged_ep(),
+        0,
+        0,
+        0,
+    );
+    let move_r = trona_kernel::syscall::invoke(
+        CAP_SELF_CSPACE,
+        KERNITE_INV_CNODE_MOVE as u64,
+        cap_vfs_callback_ep(),
+        CAP_SELF_CSPACE,
+        cap_recv_scratch_slot(),
+        0,
+    );
+    if move_r.error != 0 {
+        return Err(move_r.error as u64);
+    }
+    if mint_badged_alias {
+        let mint_r = trona_kernel::syscall::invoke(
+            CAP_SELF_CSPACE,
+            KERNITE_INV_CNODE_MINT as u64,
+            cap_vfs_callback_ep(),
+            CAP_SELF_CSPACE,
+            cap_vfs_callback_badged_ep(),
+            NETSRV_CALLBACK_BADGE,
+        );
+        if mint_r.error != 0 {
+            return Err(mint_r.error as u64);
+        }
+    }
+    Ok(())
+}
+
+fn handle_backend_open_session(msg: &TronaMsg, reply: &mut TronaMsg) {
+    if install_vfs_callback_cap(false).is_err() {
+        reply.label = VFS_BACKEND_REPLY_INVALID;
+        reply.length = 0;
+        return;
+    }
+    unsafe {
+        *(&raw mut VFS_REGISTERED) = true;
+        *(&raw mut VFS_SESSION_ID) = msg.regs[1] as u32;
+        let cur = *(&raw const VFS_SESSION_LIVE_GEN);
+        *(&raw mut VFS_SESSION_LIVE_GEN) = if cur == 0 { 1 } else { cur.wrapping_add(2) };
+    }
+    reply.label = VFS_BACKEND_REPLY_OK;
+    reply.regs[0] = 64;
+    reply.regs[1] = BACKEND_FEATURE_ASYNC_V1
+        | BACKEND_FEATURE_INCARNATION_SEQ
+        | BACKEND_FEATURE_INLINE_TRANSFER;
+    reply.regs[2] = 0;
+    reply.length = 3;
+}
+
+fn log_ipv4(lb: &mut trona_runtime::debug::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -108,10 +407,25 @@ fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec((ip & 0xFF) as u64);
 }
 
+fn log_mac(lb: &mut trona_runtime::debug::serial::LineBuf, mac: &[u8; 6]) {
+    let mut i = 0;
+    while i < mac.len() {
+        if i != 0 {
+            lb.putc(b':');
+        }
+        lb.hex(mac[i] as u64);
+        i += 1;
+    }
+}
+
 fn log_network_config(prefix: &[u8]) {
     let cfg = net::config::snapshot();
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(prefix);
+        _lb.str(b" host=");
+        _lb.str(net::config::HOSTNAME);
+        _lb.str(b" if=");
+        _lb.str(net::config::IFACE_NAME);
         _lb.str(b" IP=");
         log_ipv4(&mut _lb, cfg.our_ip);
         _lb.str(b" MASK=");
@@ -124,6 +438,19 @@ fn log_network_config(prefix: &[u8]) {
     });
 }
 
+fn maybe_log_network_ready() {
+    if !net::config::is_ready() || !net::config::is_configured() {
+        return;
+    }
+    unsafe {
+        if *(&raw const LOGGED_NETWORK_CONFIG) {
+            return;
+        }
+        *(&raw mut LOGGED_NETWORK_CONFIG) = true;
+    }
+    log_network_config(b"[netsrv] network ready");
+}
+
 fn log_inet_ipc(op: &[u8], conn_id: u32, ip: u32, port: u16, len: usize) {
     unsafe {
         if *(&raw const LOGGED_INET_IPC) >= 24 {
@@ -131,7 +458,7 @@ fn log_inet_ipc(op: &[u8], conn_id: u32, ip: u32, port: u16, len: usize) {
         }
         *(&raw mut LOGGED_INET_IPC) += 1;
     }
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] ipc ");
         _lb.str(op);
         _lb.str(b" conn=");
@@ -157,7 +484,7 @@ fn log_inet_recv_result(op: &[u8], conn_id: u32, src_ip: u32, len: usize, data: 
         }
         *(&raw mut LOGGED_INET_RECV_RESULTS) += 1;
     }
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] ipc ");
         _lb.str(op);
         _lb.str(b" conn=");
@@ -187,7 +514,7 @@ fn log_frame_once(frame: &[u8]) {
         return;
     }
     let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] RX frame len=");
         _lb.dec(frame.len() as u64);
         _lb.str(b" ethertype=");
@@ -197,13 +524,17 @@ fn log_frame_once(frame: &[u8]) {
 }
 
 fn log_ipv4_packet(hdr: &net::proto::ipv4::Ipv4Header, payload_len: usize) {
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] IPv4 src=");
         log_ipv4(&mut _lb, hdr.src);
         _lb.str(b" dst=");
         log_ipv4(&mut _lb, hdr.dst);
         _lb.str(b" proto=");
         _lb.dec(hdr.protocol as u64);
+        _lb.str(b" ihl=");
+        _lb.dec((hdr.version_ihl & 0x0F) as u64);
+        _lb.str(b" total=");
+        _lb.dec(hdr.total_len as u64);
         _lb.str(b" len=");
         _lb.dec(payload_len as u64);
         _lb.putc(b'\n');
@@ -213,7 +544,7 @@ fn log_ipv4_packet(hdr: &net::proto::ipv4::Ipv4Header, payload_len: usize) {
 fn bootstrap_network_config() {
     net::config::init(mac_addr());
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netsrv] DHCP bootstrap starting\n");
     });
 
@@ -222,7 +553,7 @@ fn bootstrap_network_config() {
         net::flush_pending_packets();
         net::dhcp::process();
     } else {
-        trona::uwarn!(|_lb| {
+        trona_runtime::uwarn!(|_lb| {
             _lb.str(b"[netsrv] DHCP start failed, continuing without a fallback config\n");
         });
     }
@@ -255,7 +586,7 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
             let next = (tx_head + 1) % slot_count;
             if next == tx_tail {
                 signal_netdrv_tx();
-                let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = trona_kernel::syscall::yield_now();
                 continue;
             }
 
@@ -274,12 +605,19 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
 }
 
 /// Signal netdrv that TX frames are available.
-///
-/// The TX notification cap received from netdrv is unbadged (badge=0).
-/// We pass TX_BADGE via the `bits` argument so netdrv sees badge & 0x2 != 0
-/// in its event loop (kernel computes: notification.signal(cap.badge | bits)).
 pub(crate) fn signal_netdrv_tx() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
+    let mut msg = TronaMsg::zeroed();
+    msg.label = NETDRV_TX_KICK;
+    // TX availability is edge-triggered but coalescable: the frame is already
+    // published in SHM, so netsrv must not synchronously wait for netdrv here.
+    let err = unsafe { ipc::mp_write_ctx(ipc_ctx(), netdrv_ep().addr(), &raw const msg) };
+    if err != 0 && err != KERNITE_ERR_WOULD_BLOCK as i32 {
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[netsrv] NETDRV_TX_KICK write failed err=");
+            _lb.dec(err as u64);
+            _lb.putc(b'\n');
+        });
+    }
 }
 
 /// Read a frame from the SHM RX ring. Returns the frame length on success.
@@ -321,51 +659,89 @@ fn shm_rx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 fn setup_shm() -> bool {
-    let ctx = ipc_ctx();
+    let shm_bytes = NET_SHM_PAGES * 4096;
 
-    // Create SHM
-    let mut msg = TronaMsg::zeroed();
-    msg.label = MM_SHM_CREATE;
-    msg.regs[0] = NET_SHM_ID;
-    msg.regs[1] = NET_SHM_PAGES;
-    msg.length = 2;
-    let mut reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS) {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] SHM create failed: ");
-            _lb.dec(if err != 0 { err as u64 } else { reply.label });
-            _lb.putc(b'\n');
-        });
-        return false;
+    // Create the SHM MO (producer). netsrv retains SHM_CAP for the later
+    // netdrv handoff and maps a disposable copy for its own view.
+    let (shm_idx, shm_cap) = match trona_runtime::client::mm::shm_create(NET_SHM_ID, shm_bytes) {
+        Ok(v) => v,
+        Err(label) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netsrv] SHM create failed label=");
+                _lb.dec(label);
+                _lb.putc(b'\n');
+            });
+            return false;
+        }
+    };
+    unsafe {
+        *(&raw mut SHM_IDX) = shm_idx;
+        // shm_cap stored for netdrv handoff; replaced (Drop frees old) on any error path below.
+        *(&raw mut SHM_CAP) = Some(shm_cap);
     }
 
-    // Map SHM
-    let mut msg = TronaMsg::zeroed();
-    msg.label = MM_SHM_MAP;
-    msg.regs[0] = NET_SHM_ID;
-    msg.regs[1] = 0;
-    msg.regs[2] = SHM_VADDR;
-    msg.regs[3] = 0x3; // RW
-    msg.length = 4;
-    let mut reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] SHM map failed: ");
-            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+    // Map into netsrv at an mmsrv-chosen VA (zero hint). Send a disposable
+    // copy and keep SHM_CAP for the netdrv handoff.
+    let shm_cap_ref = unsafe { (&*(&raw const SHM_CAP)).as_ref().unwrap() };
+    let Some(map_cap) = copy_cap_to_temp(shm_cap_ref, b"netsrv shm map cap") else {
+        unsafe {
+            *(&raw mut SHM_IDX) = 0;
+            *(&raw mut SHM_CAP) = None; // Drop frees the cap
+        }
+        return false;
+    };
+    let map_res = trona_runtime::client::mm::shm_map(
+        shm_idx,
+        map_cap.into_transfer(),
+        SHM_MAP_HINT,
+        shm_bytes,
+        0x3,
+    );
+    let mapped_base = match map_res {
+        Ok(base) => base,
+        Err(label) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netsrv] SHM map failed label=");
+                _lb.dec(label);
+                _lb.str(b" idx=");
+                _lb.dec(shm_idx);
+                _lb.putc(b'\n');
+            });
+            unsafe {
+                *(&raw mut SHM_IDX) = 0;
+                *(&raw mut SHM_CAP) = None; // Drop frees the cap
+            }
+            return false;
+        }
+    };
+    if mapped_base == 0 {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netsrv] SHM map returned base=0 idx=");
+            _lb.dec(shm_idx);
             _lb.putc(b'\n');
         });
+        unsafe {
+            *(&raw mut SHM_IDX) = 0;
+            *(&raw mut SHM_CAP) = None; // Drop frees the cap
+        }
         return false;
     }
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] SHM map ok base=");
+        _lb.hex(mapped_base);
+        _lb.putc(b'\n');
+    });
 
     // Initialize SHM header
-    // SAFETY: SHM is mapped at SHM_VADDR; single-threaded init.
+    // SAFETY: SHM is mapped at `mapped_base`; single-threaded init.
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] SHM header init base=");
+        _lb.hex(mapped_base);
+        _lb.putc(b'\n');
+    });
     unsafe {
-        *(&raw mut SHM_BASE) = SHM_VADDR;
-        let hdr = SHM_VADDR as *mut u32;
+        *(&raw mut SHM_BASE) = mapped_base;
+        let hdr = mapped_base as *mut u32;
         *hdr.add(0) = 0; // rx_head
         *hdr.add(1) = 0; // rx_tail
         *hdr.add(2) = 0; // tx_head
@@ -374,95 +750,72 @@ fn setup_shm() -> bool {
         *hdr.add(5) = SHM_TX_SLOT_COUNT as u32;
     }
 
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netsrv] SHM allocated and mapped\n");
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] SHM allocated idx=");
+        _lb.dec(shm_idx);
+        _lb.str(b" mapped at ");
+        _lb.hex(mapped_base);
+        _lb.putc(b'\n');
     });
     true
 }
 
 // ---------------------------------------------------------------------------
-// Startup: Notification allocation and binding
+// Startup: event wake path
 // ---------------------------------------------------------------------------
 
-fn setup_notification() -> bool {
-    let ctx = ipc_ctx();
-
-    // Allocate Notification via rsrcsrv (RES_ALLOC_OBJECT, owner=self).
-    // SAFETY: IPC context is valid; set up receive slot for cap transfer.
-    unsafe {
-        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_RX_NOTIFICATION, 0);
-    }
-    let mut msg = TronaMsg::zeroed();
-    msg.label = RES_ALLOC_OBJECT;
-    msg.regs[0] = 0; // owner_id=0 → caller's badge
-    msg.regs[1] = OBJ_NOTIFICATION;
-    msg.regs[2] = 0;
-    msg.regs[3] = 0;
-    msg.length = 4;
-    let mut reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to rsrcsrv.
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::rsrcsrv_ep(), &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] Failed to allocate notification: ");
-            _lb.dec(if err != 0 { err as u64 } else { reply.label });
-            _lb.putc(b'\n');
-        });
-        return false;
-    }
-
-    // Bind notification to our TCB
-    let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RX_NOTIFICATION);
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] Failed to bind notification to TCB: ");
-            _lb.dec(err as u64);
-            _lb.putc(b'\n');
-        });
-        return false;
-    }
-
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netsrv] Notification allocated and bound\n");
-    });
-    true
-}
-
 // ---------------------------------------------------------------------------
-// Startup: Register with netdrv via DRIVER_REGISTER
+// Startup: Register with netdrv via NETDRV_REGISTER
 // ---------------------------------------------------------------------------
 
 fn driver_register() -> bool {
     let ctx = ipc_ctx();
 
-    // Send DRIVER_REGISTER to netdrv EP (slot 64)
-    // extra_caps=1: send original RX notification (slot 80, retains GRANT
-    // right so IPC cap transfer succeeds) to netdrv.  netdrv signals us
-    // with bits=1 to indicate RX frames available.
-    // SAFETY: IPC context is valid; setting up send/receive caps.
-    unsafe {
-        ipc::set_send_cap_ctx(ctx, 0, CAP_RX_NOTIFICATION);
-        // Set receive slot for TX notification from netdrv
-        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_TX_NOTIFICATION, 0);
-    }
+    // Send NETDRV_REGISTER to netdrv with the mmsrv SHM index and an MO
+    // cap copy. TX and RX wakeups use explicit MP labels.
+    let shm_idx = unsafe { *(&raw const SHM_IDX) };
+    let shm_cap_opt = unsafe { (&*(&raw const SHM_CAP)).as_ref() };
+    let Some(shm_cap) = shm_cap_opt else {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netsrv] NETDRV_REGISTER missing SHM cap\n");
+        });
+        return false;
+    };
 
     let mut msg = TronaMsg::zeroed();
-    msg.label = DRIVER_REGISTER; // 0xC0
-    msg.regs[0] = NET_SHM_ID;
+    msg.label = NETDRV_REGISTER;
+    msg.regs[0] = shm_idx;
     msg.length = 1;
     let mut reply = TronaMsg::zeroed();
+    let Some(register_cap) = copy_cap_to_temp(shm_cap, b"netsrv netdrv shm cap") else {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netsrv] NETDRV_REGISTER SHM cap copy failed\n");
+        });
+        return false;
+    };
+    let register_tc = register_cap.into_transfer();
     // SAFETY: IPC context is valid; making RPC to netdrv.
-    let err = unsafe { ipc::call_ctx(ctx, svc_caps::netdrv_ep(), &raw const msg, &raw mut reply) };
-    trona::udebug!(|_lb| {
-        _lb.str(b"[netsrv] DRIVER_REGISTER call result=");
+    let err = unsafe {
+        ipc::set_send_cap_ctx(ctx, 0, register_tc.slot());
+        ipc::mp_call_ctx(
+            ctx,
+            netdrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
+    drop(register_tc);
+    trona_runtime::udebug!(|_lb| {
+        _lb.str(b"[netsrv] NETDRV_REGISTER call result=");
         _lb.dec(err as u64);
         _lb.str(b" label=");
         _lb.dec(reply.label);
         _lb.putc(b'\n');
     });
     if err != 0 || reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netsrv] NETDRV_REGISTER failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
         });
@@ -483,7 +836,7 @@ fn driver_register() -> bool {
         (*mac)[5] = mac_hi as u8;
     }
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Registered with netdrv, MAC=");
         let mac = mac_addr();
         let mut i = 0;
@@ -504,11 +857,14 @@ fn driver_register() -> bool {
 // ---------------------------------------------------------------------------
 
 fn register_namesrv() {
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
+
     let name = b"netsrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = NS_REGISTER;
+    msg.label = NAMESRV_REGISTER;
     msg.regs[0] = name.len() as u64;
-    msg.length = 1 + (name.len() as u64 + 7) / 8;
+    let publish_tc = trona_runtime::client::caps::service_client_ep_for_transfer();
     // SAFETY: Writing name bytes into message register space; IPC context is valid.
     unsafe {
         let dst = &raw mut msg.regs[1] as *mut u8;
@@ -517,16 +873,22 @@ fn register_namesrv() {
             *dst.add(i) = name[i];
             i += 1;
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.as_ref().map_or(0, |t| t.slot()));
+    }
+    msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    msg.length = (REGISTER_FLAGS_REG + 1) as u64;
+    unsafe {
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
+        let err = ipc::mp_call_ctx(
             ipc_ctx(),
-            trona::caps::namesrv_ep(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
+        drop(publish_tc);
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[netsrv] namesrv registration failed\n");
             });
         }
@@ -541,9 +903,14 @@ fn register_namesrv() {
 fn process_packet(data: &[u8]) {
     let our_ip = net::proto::ipv4::our_ip();
     if let Some((eth_hdr, payload)) = net::ethernet::parse(data) {
+        let our_mac = mac_addr();
+        if eth_hdr.dst != our_mac && eth_hdr.dst != net::ethernet::BROADCAST_MAC {
+            return;
+        }
+
         match eth_hdr.ethertype {
             net::ethernet::ETHERTYPE_ARP => {
-                net::proto::arp::handle_packet(&mac_addr(), our_ip, payload);
+                net::proto::arp::handle_packet(&our_mac, our_ip, payload);
             }
             net::ethernet::ETHERTYPE_IPV4 => {
                 if let Some((ip_hdr, ip_payload)) = net::proto::ipv4::parse(payload) {
@@ -573,9 +940,13 @@ fn process_packet(data: &[u8]) {
             _ => unsafe {
                 if !*(&raw const LOGGED_UNKNOWN_ETHERTYPE) {
                     *(&raw mut LOGGED_UNKNOWN_ETHERTYPE) = true;
-                    trona::udebug!(|_lb| {
+                    trona_runtime::udebug!(|_lb| {
                         _lb.str(b"[netsrv] unhandled ethertype=");
                         _lb.hex(eth_hdr.ethertype as u64);
+                        _lb.str(b" src=");
+                        log_mac(&mut _lb, &eth_hdr.src);
+                        _lb.str(b" dst=");
+                        log_mac(&mut _lb, &eth_hdr.dst);
                         _lb.putc(b'\n');
                     });
                 }
@@ -597,6 +968,21 @@ pub(crate) fn process_rx_from_shm() {
         net::config::note_rx(len);
         process_packet(&frame_buf[..len]);
     }
+}
+
+fn service_network_progress(ctx: *mut IpcContext) {
+    process_rx_from_shm();
+    net::flush_pending_packets();
+    net::dhcp::process();
+    if net::dhcp::is_finished() && !net::dhcp::is_bound() {
+        net::dhcp::finish();
+    }
+    maybe_log_network_ready();
+    net::socket::tcp::process_timers();
+    net::dns::process_pending();
+    drain_completion_queue();
+    drain_dns_completions(ctx);
+    check_self_test();
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +1014,7 @@ fn check_self_test() {
             }
 
             if net::proto::arp::lookup(gateway).is_some() {
-                trona::udebug!(|_lb| {
+                trona_runtime::udebug!(|_lb| {
                     _lb.str(b"[netsrv] ARP reply received for gateway\n");
                 });
                 unsafe {
@@ -640,7 +1026,7 @@ fn check_self_test() {
                     *(&raw mut SELF_TEST_TICKS) = ticks + 1;
                 }
                 if ticks + 1 >= 200 {
-                    trona::uwarn!(|_lb| {
+                    trona_runtime::uwarn!(|_lb| {
                         _lb.str(b"[netsrv] ARP timeout for gateway\n");
                     });
                     // SAFETY: Single-threaded server.
@@ -694,7 +1080,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             reply.regs[0] = sent as u64;
             reply.length = 1;
         } else {
-            trona::udebug!(|_lb| {
+            trona_runtime::udebug!(|_lb| {
                 _lb.str(b"[netsrv] send failed label=");
                 _lb.dec((-sent) as u64);
                 _lb.putc(b'\n');
@@ -706,13 +1092,45 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
     }
 
     fn handle_net_accept(reply: &mut TronaMsg, conn_id: u32, arm_pending: bool) {
+        // `arm_pending` path — `NET_ACCEPT_WAIT` under `mp_write_ctx`. Route
+        // all outcomes through `push_completion`.
+        if arm_pending {
+            match socket_kind(conn_id) {
+                SocketKind::Tcp => {
+                    let result = net::socket::tcp::tcp_accept(conn_id);
+                    if result == -1 {
+                        net::socket::tcp::set_pending_accept(conn_id);
+                    } else if result > 0 {
+                        let new_cid = result as u32;
+                        match net::socket::tcp::tcp_getpeername(new_cid) {
+                            Ok((ip, port)) => {
+                                net::socket::tcp::push_immediate_accept_completion(
+                                    conn_id, new_cid, ip, port,
+                                );
+                            }
+                            Err(_label) => {
+                                net::socket::tcp::push_immediate_accept_completion(
+                                    conn_id, 0, 0, 0,
+                                );
+                            }
+                        }
+                    } else {
+                        net::socket::tcp::push_immediate_accept_completion(conn_id, 0, 0, 0);
+                    }
+                }
+                _ => {
+                    net::socket::tcp::push_immediate_accept_completion(conn_id, 0, 0, 0);
+                }
+            }
+            reply.label = TRONA_PENDING;
+            return;
+        }
+
+        // Synchronous `NET_ACCEPT` path for blocking `mp_call_ctx`.
         match socket_kind(conn_id) {
             SocketKind::Tcp => {
                 let result = net::socket::tcp::tcp_accept(conn_id);
                 if result == -1 {
-                    if arm_pending {
-                        net::socket::tcp::set_pending_accept(conn_id);
-                    }
                     reply.label = TRONA_PENDING;
                 } else if result > 0 {
                     let new_cid = result as u32;
@@ -746,12 +1164,69 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         arm_pending: bool,
     ) {
         let capped = core::cmp::min(max_len, 152) as usize;
+        let kind = socket_kind(conn_id);
+        let peek = (flags & INET_RECV_FLAG_PEEK) != 0;
+
+        // `NET_RECV_WAIT` path. VFS has already parked the client via
+        // `PendingInetOp` + `save_caller`, fired `mp_write_ctx`, and is not
+        // waiting for this reply. The response VFS expects travels via
+        // `push_completion` + the callback EP so `handle_netsrv_callback`
+        // can match it to the saved client slot. The `reply` written
+        // here carries only the courtesy `TRONA_PENDING` label and is
+        // discarded — no reply cap was transferred.
+        if arm_pending {
+            let mut scratch = [0u8; 152];
+            let result = match kind {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, &mut scratch[..capped]),
+                SocketKind::Udp => net::socket::udp::udp_recv(conn_id, &mut scratch[..capped]),
+                SocketKind::Tcp => {
+                    if peek {
+                        net::socket::tcp::tcp_recv_peek(conn_id, &mut scratch[..capped])
+                    } else {
+                        net::socket::tcp::tcp_recv(conn_id, &mut scratch[..capped])
+                    }
+                }
+            };
+            if result == -1 {
+                match kind {
+                    SocketKind::Raw => {
+                        net::socket::raw_ipv4::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Udp => {
+                        net::socket::udp::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Tcp => {
+                        net::socket::tcp::set_pending_recv(conn_id, capped as u16, peek);
+                    }
+                }
+            } else {
+                let n = core::cmp::min(result as usize, 152);
+                match kind {
+                    SocketKind::Raw => {
+                        net::socket::raw_ipv4::push_immediate_recv_completion(
+                            conn_id,
+                            &scratch[..n],
+                        );
+                    }
+                    SocketKind::Udp => {
+                        net::socket::udp::push_immediate_recv_completion(conn_id, &scratch[..n]);
+                    }
+                    SocketKind::Tcp => {
+                        net::socket::tcp::push_immediate_recv_completion(conn_id, &scratch[..n]);
+                    }
+                }
+            }
+            reply.label = TRONA_PENDING;
+            return;
+        }
+
+        // `NET_RECV` path (no arm). VFS is waiting for this reply with
+        // `mp_call_ctx` — fill inline or return `TRONA_PENDING` so VFS
+        // parks the client and re-asks via `NET_RECV_WAIT`.
         let buf = unsafe {
             let dst = &raw mut reply.regs[1] as *mut u8;
             core::slice::from_raw_parts_mut(dst, capped)
         };
-        let kind = socket_kind(conn_id);
-        let peek = (flags & INET_RECV_FLAG_PEEK) != 0;
         let result = match kind {
             SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, buf),
             SocketKind::Udp => net::socket::udp::udp_recv(conn_id, buf),
@@ -764,19 +1239,6 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             }
         };
         if result == -1 {
-            if arm_pending {
-                match kind {
-                    SocketKind::Raw => {
-                        net::socket::raw_ipv4::set_pending_recv(conn_id, capped as u16);
-                    }
-                    SocketKind::Udp => {
-                        net::socket::udp::set_pending_recv(conn_id, capped as u16);
-                    }
-                    SocketKind::Tcp => {
-                        net::socket::tcp::set_pending_recv(conn_id, capped as u16, peek);
-                    }
-                }
-            }
             reply.label = TRONA_PENDING;
         } else {
             reply.label = TRONA_OK;
@@ -795,18 +1257,75 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         let want_timestamp = (flags & INET_RECV_FLAG_WANT_TIMESTAMP) != 0;
         let capped = core::cmp::min(max_len, 128) as usize;
         log_inet_ipc(b"recvfrom", conn_id, 0, 0, capped);
+        let kind = socket_kind(conn_id);
+
+        // `NET_RECVFROM_WAIT` path — same async contract as
+        // `NET_RECV_WAIT`: VFS parked the client before firing
+        // `mp_write_ctx`; all results travel via `push_completion`.
+        if arm_pending {
+            let mut scratch = [0u8; 152];
+            match kind {
+                SocketKind::Raw => {
+                    let (result, src_ip, src_port, timestamp_ns) =
+                        net::socket::raw_ipv4::raw_recvfrom(
+                            conn_id,
+                            &mut scratch[..capped],
+                            want_timestamp,
+                        );
+                    if result == -1 {
+                        net::socket::raw_ipv4::set_pending_recvfrom(conn_id, capped as u16, flags);
+                    } else {
+                        let n = core::cmp::min(result as usize, 152);
+                        net::socket::raw_ipv4::push_immediate_recvfrom_completion(
+                            conn_id,
+                            &scratch[..n],
+                            src_ip,
+                            src_port,
+                            timestamp_ns,
+                        );
+                    }
+                }
+                SocketKind::Udp => {
+                    let (result, src_ip, src_port, timestamp_ns) = net::socket::udp::udp_recvfrom(
+                        conn_id,
+                        &mut scratch[..capped],
+                        want_timestamp,
+                    );
+                    if result == -1 {
+                        net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
+                    } else {
+                        let n = core::cmp::min(result as usize, 152);
+                        net::socket::udp::push_immediate_recvfrom_completion(
+                            conn_id,
+                            &scratch[..n],
+                            src_ip,
+                            src_port,
+                            timestamp_ns,
+                        );
+                    }
+                }
+                SocketKind::Tcp => {
+                    // TCP has no connectionless recvfrom. Push an error
+                    // completion so VFS unparks the client with the
+                    // correct errno.
+                    net::socket::tcp::push_immediate_recv_completion(conn_id, &[]);
+                }
+            }
+            reply.label = TRONA_PENDING;
+            return;
+        }
+
+        // `NET_RECVFROM` path (no arm): synchronous response for the
+        // blocking VFS `mp_call_ctx`.
         let buf = unsafe {
             let dst = &raw mut reply.regs[4] as *mut u8;
             core::slice::from_raw_parts_mut(dst, capped)
         };
-        match socket_kind(conn_id) {
+        match kind {
             SocketKind::Raw => {
                 let (result, src_ip, src_port, timestamp_ns) =
                     net::socket::raw_ipv4::raw_recvfrom(conn_id, buf, want_timestamp);
                 if result == -1 {
-                    if arm_pending {
-                        net::socket::raw_ipv4::set_pending_recvfrom(conn_id, capped as u16, flags);
-                    }
                     reply.label = TRONA_PENDING;
                 } else {
                     let data_len = result as usize;
@@ -816,22 +1335,13 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                     reply.regs[2] = src_port as u64;
                     reply.regs[3] = timestamp_ns;
                     reply.length = 4 + (((result as u64) + 7) / 8);
-                    log_inet_recv_result(
-                        b"recvfrom",
-                        conn_id,
-                        src_ip,
-                        data_len,
-                        &buf[..data_len],
-                    );
+                    log_inet_recv_result(b"recvfrom", conn_id, src_ip, data_len, &buf[..data_len]);
                 }
             }
             SocketKind::Udp => {
                 let (result, src_ip, src_port, timestamp_ns) =
                     net::socket::udp::udp_recvfrom(conn_id, buf, want_timestamp);
                 if result == -1 {
-                    if arm_pending {
-                        net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
-                    }
                     reply.label = TRONA_PENDING;
                 } else {
                     reply.label = TRONA_OK;
@@ -848,44 +1358,27 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         }
     }
 
-    // Category A handlers (socket, bind, listen, send, close, etc.) are
-    // synchronous metadata ops that must never trigger VFS callbacks.
-    // The IN_SYNC_HANDLER flag guards against accidental callback dispatch.
-    let is_sync_handler = matches!(
-        msg.label,
-        NET_SOCKET
-            | NET_BIND
-            | NET_LISTEN
-            | NET_SEND
-            | NET_SENDTO
-            | NET_CLOSE
-            | NET_SHUTDOWN
-            | NET_GETSOCKNAME
-            | NET_GETPEERNAME
-            | NET_SETSOCKOPT
-            | NET_GETSOCKOPT
-            | NET_POLL_STATUS
-    );
-    if is_sync_handler {
-        unsafe { *(&raw mut IN_SYNC_HANDLER) = true; }
-    }
+    let request_correlation = decode_request_correlation(msg);
 
     match msg.label {
+        VFS_BACKEND_OPEN_SESSION => {
+            handle_backend_open_session(msg, reply);
+        }
+        NETSRV_RX_KICK => {
+            service_network_progress(ipc_ctx());
+            reply.label = TRONA_OK;
+        }
         NET_REGISTER_VFS => {
-            // VFS transfers a plain, IPC-transferable endpoint cap. Rebadge it
-            // locally so callbacks arrive with a distinctive badge on the VFS
-            // side without relying on label-based fallback routing.
-            let mint_err = invoke::cnode_mint(
-                CAP_SELF_CSPACE,
-                CAP_VFS_CALLBACK_EP,
-                CAP_SELF_CSPACE,
-                CAP_VFS_CALLBACK_BADGED_EP,
-                NETSRV_CALLBACK_BADGE,
-            );
-            if mint_err != 0 {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[netsrv] failed to mint local callback alias err=");
-                    _lb.dec(mint_err as u64);
+            // VFS transfers a plain, IPC-transferable endpoint cap.
+            // Inbound payload caps deposit at `recv_scratch`; move
+            // the cap to its permanent slot first, then rebadge it
+            // locally so callbacks arrive with a distinctive badge on
+            // the VFS side without relying on label-based fallback
+            // routing.
+            if let Err(err) = install_vfs_callback_cap(true) {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[netsrv] failed to move VFS callback EP into permanent slot err=");
+                    _lb.dec(err);
                     _lb.putc(b'\n');
                 });
                 reply.label = TRONA_INVALID_OPERATION;
@@ -893,7 +1386,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                 unsafe {
                     *(&raw mut VFS_REGISTERED) = true;
                 }
-                trona::uinfo!(|_lb| {
+                trona_runtime::uinfo!(|_lb| {
                     _lb.str(b"[netsrv] VFS callback EP registered\n");
                 });
                 reply.label = TRONA_OK;
@@ -949,6 +1442,9 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                 SocketKind::Tcp => {
                     let result = net::socket::tcp::tcp_connect(conn_id, ip, port);
                     if result == -1 {
+                        if let Some(header) = request_correlation {
+                            save_pending_correlation(conn_id, INET_OP_CONNECT, header);
+                        }
                         reply.label = TRONA_PENDING;
                     } else {
                         reply.label = TRONA_INVALID_ARGUMENT;
@@ -1023,7 +1519,11 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         NET_RECV => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            let flags = if msg.length >= 3 { msg.regs[2] as u32 } else { 0 };
+            let flags = if msg.length >= 3 {
+                msg.regs[2] as u32
+            } else {
+                0
+            };
             handle_net_recv(reply, conn_id, max_len, flags, false);
         }
         NET_SENDTO => {
@@ -1058,11 +1558,21 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         NET_RECV_WAIT => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            let flags = if msg.length >= 3 { msg.regs[2] as u32 } else { 0 };
+            let flags = if msg.length >= 3 {
+                msg.regs[2] as u32
+            } else {
+                0
+            };
+            if let Some(header) = request_correlation {
+                save_pending_correlation(conn_id, INET_OP_RECV, header);
+            }
             handle_net_recv(reply, conn_id, max_len, flags, true);
         }
         NET_ACCEPT_WAIT => {
             let conn_id = msg.regs[0] as u32;
+            if let Some(header) = request_correlation {
+                save_pending_correlation(conn_id, INET_OP_ACCEPT, header);
+            }
             handle_net_accept(reply, conn_id, true);
         }
         NET_RECVFROM_WAIT => {
@@ -1073,14 +1583,23 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             } else {
                 INET_RECV_FLAG_WANT_ADDR
             };
+            if let Some(header) = request_correlation {
+                save_pending_correlation(conn_id, INET_OP_RECVFROM, header);
+            }
             handle_net_recvfrom(reply, conn_id, max_len, flags, true);
         }
         NET_CLOSE => {
             let conn_id = msg.regs[0] as u32;
             match socket_kind(conn_id) {
-                SocketKind::Raw => { net::socket::raw_ipv4::raw_close(conn_id); }
-                SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
-                SocketKind::Tcp => { net::socket::tcp::tcp_close(conn_id); }
+                SocketKind::Raw => {
+                    net::socket::raw_ipv4::raw_close(conn_id);
+                }
+                SocketKind::Udp => {
+                    net::socket::udp::udp_close(conn_id);
+                }
+                SocketKind::Tcp => {
+                    net::socket::tcp::tcp_close(conn_id);
+                }
             }
             reply.label = TRONA_OK;
         }
@@ -1088,9 +1607,15 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             let conn_id = msg.regs[0] as u32;
             let how = msg.regs[1] as i32;
             match socket_kind(conn_id) {
-                SocketKind::Raw => { net::socket::raw_ipv4::raw_close(conn_id); }
-                SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
-                SocketKind::Tcp => { net::socket::tcp::tcp_shutdown(conn_id, how); }
+                SocketKind::Raw => {
+                    net::socket::raw_ipv4::raw_close(conn_id);
+                }
+                SocketKind::Udp => {
+                    net::socket::udp::udp_close(conn_id);
+                }
+                SocketKind::Tcp => {
+                    net::socket::tcp::tcp_shutdown(conn_id, how);
+                }
             }
             reply.label = TRONA_OK;
         }
@@ -1189,6 +1714,13 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                 let src = &msg.regs[1] as *const u64 as *const u8;
                 core::ptr::copy_nonoverlapping(src, hostname.as_mut_ptr(), hostname_len);
             }
+            // Fail fast when no resolver is configured (DHCP never provided
+            // one): deferring would block the caller until the per-query hard
+            // deadline. Reply with a meaningful error now instead.
+            if net::config::dns_server() == 0 {
+                reply.label = TRONA_NOT_FOUND;
+                return false;
+            }
             match net::dns::start_resolve(&hostname[..hostname_len]) {
                 Some(_) => return true, // deferred
                 None => {
@@ -1198,6 +1730,11 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         }
         NET_DNS_RESOLVE_PTR => {
             let ip = msg.regs[0] as u32;
+            // Fail fast with a meaningful error when no resolver is configured.
+            if net::config::dns_server() == 0 {
+                reply.label = TRONA_NOT_FOUND;
+                return false;
+            }
             match net::dns::start_resolve_ptr(ip) {
                 Some(_) => return true, // deferred
                 None => {
@@ -1244,9 +1781,6 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             reply.label = TRONA_INVALID_OPERATION;
         }
     }
-    if is_sync_handler {
-        unsafe { *(&raw mut IN_SYNC_HANDLER) = false; }
-    }
     false
 }
 
@@ -1261,7 +1795,7 @@ fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
 }
 
 /// Drain completed async DNS queries and send deferred replies to saved
-/// caller caps.
+/// caller reply targets.
 fn drain_dns_completions(ctx: *mut IpcContext) {
     while let Some(c) = net::dns::pop_completion() {
         let mut reply = TronaMsg::zeroed();
@@ -1290,11 +1824,7 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
                         // SAFETY: Writing hostname bytes into reply register area.
                         unsafe {
                             let dst = &raw mut reply.regs[1] as *mut u8;
-                            core::ptr::copy_nonoverlapping(
-                                c.ptr_hostname.as_ptr(),
-                                dst,
-                                copy_len,
-                            );
+                            core::ptr::copy_nonoverlapping(c.ptr_hostname.as_ptr(), dst, copy_len);
                         }
                     }
                     reply.length = 1 + ((copy_len as u64 + 7) / 8);
@@ -1303,62 +1833,56 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
                 }
             }
         }
-        // SAFETY: IPC context is valid; reply cap slot was saved by start_resolve*.
+        // SAFETY: IPC context is valid; reply target was stashed by the DNS start path.
         unsafe {
-            ipc::send_ctx(ctx, c.reply_cap_slot, &raw const reply);
+            let ipc_buf = if let Some(ctx_mut) = ctx.as_mut() {
+                ctx_mut.ipc_buffer
+            } else {
+                core::ptr::null_mut()
+            };
+            let len = core::cmp::min(reply.length as usize, reply.regs.len());
+            let err = trona_server::mp_write_reply_to(
+                ipc_buf,
+                c.reply_target,
+                reply.label,
+                &reply.regs[..len],
+                0,
+            );
+            if err != 0 {
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[netsrv] DNS mp_write_reply failed err=");
+                    _lb.hex(err as u64);
+                    _lb.putc(b'\n');
+                });
+            }
         }
     }
 }
 
-/// Receive the next event on the server EP, with a timeout if DNS queries
-/// are pending. On timeout, sets badge to 1 to trigger notification
-/// processing (which calls `dns::process_pending` to check deadlines).
-///
-/// # Safety
-///
-/// `ctx` must be a valid IPC context. `msg` and `badge` must be valid pointers.
-unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut TronaMsg, badge: *mut u64) {
-    unsafe {
-        if net::dns::has_pending() || net::dhcp::has_timer() {
-            let now = net::dns::clock_monotonic_ns();
-            let dns_deadline = if net::dns::has_pending() {
-                net::dns::nearest_deadline_ns()
-            } else {
-                u64::MAX
-            };
-            let dhcp_deadline = if net::dhcp::has_timer() {
-                net::dhcp::nearest_deadline_ns()
-            } else {
-                u64::MAX
-            };
-            let deadline = core::cmp::min(dns_deadline, dhcp_deadline);
-            if deadline <= now {
-                // Deadline already passed; skip recv and process immediately
-                *badge = 1;
-                return;
-            }
-            let timeout = deadline.saturating_sub(now).max(100_000); // min 100us
-            let r = trona::syscall::syscall(
-                SYS_RECV_TIMED,
-                trona::caps::service_ep(),
-                timeout,
-                0,
-                0,
-                0,
-                0,
-            );
-            if r.error == 0 {
-                *badge = r.value;
-                // Read message from IPC buffer (same as recv_ctx does)
-                let buf = (*ctx).ipc_buffer as *const TronaMsg;
-                *msg = *buf;
-            } else {
-                // Timeout: trigger notification processing to check DNS deadlines
-                *badge = 1;
-            }
-        } else {
-            ipc::recv_ctx(ctx, trona::caps::service_ep(), msg, badge);
-        }
+/// Compute the absolute monotonic deadline for the next progress-timer fire:
+/// the nearest pending DNS/DHCP/TCP deadline, or `now + SAFETY_TICK_NS` when
+/// none is pending (so stranded SHM RX is still swept on an idle heartbeat).
+fn next_wake_deadline() -> u64 {
+    let now = net::dns::clock_monotonic_ns();
+    let tcp_deadline = net::socket::tcp::next_timer_deadline_ns();
+    let dns_deadline = if net::dns::has_pending() {
+        net::dns::nearest_deadline_ns()
+    } else {
+        u64::MAX
+    };
+    let dhcp_deadline = if net::dhcp::has_timer() {
+        net::dhcp::nearest_deadline_ns()
+    } else {
+        u64::MAX
+    };
+    let deadline = core::cmp::min(core::cmp::min(dns_deadline, dhcp_deadline), tcp_deadline);
+    if deadline == u64::MAX {
+        now.saturating_add(SAFETY_TICK_NS)
+    } else {
+        // Clamp into the future so a just-passed deadline still fires promptly
+        // (the kernel fires a past deadline on the next tick) without re-arming
+        // in the past on every iteration.
+        core::cmp::max(deadline, now.saturating_add(1))
     }
 }
 
@@ -1390,26 +1914,10 @@ fn notify_vfs_completion(
     extra_port: u16,
     timestamp_ns: u64,
 ) {
-    // Cycle safety: VFS callbacks must never be sent while processing a
-    // synchronous VFS request (socket/bind/listen/etc.), as VFS would be
-    // blocked on netsrv and unable to receive the callback.
-    unsafe {
-        if *(&raw const IN_SYNC_HANDLER) {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[netsrv] BUG: VFS callback attempted during sync handler! conn=");
-                _lb.dec(conn_id as u64);
-                _lb.str(b" op=");
-                _lb.dec(op_type as u64);
-                _lb.str(b"\n");
-            });
-            return;
-        }
-    }
-
     // SAFETY: Single-threaded server; VFS_REGISTERED is set once.
     let registered = unsafe { *(&raw const VFS_REGISTERED) };
     if !registered {
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[netsrv] notify skip conn=");
             _lb.dec(conn_id as u64);
             _lb.str(b" op=");
@@ -1418,6 +1926,91 @@ fn notify_vfs_completion(
         });
         return;
     }
+
+    if let Some(header) = take_pending_correlation(conn_id, op_type) {
+        let mut msg = TronaMsg::zeroed();
+        msg.label = backend_reply_label(result);
+        if msg.label == VFS_BACKEND_REPLY_OK {
+            match op_type {
+                INET_OP_CONNECT => {
+                    msg.regs[0] = conn_id as u64;
+                    msg.regs[1] = 0;
+                    msg.length = 2;
+                }
+                INET_OP_RECV => {
+                    let max_data = core::cmp::min(data_len, 152);
+                    msg.regs[0] = max_data as u64;
+                    if max_data > 0 {
+                        unsafe {
+                            let dst = &raw mut msg.regs[1] as *mut u8;
+                            let mut i = 0usize;
+                            while i < max_data {
+                                *dst.add(i) = data[i];
+                                i += 1;
+                            }
+                        }
+                    }
+                    msg.length = 1 + ((max_data as u64 + 7) / 8);
+                }
+                INET_OP_ACCEPT => {
+                    msg.regs[0] = extra_conn_id as u64;
+                    msg.regs[1] = 8;
+                    unsafe {
+                        let dst = &raw mut msg.regs[2] as *mut u8;
+                        let family = (AF_INET as u16).to_le_bytes();
+                        *dst.add(0) = family[0];
+                        *dst.add(1) = family[1];
+                        let port = extra_port.to_be_bytes();
+                        *dst.add(2) = port[0];
+                        *dst.add(3) = port[1];
+                        let ip = extra_ip.to_be_bytes();
+                        *dst.add(4) = ip[0];
+                        *dst.add(5) = ip[1];
+                        *dst.add(6) = ip[2];
+                        *dst.add(7) = ip[3];
+                    }
+                    msg.length = 3;
+                }
+                INET_OP_RECVFROM => {
+                    let max_data = core::cmp::min(data_len, 104);
+                    msg.regs[0] = max_data as u64;
+                    msg.regs[1] = extra_ip as u64;
+                    msg.regs[2] = extra_port as u64;
+                    msg.regs[3] = timestamp_ns;
+                    if max_data > 0 {
+                        unsafe {
+                            let dst = &raw mut msg.regs[4] as *mut u8;
+                            let mut i = 0usize;
+                            while i < max_data {
+                                *dst.add(i) = data[i];
+                                i += 1;
+                            }
+                        }
+                    }
+                    msg.length = 4 + ((max_data as u64 + 7) / 8);
+                }
+                _ => {
+                    msg.length = 0;
+                }
+            }
+        }
+        stamp_completion_correlation(&mut msg, header);
+        let ep = cap_vfs_callback_ep();
+        let write_err = unsafe { ipc::mp_write_ctx(ipc_ctx(), ep, &raw const msg) };
+        trona_runtime::udebug!(|_lb| {
+            _lb.str(b"[netsrv] backend notify conn=");
+            _lb.dec(conn_id as u64);
+            _lb.str(b" op=");
+            _lb.dec(op_type as u64);
+            _lb.str(b" len=");
+            _lb.dec(data_len as u64);
+            _lb.str(b" err=");
+            _lb.hex(write_err as u64);
+            _lb.putc(b'\n');
+        });
+        return;
+    }
+
     let mut msg = TronaMsg::zeroed();
     msg.label = NET_COMPLETE;
     msg.regs[0] = conn_id as u64;
@@ -1473,17 +2066,15 @@ fn notify_vfs_completion(
         }
     }
 
-    let mut resp = TronaMsg::zeroed();
+    // One-way completion (the reply was only logged). Non-blocking so the
+    // netsrv reactor never parks on VFS — that blocking call was the VFS↔netsrv
+    // return-edge of the boot deadlock. Post-A1a a reply to a VFS that is parked
+    // on netsrv enqueues on the callback ring (it was silently dropped before),
+    // so the `IN_SYNC_HANDLER` guard that used to suppress this is retired.
     // SAFETY: IPC context is valid; slot 84 holds the local badged alias.
-    let call_err = unsafe {
-        ipc::call_ctx(
-            ipc_ctx(),
-            CAP_VFS_CALLBACK_BADGED_EP,
-            &raw const msg,
-            &raw mut resp,
-        )
-    };
-    trona::udebug!(|_lb| {
+    let call_err =
+        unsafe { ipc::mp_write_ctx(ipc_ctx(), cap_vfs_callback_badged_ep(), &raw const msg) };
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] notify conn=");
         _lb.dec(conn_id as u64);
         _lb.str(b" op=");
@@ -1492,8 +2083,6 @@ fn notify_vfs_completion(
         _lb.dec(data_len as u64);
         _lb.str(b" err=");
         _lb.hex(call_err as u64);
-        _lb.str(b" resp=");
-        _lb.hex(resp.label);
         _lb.putc(b'\n');
     });
 }
@@ -1505,7 +2094,7 @@ fn notify_vfs_completion(
 /// on a netsrv call) and after timer processing.
 fn drain_completion_queue() {
     while let Some(c) = net::socket::raw_ipv4::pop_completion() {
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[netsrv] drain raw conn=");
             _lb.dec(c.conn_id as u64);
             _lb.str(b" op=");
@@ -1536,7 +2125,7 @@ fn drain_completion_queue() {
             c.extra_conn_id,
             c.extra_ip,
             c.extra_port,
-            trona::consts::INET_RECV_TIMESTAMP_NONE,
+            INET_RECV_TIMESTAMP_NONE,
         );
     }
     while let Some(c) = net::socket::udp::pop_completion() {
@@ -1554,104 +2143,225 @@ fn drain_completion_queue() {
     }
 }
 
+fn shape_immediate_backend_completion(request: &TronaMsg, reply: &mut TronaMsg) {
+    let original = reply.label;
+    reply.label = backend_reply_label(original);
+    if reply.label != VFS_BACKEND_REPLY_OK {
+        reply.length = 0;
+        return;
+    }
+    match request.label {
+        NET_CONNECT => {
+            reply.regs[0] = request.regs[0];
+            reply.regs[1] = 0;
+            reply.length = reply.length.max(2);
+        }
+        NET_BIND | NET_LISTEN | NET_SHUTDOWN => {
+            reply.length = 0;
+        }
+        NET_SEND | NET_SENDTO => {
+            reply.length = reply.length.max(1);
+        }
+        _ => {}
+    }
+}
+
+fn send_immediate_backend_completion(
+    ctx: *mut IpcContext,
+    header: CorrelationHeader,
+    request: &TronaMsg,
+    reply: &mut TronaMsg,
+) {
+    shape_immediate_backend_completion(request, reply);
+    stamp_completion_correlation(reply, header);
+    let ep = cap_vfs_callback_ep();
+    if ep == 0 {
+        return;
+    }
+    let _ = unsafe { ipc::mp_write_ctx(ctx, ep, &raw const *reply) };
+}
+
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
 
-/// Main event loop: wait for notification wakeups or IPC requests.
-///
-/// Uses a recv / reply_recv pattern:
-/// - On notification wakeup (badge != 0): process RX frames from SHM,
-///   run TCP timers, drain completion queue (callbacks to VFS), then recv.
-/// - On IPC request (badge == 0): dispatch the request, fill reply, then
-///   reply_recv (atomically reply and wait for next event).
+/// Cookie for the service pipe's `STATE_READABLE` Watch (kind 0).
+const NETSRV_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+/// Cookie stamped on the progress `Timer`'s `EVENT_TYPE_TIMER` records (kind 2).
+const NETSRV_TIMER_COOKIE: u64 = trona_server::event_loop::encode_cookie(2, 0, 1);
+
+/// Reactor dispatcher. The service pipe (`STATE_READABLE`) carries client RPCs
+/// (VFS socket ops, dnssrv DNS) and the netdrv `NETSRV_RX_KICK`; a kernel
+/// `Timer` bound to the same `EventQueue` drives DNS/DHCP/TCP deadlines and the
+/// idle SHM-RX sweep. The timer is re-armed after every event at the nearest
+/// `next_wake_deadline()`.
+struct NetsrvDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    timer_cap: Cap,
+    recv_scratch: Cap,
+}
+
+impl NetsrvDispatcher {
+    /// Re-arm the one-shot progress timer at the nearest pending deadline.
+    fn rearm_timer(&self) {
+        let _ = trona_kernel::invoke::timer_set(
+            trona_kernel::core_types::CapRef::flat(self.timer_cap),
+            next_wake_deadline(),
+            0,
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            NETSRV_TIMER_COOKIE,
+        );
+    }
+}
+
+impl trona_server::event_loop::EqDispatcher for NetsrvDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
+    }
+
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        let ctx = ipc_ctx();
+        // The netdrv RX kick wants only a progress sweep, no reply.
+        if msg.label == NETSRV_RX_KICK {
+            service_network_progress(ctx);
+            self.rearm_timer();
+            return 0;
+        }
+        // Real client RPC: dispatch + route the reply (deferred / async-pending
+        // via the VFS callback EP / direct), mirroring the former event loop.
+        let request_correlation = decode_request_correlation(msg);
+        let mut reply = TronaMsg::zeroed();
+        let deferred = dispatch_ipc(msg, &mut reply);
+        if deferred {
+            // Parked: the completion is delivered later via the callback EP.
+        } else if let Some(header) = request_correlation {
+            if reply.label == TRONA_PENDING {
+                drain_completion_queue();
+            } else {
+                send_immediate_backend_completion(ctx, header, msg, &mut reply);
+            }
+        } else {
+            // SAFETY: `ctx` is this thread's IPC context.
+            let _ = unsafe { ipc::mp_write_reply_ctx(ctx, self.recv_ep, &raw const reply) };
+        }
+        self.rearm_timer();
+        0
+    }
+
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        // SAFETY: re-arm the cap-receive scratch before each MP_READ.
+        unsafe {
+            trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+                ipc_ctx(),
+                CAP_SELF_CSPACE,
+                self.recv_scratch,
+                0,
+            );
+        }
+        true
+    }
+
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+            NETSRV_SERVICE_COOKIE,
+        )
+    }
+
+    fn continue_readable_drain(&mut self, _cookie: u64) -> bool {
+        // One RPC per EQ_WAIT so the timer is re-armed (and a pending timer fire
+        // observed) between messages, matching the former one-at-a-time loop.
+        false
+    }
+
+    fn handle_timer(&mut self, _cookie: u64) {
+        service_network_progress(ipc_ctx());
+        self.rearm_timer();
+    }
+
+    fn handle_overflow(&mut self, _dropped: u64) {}
+}
+
+/// Reactor entry: binds the service pipe (client RPC + netdrv RX kick) and a
+/// progress `Timer` onto one `EventQueue`, then blocks in `EQ_WAIT`. The timer
+/// is re-armed after every event at the nearest DNS/DHCP/TCP deadline.
 fn event_loop() -> ! {
-    trona::uinfo!(|_lb| {
-        _lb.str(b"[netsrv] Entering event loop\n");
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] Entering reactor\n");
     });
 
     let ctx = ipc_ctx();
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+    let recv_scratch = cap_recv_scratch_slot();
 
-    // Set receive slot for the plain VFS callback EP (slot 83).
-    // We rebadge it locally into slot 84 after registration.
-    // SAFETY: IPC context is valid.
-    unsafe {
-        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_VFS_CALLBACK_EP, 0);
-    }
+    // Self-provision the reactor's EventQueue + Watch + progress Timer.
+    let eq = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_EVENT_QUEUE as u64,
+        4,
+    );
+    let watch = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_WATCH as u64,
+        0,
+    );
+    let timer = trona_runtime::core::slot_alloc::rsrc_alloc_object(
+        trona_kernel::uapi::KERNITE_OBJ_TIMER as u64,
+        0,
+    );
+    let (eq, watch, timer) = match (eq, watch, timer) {
+        (Some(eq), Some(watch), Some(timer)) => (eq, watch, timer),
+        _ => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netsrv] reactor EventQueue/Watch/Timer alloc failed\n");
+            });
+            idle();
+        }
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+    let timer_cap = timer.borrow().addr();
 
-    // Initial wait must also honor DNS/DHCP timers so asynchronous bootstrap
-    // work can progress before the first external IPC arrives.
-    unsafe {
-        do_recv(ctx, &raw mut msg, &raw mut badge);
-    }
+    // Arm the service pipe's READABLE edge onto the reactor EQ.
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        trona_kernel::uapi::KERNITE_STATE_READABLE as u64,
+        NETSRV_SERVICE_COOKIE,
+    );
 
+    // The reactor objects live for the process lifetime.
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+    core::mem::forget(timer);
+
+    let dispatcher = NetsrvDispatcher {
+        recv_ep,
+        watch_cap,
+        eq_cap,
+        timer_cap,
+        recv_scratch,
+    };
+    // Arm the progress timer for the first deadline (DNS/DHCP bootstrap may
+    // already have pending work).
+    dispatcher.rearm_timer();
+
+    let mut reactor = trona_server::event_loop::EventLoop::new(eq_cap, dispatcher);
     loop {
-        if badge != 0 {
-            // Woken by bound notification: RX/TX progress from netdrv.
-            // Retry queued IP packets on every notification so packets queued
-            // due to transient TX-ring pressure are not stranded waiting for
-            // an unrelated ARP reply.
-            process_rx_from_shm();
-            net::flush_pending_packets();
-            net::dhcp::process();
-            net::socket::tcp::process_timers();
-            net::dns::process_pending();
-            drain_completion_queue();
-            drain_dns_completions(ctx);
-            check_self_test();
-
-            // Wait for next event (with timeout if DNS queries are pending)
-            msg = TronaMsg::zeroed();
-            badge = 0;
-            unsafe {
-                do_recv(ctx, &raw mut msg, &raw mut badge);
-            }
-        } else {
-            // IPC request on server endpoint
-            let mut reply = TronaMsg::zeroed();
-            let deferred = dispatch_ipc(&msg, &mut reply);
-            badge = 0;
-
-            if deferred {
-                unsafe {
-                    msg = TronaMsg::zeroed();
-                    do_recv(ctx, &raw mut msg, &raw mut badge);
-                }
-            } else if net::dns::has_pending() || net::dhcp::has_timer() {
-                // Non-deferred reply, but timer-driven work is pending: split
-                // reply + recv so we can use a timed recv for DNS/DHCP deadlines.
-                // SAFETY: IPC context is valid; reply cap saved then sent.
-                unsafe {
-                    let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
-                    if err == 0 {
-                        ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply);
-                        msg = TronaMsg::zeroed();
-                        do_recv(ctx, &raw mut msg, &raw mut badge);
-                    } else {
-                        ipc::reply_recv_ctx(
-                            ctx,
-                            trona::caps::service_ep(),
-                            &raw const reply,
-                            &raw mut msg,
-                            &raw mut badge,
-                        );
-                    }
-                }
-            } else {
-                // Normal path: reply + recv atomically
-                // SAFETY: IPC context is valid.
-                unsafe {
-                    ipc::reply_recv_ctx(
-                        ctx,
-                        trona::caps::service_ep(),
-                        &raw const reply,
-                        &raw mut msg,
-                        &raw mut badge,
-                    );
-                }
-            }
+        // SAFETY: `ctx` is this thread's IPC context; block on the EQ and
+        // dispatch one ready event (client RPC / RX kick via `dispatch_state`,
+        // progress timer via `handle_timer`).
+        unsafe {
+            let _ = reactor.run_iteration(ctx);
         }
     }
 }
@@ -1662,29 +2372,31 @@ fn event_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Network Stack Server starting\n");
     });
 
+    // 0. Reserve the server-private CNode slots (VFS callback EP,
+    //    VFS callback badged EP, receive scratch) out of the RTLD frame pool
+    //    via `trona_runtime::core::slot_alloc`. Must run before any helper
+    //    that reads `cap_*_slot()`. The DNS subsystem
+    //    reserves its own `MAX_PENDING_DNS` consecutive reply cap slots
+    //    in the same step so the whole server-private region is
+    //    settled before any hardware / IPC setup.
+    init_private_slots();
+    net::dns::init_dns_reply_slots();
+
     // 1. Allocate and map SHM
     if !setup_shm() {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM setup failed, halting\n");
         });
         idle();
     }
 
-    // 2. Setup notification (allocate, bind to TCB, mint badged copy)
-    if !setup_notification() {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netsrv] Notification setup failed, halting\n");
-        });
-        idle();
-    }
-
-    // 3. Register with netdrv (DRIVER_REGISTER: exchange SHM ID, caps, get MAC)
+    // 2. Register with netdrv (NETDRV_REGISTER: exchange SHM MO cap/index, get MAC)
     if !driver_register() {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[netsrv] Driver register failed, halting\n");
         });
         idle();
@@ -1695,7 +2407,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // 4b. Fire-and-forget ARP request for the configured gateway.
     if net::proto::ipv4::our_ip() != 0 && net::proto::ipv4::gateway_ip() != 0 {
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[netsrv] Self-test: ARP request for configured gateway\n");
         });
         net::proto::arp::request(
@@ -1709,14 +2421,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
     }
 
-    // 5. Register with name service
+    // 5. Register with name service; unit_mgr observes the publish event as readiness.
     register_namesrv();
 
     // 5b. Initialize DNS protocol engine
     net::dns::init_dns_socket();
-
-    // 6. Signal readiness to init
-    signal_ready();
 
     // 7. Enter event loop (never returns)
     event_loop()
@@ -1724,6 +2433,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona_kernel::syscall::yield_now();
     }
 }

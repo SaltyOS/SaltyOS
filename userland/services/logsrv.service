@@ -1,0 +1,23 @@
+[Service]
+Name=logsrv
+Binary=/bin/logsrv
+Type=broker
+Restart=always
+Privileged=true
+
+[Dependencies]
+After=namesrv ldsrv
+Before=console vfs pcidrv blkdrv saltyfs dispdrv posix_ttysrv netdrv netsrv dnssrv win32_csrss rootfs.target
+Requires=namesrv.socket
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

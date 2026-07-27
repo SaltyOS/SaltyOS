@@ -1,0 +1,5 @@
+[Unit]
+Name=kbd_irq.cap
+
+[Capability]
+SourceSlot=23

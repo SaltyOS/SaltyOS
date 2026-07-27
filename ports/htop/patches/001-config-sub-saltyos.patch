@@ -1,0 +1,12 @@
+Add saltyos to the basic_os list in modern GNU config.sub.
+--- a/build-aux/config.sub
++++ b/build-aux/config.sub
+@@ -2104,7 +2104,8 @@
+ 	| riscos* \
+ 	| rtems* \
+ 	| rtmk* \
+ 	| rtu* \
++	| saltyos* \
+ 	| scout* \
+ 	| secbsd* \
+ 	| sei* \

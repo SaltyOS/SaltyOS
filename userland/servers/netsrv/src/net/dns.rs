@@ -5,15 +5,12 @@
 //! internal UDP socket to the runtime-configured recursive resolver, and parses
 //! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona_posix::consts::*;
-
 const DNS_PORT: u16 = 53;
 const MAX_DNS_RESULTS: usize = 4;
 const DNS_TIMEOUT_NS: u64 = 3_000_000_000; // 3 seconds per attempt
 const ARP_RETRY_NS: u64 = 200_000_000; // 200ms — short retry when waiting for ARP
 const DNS_MAX_RETRIES: usize = 2; // total 3 attempts
+const DNS_HARD_DEADLINE_NS: u64 = 10_000_000_000; // overall per-query budget: every saved reply target gets a terminal result within this even if a packet never reaches the wire
 const DNS_MAX_QUERY_LEN: usize = 288; // 12 header + 256 max qname + 4 qtype/qclass + padding
 const DNS_MAX_RESPONSE_LEN: usize = 512; // RFC 1035 UDP limit
 const DNS_HEADER_LEN: usize = 12;
@@ -64,21 +61,25 @@ pub(crate) fn init_dns_socket() {
 
 /// Get monotonic time in nanoseconds.
 pub(crate) fn clock_monotonic_ns() -> u64 {
-    let r = trona::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
-    if r.error != 0 { 0 } else { r.value }
+    trona_kernel::syscall::clock_read_monotonic(trona_runtime::client::caps::clock_cap().addr())
 }
 
-/// Generate a random transaction ID using the kernel RDRAND-backed GetRandom
-/// syscall, matching the pattern used by `tcp::generate_isn()`.
+/// Generate a random transaction ID using the kernel RNG byte-read invocation,
+/// matching the pattern used by `tcp::generate_isn()`.
 fn generate_txn_id() -> u16 {
-    let mut buf = [0u8; 2];
-    // SAFETY: Passing valid stack buffer to GetRandom syscall.
-    let r = unsafe {
-        trona::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
+    let mut bytes = [0u8; 2];
+    let r = trona_kernel::syscall::rng_read_bytes(
+        trona_runtime::client::caps::kernel_rng_cap().addr(),
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    let id = if r.error == 0 && r.value == bytes.len() as u64 {
+        u16::from_le_bytes(bytes)
+    } else {
+        0
     };
-    let id = u16::from_ne_bytes(buf);
-    if r.error != 0 || id == 0 {
-        // Fallback: clock-based ID if RDRAND is unavailable or returned zero
+    if id == 0 {
+        // Fallback: clock-based ID if KernelRng is unavailable or returned zero.
         let t = clock_monotonic_ns();
         ((t >> 16) ^ t) as u16 | 1
     } else {
@@ -572,8 +573,11 @@ fn rcode_to_error(rcode: u8) -> DnsError {
 // ---------------------------------------------------------------------------
 
 const MAX_PENDING_DNS: usize = 4;
-const CAP_SELF_CSPACE: u64 = 2;
-pub(crate) const CAP_DNS_REPLY_BASE: u64 = 90; // Slots 90-93
+
+/// Kept as a startup hook for the surrounding server; regular DNS
+/// replies use the service MessagePipe endpoint saved with each
+/// pending DNS request.
+pub(crate) fn init_dns_reply_slots() {}
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum DnsQueryType {
@@ -590,7 +594,13 @@ struct PendingDns {
     txn_id: u16,
     attempt: usize,
     deadline_ns: u64,
-    reply_cap_slot: u64,
+    /// Absolute wall-clock cap for the whole query. Once `now` passes this,
+    /// `process_pending` fails the slot terminally regardless of per-attempt
+    /// retry state — so a query that can never put a packet on the wire (e.g.
+    /// ARP to the resolver never resolves) still completes instead of looping
+    /// on the short ARP retry forever.
+    hard_deadline_ns: u64,
+    reply_target: trona_server::MpReplyTarget,
 }
 
 impl PendingDns {
@@ -604,14 +614,15 @@ impl PendingDns {
             txn_id: 0,
             attempt: 0,
             deadline_ns: 0,
-            reply_cap_slot: 0,
+            hard_deadline_ns: 0,
+            reply_target: trona_server::MpReplyTarget::none(),
         }
     }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct DnsCompletion {
-    pub(crate) reply_cap_slot: u64,
+    pub(crate) reply_target: trona_server::MpReplyTarget,
     pub(crate) query_type: DnsQueryType,
     pub(crate) success: bool,
     pub(crate) dns_result: DnsResult,
@@ -623,7 +634,7 @@ pub(crate) struct DnsCompletion {
 impl DnsCompletion {
     const fn zeroed() -> Self {
         DnsCompletion {
-            reply_cap_slot: 0,
+            reply_target: trona_server::MpReplyTarget::none(),
             query_type: DnsQueryType::A,
             success: false,
             dns_result: DnsResult {
@@ -634,6 +645,17 @@ impl DnsCompletion {
             error: DnsError::Other,
             ptr_hostname: [0u8; 256],
             ptr_hostname_len: 0,
+        }
+    }
+}
+
+fn current_reply_target(reply_mp: u64) -> trona_server::MpReplyTarget {
+    unsafe {
+        let ctx = trona_runtime::current_ipc_ctx();
+        if ctx.is_null() || (*ctx).ipc_buffer.is_null() {
+            trona_server::MpReplyTarget::none()
+        } else {
+            trona_server::MpReplyTarget::from_ipc_buffer((*ctx).ipc_buffer as *const _, reply_mp)
         }
     }
 }
@@ -678,42 +700,65 @@ fn push_completion(c: DnsCompletion) {
     }
 }
 
-/// Send the DNS query for a pending slot. Returns true if the UDP packet
-/// was actually sent, false if blocked on ARP resolution.
-fn send_query_for_slot(slot: &PendingDns) -> bool {
+/// Outcome of attempting to put a DNS query on the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    /// UDP datagram handed to the stack.
+    Sent,
+    /// Next-hop ARP entry missing — a request was issued; retry shortly.
+    ArpBlocked,
+    /// No resolver address configured (DHCP never provided one).
+    NoUpstream,
+}
+
+/// Attempt to put the slot's DNS query on the wire, reporting whether it was
+/// sent, is waiting on ARP, or has no resolver to send to.
+fn send_query_for_slot(slot: &PendingDns) -> SendOutcome {
     // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
-        return false;
+        return SendOutcome::NoUpstream;
     }
 
     let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
     let query_len = match slot.query_type {
-        DnsQueryType::A => build_query(&slot.hostname[..slot.hostname_len], slot.txn_id, &mut query_buf),
+        DnsQueryType::A => build_query(
+            &slot.hostname[..slot.hostname_len],
+            slot.txn_id,
+            &mut query_buf,
+        ),
         DnsQueryType::Ptr => build_ptr_query(slot.ptr_ip, slot.txn_id, &mut query_buf),
     };
-    if query_len > 0 {
-        let dns_server = super::config::dns_server();
-        if dns_server == 0 {
-            return false;
-        }
-        let next_hop = super::proto::ipv4::route(dns_server);
-        if super::proto::arp::lookup(next_hop).is_none() {
-            // ARP entry missing — send request; caller will use a short
-            // retry deadline instead of the full DNS_TIMEOUT_NS.
-            let our_mac = crate::mac_addr();
-            super::proto::arp::request(&our_mac, super::proto::ipv4::our_ip(), next_hop);
-            return false;
-        }
-        super::socket::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], dns_server, DNS_PORT);
+    if query_len == 0 {
+        // Caller already validated the query; nothing to encode here. Treat as
+        // "on the wire" so the normal per-attempt timeout governs the slot.
+        return SendOutcome::Sent;
     }
-    true
+    let dns_server = super::config::dns_server();
+    if dns_server == 0 {
+        return SendOutcome::NoUpstream;
+    }
+    let next_hop = super::proto::ipv4::route(dns_server);
+    if super::proto::arp::lookup(next_hop).is_none() {
+        // ARP entry missing — issue the request; the caller uses a short retry
+        // deadline instead of the full DNS_TIMEOUT_NS.
+        let our_mac = crate::mac_addr();
+        super::proto::arp::request(&our_mac, super::proto::ipv4::our_ip(), next_hop);
+        return SendOutcome::ArpBlocked;
+    }
+    super::socket::udp::udp_sendto(
+        socket_id as u32,
+        &query_buf[..query_len],
+        dns_server,
+        DNS_PORT,
+    );
+    SendOutcome::Sent
 }
 
-/// Begin an async A-record resolution. Saves the caller's reply cap and
-/// sends the first DNS query. Returns the reply cap slot on success, or
+/// Begin an async A-record resolution. Saves the caller's reply target and
+/// sends the first DNS query. Returns the reply target on success, or
 /// None if the hostname is invalid or all pending slots are busy.
-pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
+pub(crate) fn start_resolve(hostname: &[u8]) -> Option<trona_server::MpReplyTarget> {
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
         return None;
@@ -728,8 +773,8 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
     }
 
     let slot_idx = find_free_slot()?;
-    let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
-    trona::udebug!(|_lb| {
+    let reply_target = current_reply_target(trona_runtime::client::caps::service_recv_ep().addr());
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[netsrv] DNS start A slot=");
         _lb.dec(slot_idx as u64);
         _lb.str(b" host_len=");
@@ -738,12 +783,6 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
         _lb.hex(txn_id as u64);
         _lb.putc(b'\n');
     });
-
-    // Save the caller's reply cap into a CNode slot
-    let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
-    if err != 0 {
-        return None;
-    }
 
     let now = clock_monotonic_ns();
 
@@ -761,20 +800,27 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
         slot.ptr_ip = 0;
         slot.txn_id = txn_id;
         slot.attempt = 0;
-        slot.reply_cap_slot = reply_cap_slot;
+        slot.reply_target = reply_target;
 
-        // Send the first query; use short deadline if blocked on ARP
-        let sent = send_query_for_slot(slot);
-        slot.deadline_ns = now + if sent { DNS_TIMEOUT_NS } else { ARP_RETRY_NS };
+        // Send the first query; use a short deadline if blocked on ARP. The
+        // hard deadline caps the whole query so it always terminates.
+        let outcome = send_query_for_slot(slot);
+        slot.deadline_ns = now
+            + if outcome == SendOutcome::Sent {
+                DNS_TIMEOUT_NS
+            } else {
+                ARP_RETRY_NS
+            };
+        slot.hard_deadline_ns = now + DNS_HARD_DEADLINE_NS;
     }
 
-    Some(reply_cap_slot)
+    Some(reply_target)
 }
 
-/// Begin an async PTR resolution. Saves the caller's reply cap and
-/// sends the first DNS PTR query. Returns the reply cap slot on success,
+/// Begin an async PTR resolution. Saves the caller's reply target and
+/// sends the first DNS PTR query. Returns the reply target on success,
 /// or None if all pending slots are busy.
-pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
+pub(crate) fn start_resolve_ptr(ip: u32) -> Option<trona_server::MpReplyTarget> {
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
         return None;
@@ -788,12 +834,7 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
     }
 
     let slot_idx = find_free_slot()?;
-    let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
-
-    let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
-    if err != 0 {
-        return None;
-    }
+    let reply_target = current_reply_target(trona_runtime::client::caps::service_recv_ep().addr());
 
     let now = clock_monotonic_ns();
 
@@ -807,13 +848,19 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
         slot.ptr_ip = ip;
         slot.txn_id = txn_id;
         slot.attempt = 0;
-        slot.reply_cap_slot = reply_cap_slot;
+        slot.reply_target = reply_target;
 
-        let sent = send_query_for_slot(slot);
-        slot.deadline_ns = now + if sent { DNS_TIMEOUT_NS } else { ARP_RETRY_NS };
+        let outcome = send_query_for_slot(slot);
+        slot.deadline_ns = now
+            + if outcome == SendOutcome::Sent {
+                DNS_TIMEOUT_NS
+            } else {
+                ARP_RETRY_NS
+            };
+        slot.hard_deadline_ns = now + DNS_HARD_DEADLINE_NS;
     }
 
-    Some(reply_cap_slot)
+    Some(reply_target)
 }
 
 /// Called when the ARP cache is updated. Immediately sends any pending
@@ -826,8 +873,7 @@ pub(crate) fn flush_arp_waiters() {
         let mut i = 0;
         while i < MAX_PENDING_DNS {
             if (*pending)[i].active {
-                let sent = send_query_for_slot(&(*pending)[i]);
-                if sent {
+                if send_query_for_slot(&(*pending)[i]) == SendOutcome::Sent {
                     // Query went out — set a real DNS timeout from now
                     (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
                 }
@@ -858,7 +904,7 @@ pub(crate) fn process_pending() {
         if src_ip != super::config::dns_server() || src_port != DNS_PORT {
             continue;
         }
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[netsrv] DNS recv len=");
             _lb.dec(len as u64);
             _lb.str(b" src=0x");
@@ -881,62 +927,72 @@ pub(crate) fn process_pending() {
 
                 let txn_id = (*pending)[i].txn_id;
                 let matched = match (*pending)[i].query_type {
-                    DnsQueryType::A => {
-                        match parse_response(&resp_buf[..len as usize], txn_id) {
-                            Some(Ok(result)) => {
-                                trona::udebug!(|_lb| {
-                                    _lb.str(b"[netsrv] DNS match A slot=");
-                                    _lb.dec(i as u64);
-                                    _lb.str(b" txn=");
-                                    _lb.hex(txn_id as u64);
-                                    _lb.str(b" count=");
-                                    _lb.dec(result.ip_count as u64);
-                                    _lb.putc(b'\n');
-                                });
-                                push_completion(DnsCompletion {
-                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
-                                    query_type: DnsQueryType::A,
-                                    success: true,
-                                    dns_result: result,
-                                    error: DnsError::Other,
-                                    ptr_hostname: [0; 256],
-                                    ptr_hostname_len: 0,
-                                });
-                                true
-                            }
-                            Some(Err(rcode)) => {
-                                trona::udebug!(|_lb| {
-                                    _lb.str(b"[netsrv] DNS error A slot=");
-                                    _lb.dec(i as u64);
-                                    _lb.str(b" txn=");
-                                    _lb.hex(txn_id as u64);
-                                    _lb.str(b" rcode=");
-                                    _lb.dec(rcode as u64);
-                                    _lb.putc(b'\n');
-                                });
-                                push_completion(DnsCompletion {
-                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
-                                    query_type: DnsQueryType::A,
-                                    success: false,
-                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
-                                    error: rcode_to_error(rcode),
-                                    ptr_hostname: [0; 256],
-                                    ptr_hostname_len: 0,
-                                });
-                                true
-                            }
-                            None => false,
+                    DnsQueryType::A => match parse_response(&resp_buf[..len as usize], txn_id) {
+                        Some(Ok(result)) => {
+                            trona_runtime::udebug!(|_lb| {
+                                _lb.str(b"[netsrv] DNS match A slot=");
+                                _lb.dec(i as u64);
+                                _lb.str(b" txn=");
+                                _lb.hex(txn_id as u64);
+                                _lb.str(b" count=");
+                                _lb.dec(result.ip_count as u64);
+                                _lb.putc(b'\n');
+                            });
+                            push_completion(DnsCompletion {
+                                reply_target: (*pending)[i].reply_target,
+                                query_type: DnsQueryType::A,
+                                success: true,
+                                dns_result: result,
+                                error: DnsError::Other,
+                                ptr_hostname: [0; 256],
+                                ptr_hostname_len: 0,
+                            });
+                            true
                         }
-                    }
+                        Some(Err(rcode)) => {
+                            trona_runtime::udebug!(|_lb| {
+                                _lb.str(b"[netsrv] DNS error A slot=");
+                                _lb.dec(i as u64);
+                                _lb.str(b" txn=");
+                                _lb.hex(txn_id as u64);
+                                _lb.str(b" rcode=");
+                                _lb.dec(rcode as u64);
+                                _lb.putc(b'\n');
+                            });
+                            push_completion(DnsCompletion {
+                                reply_target: (*pending)[i].reply_target,
+                                query_type: DnsQueryType::A,
+                                success: false,
+                                dns_result: DnsResult {
+                                    ip_count: 0,
+                                    ips: [0; MAX_DNS_RESULTS],
+                                    ttl: 0,
+                                },
+                                error: rcode_to_error(rcode),
+                                ptr_hostname: [0; 256],
+                                ptr_hostname_len: 0,
+                            });
+                            true
+                        }
+                        None => false,
+                    },
                     DnsQueryType::Ptr => {
                         let mut ptr_hostname = [0u8; 256];
-                        match parse_ptr_response(&resp_buf[..len as usize], txn_id, &mut ptr_hostname) {
+                        match parse_ptr_response(
+                            &resp_buf[..len as usize],
+                            txn_id,
+                            &mut ptr_hostname,
+                        ) {
                             Some(Ok(name_len)) => {
                                 push_completion(DnsCompletion {
-                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    reply_target: (*pending)[i].reply_target,
                                     query_type: DnsQueryType::Ptr,
                                     success: true,
-                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                                    dns_result: DnsResult {
+                                        ip_count: 0,
+                                        ips: [0; MAX_DNS_RESULTS],
+                                        ttl: 0,
+                                    },
                                     error: DnsError::Other,
                                     ptr_hostname,
                                     ptr_hostname_len: name_len,
@@ -945,10 +1001,14 @@ pub(crate) fn process_pending() {
                             }
                             Some(Err(rcode)) => {
                                 push_completion(DnsCompletion {
-                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    reply_target: (*pending)[i].reply_target,
                                     query_type: DnsQueryType::Ptr,
                                     success: false,
-                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                                    dns_result: DnsResult {
+                                        ip_count: 0,
+                                        ips: [0; MAX_DNS_RESULTS],
+                                        ttl: 0,
+                                    },
                                     error: rcode_to_error(rcode),
                                     ptr_hostname: [0; 256],
                                     ptr_hostname_len: 0,
@@ -976,39 +1036,60 @@ pub(crate) fn process_pending() {
         let pending = &raw mut PENDING;
         let mut i = 0;
         while i < MAX_PENDING_DNS {
-                if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
-                    trona::udebug!(|_lb| {
-                        _lb.str(b"[netsrv] DNS deadline slot=");
-                        _lb.dec(i as u64);
-                        _lb.str(b" attempt=");
-                        _lb.dec((*pending)[i].attempt as u64);
-                        _lb.str(b" type=");
-                        _lb.dec((*pending)[i].query_type as u64);
-                        _lb.putc(b'\n');
-                    });
-                    if (*pending)[i].attempt < DNS_MAX_RETRIES {
-                        // Retransmit the same logical query with the same
-                        // transaction ID. Rotating txn_id per retry makes a
-                        // slightly-late response from an earlier attempt look
-                        // unrelated, which turns normal UDP delay into a
-                        // spurious hang/timeout that disappears when logging
-                        // perturbs scheduling.
-                        let sent = send_query_for_slot(&(*pending)[i]);
-                        if sent {
-                            // Query actually went out — count as a real attempt
-                            (*pending)[i].attempt += 1;
-                            (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
-                        } else {
-                            // Blocked on ARP — short retry, don't burn an attempt
-                            (*pending)[i].deadline_ns = now + ARP_RETRY_NS;
-                        }
-                    } else {
-                        // All retries exhausted: timeout
+            // Act when the per-attempt deadline OR the overall hard deadline
+            // is due. The hard-deadline arm matters because `flush_arp_waiters`
+            // can push `deadline_ns` forward on unrelated ARP-learn events; the
+            // independent `hard_deadline_ns` check guarantees the slot still
+            // terminates (`retry` below is false once it passes → failure).
+            if (*pending)[i].active
+                && (now >= (*pending)[i].deadline_ns || now >= (*pending)[i].hard_deadline_ns)
+            {
+                trona_runtime::udebug!(|_lb| {
+                    _lb.str(b"[netsrv] DNS deadline slot=");
+                    _lb.dec(i as u64);
+                    _lb.str(b" attempt=");
+                    _lb.dec((*pending)[i].attempt as u64);
+                    _lb.str(b" type=");
+                    _lb.dec((*pending)[i].query_type as u64);
+                    _lb.putc(b'\n');
+                });
+                // Retry only while the overall budget holds AND attempts
+                // remain. A blocked-on-ARP attempt does not burn an attempt
+                // count (transient ARP delay must not eat the retry budget),
+                // but the hard deadline still caps it — so a query that can
+                // never reach the wire terminates instead of looping on the
+                // short ARP retry forever. Retransmits reuse the same txn_id
+                // so a slightly-late earlier response still matches.
+                let retry =
+                    now < (*pending)[i].hard_deadline_ns && (*pending)[i].attempt < DNS_MAX_RETRIES;
+                let outcome = if retry {
+                    Some(send_query_for_slot(&(*pending)[i]))
+                } else {
+                    None
+                };
+                match outcome {
+                    Some(SendOutcome::Sent) => {
+                        // Query actually went out — count as a real attempt.
+                        (*pending)[i].attempt += 1;
+                        (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
+                    }
+                    Some(SendOutcome::ArpBlocked) => {
+                        // Waiting on ARP — short retry, don't burn an attempt.
+                        (*pending)[i].deadline_ns = now + ARP_RETRY_NS;
+                    }
+                    // No resolver (mid-flight), overall budget exhausted, or
+                    // retries used up: hand the saved reply target a terminal
+                    // failure so the caller never blocks indefinitely.
+                    Some(SendOutcome::NoUpstream) | None => {
                         push_completion(DnsCompletion {
-                            reply_cap_slot: (*pending)[i].reply_cap_slot,
+                            reply_target: (*pending)[i].reply_target,
                             query_type: (*pending)[i].query_type,
                             success: false,
-                            dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                            dns_result: DnsResult {
+                                ip_count: 0,
+                                ips: [0; MAX_DNS_RESULTS],
+                                ttl: 0,
+                            },
                             error: DnsError::Timeout,
                             ptr_hostname: [0; 256],
                             ptr_hostname_len: 0,
@@ -1016,8 +1097,9 @@ pub(crate) fn process_pending() {
                         (*pending)[i].active = false;
                     }
                 }
-                i += 1;
             }
+            i += 1;
+        }
     }
 }
 
@@ -1046,8 +1128,15 @@ pub(crate) fn nearest_deadline_ns() -> u64 {
         let pending = &raw const PENDING;
         let mut i = 0;
         while i < MAX_PENDING_DNS {
-            if (*pending)[i].active && (*pending)[i].deadline_ns < nearest {
-                nearest = (*pending)[i].deadline_ns;
+            if (*pending)[i].active {
+                // Wake for whichever fires first — the per-attempt retry or
+                // the overall hard cap — so the hard deadline is honored even
+                // when `deadline_ns` was pushed forward.
+                let slot_due =
+                    core::cmp::min((*pending)[i].deadline_ns, (*pending)[i].hard_deadline_ns);
+                if slot_due < nearest {
+                    nearest = slot_due;
+                }
             }
             i += 1;
         }

@@ -22,8 +22,45 @@ SECTIONS
     .rodata ALIGN(4K) :
     {
         _rodata_start = .;
+        . = ALIGN(8);
+        __kernite_build_info_section_start = .;
+        KEEP(*(.rodata.kernite_build_info))
+        __kernite_build_info_section_end = .;
         *(.rodata .rodata.*)
+        . = ALIGN(8);
+        __kallsyms_section_start = .;
+        __kallsyms_start = .;
+        KEEP(*(.kallsyms.header))
+        . = ALIGN(8);
+        __kallsyms_entries = .;
+        KEEP(*(.kallsyms.entries))
+        . = ALIGN(8);
+        __kallsyms_strings = .;
+        KEEP(*(.kallsyms.strings))
+        KEEP(*(.kallsyms))
+        . = ALIGN(8);
+        __kallsyms_end = .;
+        __kallsyms_section_end = .;
+        . = ALIGN(8);
+        __kernite_unwind_section_start = .;
+        KEEP(*(.kernite_unwind))
+        __kernite_unwind_section_end = .;
         _rodata_end = .;
+    } :rodata
+
+    /* Compact unwind metadata kept for in-kernel panic tracebacks. */
+    .eh_frame ALIGN(8) :
+    {
+        __eh_frame_start = .;
+        KEEP(*(.eh_frame))
+        __eh_frame_end = .;
+    } :rodata
+
+    .eh_frame_hdr ALIGN(8) :
+    {
+        __eh_frame_hdr_start = .;
+        KEEP(*(.eh_frame_hdr))
+        __eh_frame_hdr_end = .;
     } :rodata
 
     /* Initialized data (read + write) */
@@ -60,6 +97,5 @@ SECTIONS
     {
         *(.comment)
         *(.note.*)
-        *(.eh_frame*)
     }
 }

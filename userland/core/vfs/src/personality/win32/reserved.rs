@@ -3,8 +3,8 @@
 //!
 //! Certain filenames are reserved by Win32 and always refer to devices
 //! regardless of directory context or extension. For example, `CON`,
-//! `CON.txt`, `COM1`, and `NUL.tar.gz` all resolve to the corresponding
-//! device.
+//! `CON.txt`, `CONIN$`, `CONOUT$`, `COM1`, and `NUL.tar.gz` all resolve
+//! to the corresponding device.
 //!
 //! The comparison is:
 //! 1. Strip any extension (everything after the first `.`).
@@ -67,7 +67,17 @@ pub(crate) fn intercept(component: &[u8]) -> Option<ReservedDev> {
         return None;
     }
 
-    // Match 3-character names first (most common).
+    // `CONIN$` and `CONOUT$` are the canonical Win32 standard console
+    // device names. They intentionally route through the same devfs console
+    // node as `CON`; access mode decides input vs. output behavior.
+    if base.len() == 6 && ascii_fold_eq(base, b"CONIN$") {
+        return Some(ReservedDev::Con);
+    }
+    if base.len() == 7 && ascii_fold_eq(base, b"CONOUT$") {
+        return Some(ReservedDev::Con);
+    }
+
+    // Match 3-character names (most common).
     if base.len() == 3 {
         if ascii_fold_eq(base, b"CON") {
             return Some(ReservedDev::Con);

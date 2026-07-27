@@ -11,7 +11,7 @@ subdir = wget-${version}
 sha256 = fa2dc35bab5184ecbc46a9ef83def2aaaa3f4c9f3c97d4bd19dcb07d4da637de
 
 [depends]
-build = openssl, zlib
+build = openssl >= 3.4, zlib >= 1.3
 
 [build]
 type = autotools
@@ -32,10 +32,6 @@ configure =
 
 [env]
 CFLAGS_FOR_BUILD =
-OPENSSL_CFLAGS = -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include
-OPENSSL_LIBS = -L${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1 -L${PORTDIR}/../openssl/${ARCH_STAGE} -lssl -lcrypto
-EXTRA_CFLAGS = -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build
-EXTRA_LDFLAGS = -L${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1 -L${PORTDIR}/../openssl/${ARCH_STAGE} -L${PORTDIR}/../zlib/${ARCH_STAGE}
 EXTRA_LIBS = -lssl -lcrypto -lz
 
 [autoconf_cache]
@@ -47,5 +43,11 @@ ac_cv_func___freading = yes
 ac_cv_have_decl___freading = yes
 gl_cv_onwards_func___fpurge = yes
 
-[install]
-bin/wget = src/wget
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/info
+usr/share/man
+usr/share/locale
+usr/share/doc

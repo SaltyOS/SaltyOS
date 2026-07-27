@@ -13,17 +13,17 @@ This document provides a technical overview of the SaltyOS system architecture.
 │  (posix_ttysrv, posix_getty) │  (win32_csrss, PE loader)                    │
 ├──────────────────────────────┴──────────────────────────────────────────────┤
 │                           System Libraries                                  │
-│      trona (substrate/posix/loader/uapi/win32) + basalt (libc/libc++)       │
+│      trona (kernel/protocol/server/runtime/posix/loader) + basalt (libc/libc++)  │
 ├──────┬────────┬──────┬────────┬────────┬────────┬────────┬──────────────────┤
-│ init │procmgr │ vfs  │namesrv │ mmsrv  │netsrv  │ dnssrv │    drivers       │
-│      │        │      │        │        │        │        │(pcidrv, blkdrv,  │
+│ init │rsrcsrv │ vfs  │namesrv │ mmsrv  │netsrv  │ dnssrv │    drivers       │
+│      │logsrv  │      │        │        │        │        │(pcidrv, blkdrv,  │
 │      │        │      │        │        │        │        │netdrv, dispdrv,  │
 │      │        │      │        │        │        │        │saltyfs)          │
 ├──────┴────────┴──────┴────────┴────────┴────────┴────────┴──────────────────┤
 │                              Userspace                                      │
 ╠═════════════════════════════════════════════════════════════════════════════╣
 │                          System Call Interface                              │
-│                  28 syscalls (IPC, memory, scheduling)                      │
+│         single KERNITE_SYS_INVOKE trap — capability invocations on (obj_type, label)  │
 ╠═════════════════════════════════════════════════════════════════════════════╣
 │                                                                             │
 │                          SaltyOS Microkernel                                │
@@ -63,10 +63,12 @@ graph TB
     end
 
     subgraph "IPC Subsystem"
-        EP[Endpoints]
-        NOTIF[Notifications]
+        MP[MessagePipe]
+        DP[DataPipe]
+        EQ[EventQueue]
+        WATCH[Watch]
+        TMR[Timer]
         FUTEX[Futex]
-        QUEUE[IPC Queue]
     end
 
     subgraph "Memory Management"
@@ -89,8 +91,11 @@ graph TB
     SYSCALL --> MM
 
     CAP --> KOBJ
-    IPC --> EP
-    IPC --> NOTIF
+    IPC --> MP
+    IPC --> DP
+    IPC --> EQ
+    IPC --> WATCH
+    IPC --> TMR
     MM --> VSPACE
     MM --> FRAME
     MM --> MO
@@ -103,17 +108,30 @@ graph TB
 
 | Type | Description | Key Operations |
 |------|-------------|----------------|
-| `Endpoint` | Synchronous IPC channel | send, recv, call |
-| `Notification` | Async signaling primitive | signal, wait |
-| `TCB` | Thread control block | configure, suspend, resume |
-| `CNode` | Capability storage | insert, delete, copy |
-| `VSpace` | Virtual address space | map, unmap, map_mo |
+| `Untyped` | Raw physical memory | retype, reset, get_stats |
+| `TCB` | Thread control block | configure, start, stop, kill, set_space, set_priority, ... |
+| `CNode` | Capability storage | copy, mint, move, mutate, delete, revoke, set_guard |
+| `VSpace` | Virtual address space | map, unmap, map_mo, share_ro_page, futex_wait/wake, ... |
 | `Frame` | Physical memory page | retype, map |
-| `Untyped` | Raw physical memory | retype |
-| `IRQHandler` | Interrupt handler | ack, set_notification |
-| `IoPort` | I/O port range access | in, out |
-| `SchedContext` | Scheduling context | bind, set_params, yield_to |
-| `MemoryObject` | User page container | commit, decommit, clone, resize |
+| `IrqHandler` | Hardware IRQ binding | bind_eq, unbind_eq, ack |
+| `IoPort` | I/O port range | read_8/16/32, write_8/16/32 |
+| `SchedContext` | Scheduling context | configure, bind |
+| `MemoryObject` | User page container | commit, decommit, clone, resize, read, write, ... |
+| `MessagePipe` (side) | Synchronous record + cap-carrier channel | write, read, close, call, reply |
+| `MessagePipeCore` | Shared cross-side state | pair |
+| `DataPipe` (side) | Bulk byte stream | produce, consume, query, close |
+| `DataPipeCore` | Shared cross-side state | pair |
+| `EventQueue` | Bounded record queue | wait, poll, cancel |
+| `Watch` | One-shot state-mask registration | register, disarm |
+| `Timer` | ns-precision deadline | set, cancel, query |
+| `KernelRng` | RDRAND-backed entropy | read |
+| `SystemControl` | System power | shutdown, reboot |
+| `Clock` | Monotonic / realtime read | read |
+| `SystemInfo` | Kernel accounting | get_info, get_meminfo |
+| `KernelDebug` | Serial debug surface | putchar, putstr, putbuf, dump_state, console_control |
+| `Pager` | File-backed fault handler | register, deregister, supply, fail |
+| `DeviceControl` | Device power/reset surface | reset, power_on, power_off |
+| `VmHierarchyState` | Per-COW-tree serialization lock | (kernel-internal; no userland invoke labels) |
 
 ### Address Space Layout (x86_64)
 
@@ -196,7 +214,7 @@ sequenceDiagram
 ├─────────────────────────────────────────────────────────────┤
 │ Partition 2: SaltyFS (Root)                       Rest      │
 │   ├── /boot/kernel.elf                                      │
-│   ├── /boot/initrd.img                                      │
+│   ├── /boot/initrd.cpio                                     │
 │   ├── /boot/saltyos.cfg                                     │
 │   └── ...                                                   │
 └─────────────────────────────────────────────────────────────┘
@@ -204,39 +222,41 @@ sequenceDiagram
 
 ## IPC Architecture
 
-### Endpoint-based IPC
+### MessagePipe RPC (`MP_CALL` / reply-marked `MP_WRITE`)
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Endpoint
+    participant MessagePipe
     participant Server
 
-    Client->>Endpoint: send(msg)
-    Note over Client: Blocked
-    Server->>Endpoint: recv()
-    Endpoint->>Server: msg + badge
-    Server->>Server: Process request
-    Server->>Endpoint: reply(response)
-    Endpoint->>Client: response
+    Client->>MessagePipe: MP_CALL(req)
+    Note over Client: Writes request, then waits on its own inbound side
+    MessagePipe->>Server: MP_READ(req)
+    Server->>Server: process request
+    Server->>MessagePipe: reply-marked MP_WRITE(reply)
+    MessagePipe->>Client: reply record
     Note over Client: Resumed
 ```
 
-### Notification-based Async
+### IRQ + EventQueue + Watch
 
 ```mermaid
 sequenceDiagram
+    participant Hardware
+    participant IrqHandler
+    participant EventQueue
     participant Driver
-    participant Notification
-    participant IRQHandler
-    participant Kernel
 
-    Kernel->>IRQHandler: Hardware IRQ
-    IRQHandler->>Notification: signal(bits)
-    Note over Driver: Was blocked on wait()
-    Notification->>Driver: wake with bits
-    Driver->>Driver: Handle IRQ
-    Driver->>IRQHandler: ack()
+    Driver->>IrqHandler: IRQ_BIND_EQ(eq, cookie)
+    Note over IrqHandler: bound_eq pinned via refcount
+    Hardware->>IrqHandler: IRQ fires<br/>(dispatch_irq from interrupt handler)
+    IrqHandler->>IrqHandler: state_flags |= STATE_SIGNALED<br/>WatcherList::publish
+    IrqHandler->>EventQueue: enqueue(EVENT_TYPE_IRQ record)
+    Driver->>EventQueue: EQ_WAIT
+    EventQueue->>Driver: dequeued record (cookie + irq_num)
+    Driver->>Driver: handle IRQ
+    Driver->>IrqHandler: IRQ_ACK<br/>(clears STATE_SIGNALED)
 ```
 
 ## Capability Architecture
@@ -271,23 +291,23 @@ sequenceDiagram
     │            (Physical memory region)                     │
     └───────────────────────┬─────────────────────────────────┘
                             │ retype
-            ┌───────────────┼───────────────┐
-            ▼               ▼               ▼
-    ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-    │  Frame Cap    │ │   TCB Cap     │ │ Endpoint Cap  │
-    │ (rights: RW)  │ │ (rights: all) │ │ (rights: all) │
-    └───────┬───────┘ └───────────────┘ └───────┬───────┘
-            │ derive                            │ mint (badge)
-            ▼                                   ▼
-    ┌───────────────┐                   ┌───────────────┐
-    │  Frame Cap    │                   │ Endpoint Cap  │
-    │ (rights: R)   │                   │ (badge: 0x42) │
-    └───────────────┘                   └───────────────┘
+            ┌───────────────┼───────────────────┐
+            ▼               ▼                   ▼
+    ┌───────────────┐ ┌───────────────┐ ┌───────────────────┐
+    │  Frame Cap    │ │   TCB Cap     │ │  MessagePipe Cap  │
+    │ (rights: RW)  │ │ (rights: all) │ │   (rights: all)   │
+    └───────┬───────┘ └───────────────┘ └─────────┬─────────┘
+            │ derive                              │ mint (badge)
+            ▼                                     ▼
+    ┌───────────────┐                   ┌───────────────────┐
+    │  Frame Cap    │                   │  MessagePipe Cap  │
+    │ (rights: R)   │                   │   (badge: 0x42)   │
+    └───────────────┘                   └───────────────────┘
 ```
 
 ## Scheduler Architecture
 
-### EDF with Budgets
+### 4-Class Scheduler
 
 ```mermaid
 graph LR
@@ -353,7 +373,7 @@ SaltyOS uses a four-tier memory management architecture where each tier has a di
 │  └── MO data page source (primary path for MO_COMMIT)                  │
 │                                                                          │
 │  PMM (mm/frame.rs)                                                      │
-│  ├── Bitmap allocator, 16-byte FrameMeta per frame                      │
+│  ├── Bitmap allocator, 24-byte FrameMeta per frame                      │
 │  ├── FrameOwner: Free|MoData|MoMeta|KernelPrivate|...                  │
 │  ├── Emergency reserve pool (32 pages)                                  │
 │  └── Role: kernel metadata only (page tables, stacks, radix/maple)     │
@@ -404,7 +424,7 @@ TTBR1_EL1 → Kernel space (upper VA range)
 
 ## Subsystem Architecture
 
-SaltyOS implements a multi-personality subsystem model. Each process has a personality (POSIX, Win32, or None) tracked by procmgr via `PersonalityState`.
+SaltyOS implements a multi-personality subsystem model. Each process has a personality (POSIX, Win32, or None) recorded at spawn time and tracked by init's supervisor.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -414,10 +434,10 @@ SaltyOS implements a multi-personality subsystem model. Each process has a perso
 │                               │                                  │
 │  posix_ttysrv  posix_getty    │  win32_csrss                     │
 │  trona_posix   basaltc        │  trona_win32   kernel32.dll      │
-│  ld-trona.so (ELF)            │  ld-trona-pe.so (PE)             │
+│  ldtrona-elf.so (ELF)            │  ldtrona-pe.so (PE)             │
 ├───────────────────────────────┴──────────────────────────────────┤
 │              Core Services (personality-neutral)                  │
-│    init │ procmgr │ vfs │ namesrv │ mmsrv │ console              │
+│    init │ rsrcsrv │ vfs │ namesrv │ mmsrv │ console │ logsrv    │
 ├──────────────────────────────────────────────────────────────────┤
 │              Network Stack                                        │
 │    netsrv (TCP/UDP/ARP/ICMP/DHCP) │ dnssrv │ netdrv (virtio)    │
@@ -447,9 +467,10 @@ graph TB
 
     subgraph "Core Servers"
         VFS[VFS Server]
-        PROCMGR[Process Manager]
         MMSRV[Memory Manager]
         NAMESRV[Name Service]
+        RSRCSRV[Resource Server]
+        LOGSRV[Log Server]
     end
 
     subgraph "Network"
@@ -472,8 +493,9 @@ graph TB
     WIN32 --> TRONA
     TRONA --> BASALT
     TRONA -->|IPC| VFS
-    TRONA -->|IPC| PROCMGR
     TRONA -->|IPC| MMSRV
+    TRONA -->|IPC| RSRCSRV
+    TRONA -->|IPC| LOGSRV
     TRONA -->|IPC| NETSRV
     VFS -->|IPC| BLKDRV
     VFS -->|IPC| SALTYFS
@@ -485,9 +507,9 @@ graph TB
 
 1. Receive all initial capabilities from kernel
 2. Parse `.service` files from initrd for boot ordering and dependencies
-3. Create and configure system servers (mmsrv, procmgr, vfs, namesrv, ...)
+3. Spawn and configure core servers (mmsrv, rsrcsrv, vfs, namesrv, logsrv, ...)
 4. Distribute capabilities to servers
-5. Start the process manager and remaining services
+5. Own spawn/exit/waitpid lifecycle for all child processes (supervisor)
 6. Optionally start a shell via posix_getty
 
 ### Service-Based Bootstrap
@@ -563,27 +585,38 @@ SaltyOS/
 │       │       ├── gic.rs, paging.rs, pl011.rs, psci.rs, timer.rs
 │       ├── cap/
 │       │   ├── mod.rs, cdt.rs, cnode.rs, ioport.rs
-│       │   ├── memory_object.rs, object.rs, refcount.rs, slot.rs, untyped.rs
+│       │   ├── memory_object.rs, object.rs, object_size.rs
+│       │   ├── object_size_assert.rs, refcount.rs, slot.rs
+│       │   ├── system.rs, untyped.rs
 │       ├── console/
 │       │   ├── mod.rs, fb.rs, font.rs
+│       ├── event/
+│       │   ├── mod.rs, event_queue.rs, irq.rs, record.rs
+│       │   ├── state.rs, timer.rs, watch.rs, watcher_list.rs
 │       ├── ipc/
-│       │   ├── mod.rs, endpoint.rs, futex.rs
-│       │   ├── irq.rs, notification.rs, queue.rs
+│       │   ├── mod.rs, data_pipe.rs, fault.rs
+│       │   ├── futex.rs, message_pipe.rs
 │       ├── mm/
 │       │   ├── mod.rs, frame.rs, maple_tree.rs
 │       │   ├── node_alloc.rs, radix_tree.rs, vspace.rs
 │       ├── sched/
-│       │   ├── mod.rs, pip.rs, scheduler.rs
-│       │   ├── sleep_queue.rs, thread.rs
-│       └── syscall/
-│           ├── mod.rs, fastpath.rs
+│       │   ├── mod.rs, control.rs, deadline_queue.rs
+│       │   ├── pip.rs, scheduler.rs, thread.rs
+│       │   └── scheduler/ (drive.rs, wake.rs, ...)
+│       ├── syscall/
+│       │   ├── mod.rs, dispatch.rs, invoke.rs, types.rs, support.rs
+│       │   ├── cap.rs, cspace.rs, event.rs, ioport.rs
+│       │   ├── misc.rs, mo.rs, pipe.rs, sc.rs
+│       │   ├── system.rs, tcb.rs, vspace.rs
+│       └── task/
+│           ├── mod.rs, control.rs, state.rs
 │
 ├── userland/
 │   ├── core/
 │   │   ├── init/                        # First process (service-based bootstrap)
 │   │   │   └── src/ (main.rs, ini.rs, selftest.rs, spawn.rs, svc_mgr.rs)
 │   │   ├── mmsrv/                       # Memory manager server
-│   │   ├── procmgr/                     # Process manager (spawn/exit/waitpid)
+│   │   ├── procmgr/                     # Process manager (archived; lifecycle now owned by init)
 │   │   ├── namesrv/                     # Name service (endpoint lookup)
 │   │   └── vfs/                         # Virtual filesystem (ramfs + devfs + sockets + shm + poll)
 │   ├── servers/
@@ -608,18 +641,19 @@ SaltyOS/
 │   └── services/                        # .service files for boot ordering
 │
 ├── lib/
-│   ├── trona/                           # Userspace system library (5 crates + rtld)
-│   │   ├── substrate/                   # Core: syscall wrappers, IPC, capability invocations
+│   ├── trona/                           # Userspace system library (six crates + kernel32 + arch)
+│   │   ├── kernel/                      # Core: syscall wrappers, IPC, capability invocations, slot allocator
+│   │   ├── protocol/                    # IPC protocol labels and shared #[repr(C)] types
+│   │   ├── server/                      # Well-known service caps, spawn policy, server consts
+│   │   ├── runtime/                     # Cap ownership types (OwnedCap, TransferCap, CapRef)
 │   │   ├── posix/                       # POSIX compatibility (file, socket, poll, mmap, signals, pthread)
-│   │   ├── loader/                      # ELF + PE loader (cpio, elf_loader, pe_loader)
-│   │   ├── uapi/                        # Userspace API definitions (consts, protocol, types)
-│   │   ├── win32/                       # Win32 API layer (console, process, handle, kernel32)
-│   │   ├── rtld/
-│   │   │   ├── elf/                     # ld-trona.so (ELF dynamic linker)
-│   │   │   └── pe/                      # ld-trona-pe.so (PE dynamic linker)
+│   │   ├── loader/                      # ELF + PE loader + RTLD
+│   │   │   ├── common/                  # Shared parsing (ELF, PE, CPIO, LinkMap)
+│   │   │   └── rtld/                    # Runtime dynamic linkers (ldtrona-elf.so, ldtrona-pe.so)
+│   │   ├── win32/                       # Win32 API layer (console, process, handle, kernel32.dll)
 │   │   └── arch/
-│   │       ├── x86_64/                  # x86_64 fork.S, syscall asm
-│   │       └── aarch64/                 # aarch64 fork.S, syscall asm
+│   │       ├── x86_64/                  # x86_64 explicit assembly stubs
+│   │       └── aarch64/                 # aarch64 explicit assembly stubs
 │   ├── basalt/                          # C/C++ standard library
 │   │   ├── c/                           # libc.so (basaltc — POSIX libc)
 │   │   └── cpp/                         # libc++.so (from toolchain/llvm-project)

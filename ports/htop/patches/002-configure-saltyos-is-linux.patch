@@ -1,0 +1,28 @@
+Treat `saltyos*` host triples as Linux for htop's process-table backend.
+SaltyOS's procfs is a Linux-format projection, so the Linux backend's
+`/proc/stat`, `/proc/meminfo`, `/proc/<pid>/{stat,statm,status,...}`
+readers work without modification. We patch both `configure` (so no
+autoreconf dependency is introduced on the host) and `configure.ac`
+(so regenerators stay consistent with the shipped script).
+--- a/configure
++++ b/configure
+@@ -3512,7 +3512,7 @@
+ # ----------------------------------------------------------------------
+ 
+ case "$host_os" in
+-linux*|gnu*)
++linux*|gnu*|saltyos*)
+    my_htop_platform=linux
+ 
+    printf "%s\n" "#define HTOP_LINUX /**/" >>confdefs.h
+--- a/configure.ac
++++ b/configure.ac
+@@ -23,7 +23,7 @@
+ # ----------------------------------------------------------------------
+ 
+ case "$host_os" in
+-linux*|gnu*)
++linux*|gnu*|saltyos*)
+    my_htop_platform=linux
+    AC_DEFINE([HTOP_LINUX], [], [Building for Linux.])
+    ;;

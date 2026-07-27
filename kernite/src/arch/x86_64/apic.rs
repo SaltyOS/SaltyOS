@@ -17,9 +17,17 @@
 //! physmap slot before touching the registers.
 
 use super::outb;
-use crate::mm::PHYS_MAP_OFFSET;
-use crate::{kdebug, kinfo};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
+use crate::kernel::printk::{
+    serial_dec_early, serial_hex_early, serial_putc_early, serial_puts_early,
+};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+unsafe extern "C" {
+    fn x86_apic_rdtsc() -> u64;
+    fn x86_apic_cpuid1_edx() -> u32;
+    fn x86_apic_rdmsr(msr: u32) -> u64;
+    fn x86_apic_wrmsr(msr: u32, value: u64);
+}
 
 /// Local APIC base address (physical)
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
@@ -133,21 +141,21 @@ static PER_CPU_TSC_BOOT: [AtomicU64; super::cpu::MAX_CPUS] = {
 /// time never falls behind BSP wall-clock progress.
 static GLOBAL_FLOOR_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Per-CPU last returned timestamp for local monotonicity without global CAS.
-static LAST_NS_PER_CPU: [AtomicU64; super::cpu::MAX_CPUS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; super::cpu::MAX_CPUS]
-};
+/// Globally last-returned timestamp: enforces strict cross-CPU monotonicity.
+///
+/// Every `now_ns()` return value is published here via a compare-exchange
+/// max-update, so a value returned on one CPU is strictly greater than every
+/// value previously returned on any CPU. This closes the cross-CPU gap a
+/// per-CPU last left open: a thread migrated between reads (e.g. clock_gettime
+/// around a yield) could otherwise observe equal or backward values, since the
+/// BSP-tick `floor_ns` is only non-decreasing and two reads with no
+/// intervening tick would otherwise return the same value on different CPUs.
+static LAST_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the x86 Time Stamp Counter
 #[inline]
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-    }
-    (hi as u64) << 32 | lo as u64
+    unsafe { x86_apic_rdtsc() }
 }
 
 /// Local APIC base address (virtual)
@@ -178,8 +186,8 @@ pub fn tlb_shootdown_addr(cpu_id: usize) -> u64 {
 pub enum IpiKind {
     VSpaceTeardown = 0,
     Reschedule = 1,
-    TlbShootdown = 8,     // vector 48 (single-page inval)
-    TlbShootdownAll = 9,  // vector 49 (full TLB flush)
+    TlbShootdown = 8,    // vector 48 (single-page inval)
+    TlbShootdownAll = 9, // vector 49 (full TLB flush)
 }
 
 impl IpiKind {
@@ -193,15 +201,7 @@ impl IpiKind {
 ///
 /// Returns true if the CPU supports local APIC.
 pub fn is_available() -> bool {
-    let mut edx: u32;
-    unsafe {
-        core::arch::asm!(
-            "cpuid",
-            in("eax") 1,
-            lateout("edx") edx,
-            lateout("ecx") _,
-        );
-    }
+    let edx = unsafe { x86_apic_cpuid1_edx() };
     // Check bit 9 of EDX (APIC on CPU)
     edx & (1 << 9) != 0
 }
@@ -212,29 +212,13 @@ pub fn is_available() -> bool {
 /// Must be called only once per CPU during initialization.
 unsafe fn enable_apic() {
     unsafe {
-        let mut eax: u32;
-        let mut edx: u32;
-
         // Read current APIC base MSR
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") IA32_APIC_BASE_MSR,
-            out("eax") eax,
-            out("edx") edx,
-        );
-
-        let apic_base = ((edx as u64) << 32) | (eax as u64);
+        let apic_base = x86_apic_rdmsr(IA32_APIC_BASE_MSR);
 
         // Enable APIC if not already enabled
         if apic_base & APIC_BASE_ENABLED == 0 {
             let new_base = apic_base | APIC_BASE_ENABLED;
-
-            core::arch::asm!(
-                "wrmsr",
-                in("ecx") IA32_APIC_BASE_MSR,
-                in("eax") (new_base as u32),
-                in("edx") ((new_base >> 32) as u32),
-            );
+            x86_apic_wrmsr(IA32_APIC_BASE_MSR, new_base);
         }
     }
 }
@@ -374,7 +358,7 @@ unsafe fn init_timer() {
             PER_CPU_TSC_BOOT[0].store(0, Ordering::Release);
         }
 
-        crate::kinfo!(|_g| {
+        crate::kernel::printk::kinfo!(|_g| {
             _g.puts("[TIMER] APIC ticks/ms=");
             _g.dec(calibrated_ticks as u64);
             _g.puts(" fallback=");
@@ -422,7 +406,10 @@ unsafe fn init_timer() {
 pub fn start_timer() {
     unsafe {
         // Set initial count for 1ms ticks using calibrated value
-        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS.load(Ordering::Acquire));
+        lapic_write(
+            LAPIC_TIMER_INITIAL,
+            TIMER_TICKS_PER_MS.load(Ordering::Acquire),
+        );
 
         // Unmask the timer - interrupts will now fire
         let timer_config = (LAPIC_TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC;
@@ -466,7 +453,8 @@ pub fn now_us() -> u64 {
 /// Uses per-CPU TSC for sub-microsecond precision when calibrated and
 /// CPUID reports invariant TSC; otherwise uses tick-based timing.
 /// Guarantees:
-/// - Per-CPU monotonicity (`LAST_NS_PER_CPU`)
+/// - Global strict monotonicity (`LAST_NS` CAS max-update): every returned
+///   value is strictly greater than every previously returned value on any CPU.
 /// - Cross-CPU lower bound: returned time is always >= BSP global floor time
 ///   published from timer ticks (`GLOBAL_FLOOR_NS`).
 pub fn now_ns() -> u64 {
@@ -479,7 +467,11 @@ pub fn now_ns() -> u64 {
     let raw_ns = if !tsc_enabled || !inv_tsc_global || tsc_per_us == 0 {
         floor_ns
     } else {
-        let cpu = crate::arch::current_cpu() as usize;
+        let cpu = if super::cpu::per_cpu_ready() {
+            (super::cpu::current_cpu() as usize).min(super::cpu::MAX_CPUS - 1)
+        } else {
+            0
+        };
         let boot = PER_CPU_TSC_BOOT[cpu].load(Ordering::Relaxed);
         if boot == 0 {
             floor_ns
@@ -498,15 +490,25 @@ pub fn now_ns() -> u64 {
     let upper = floor_ns.saturating_add(MAX_SKEW_NS);
     let bounded_ns = raw_ns.clamp(floor_ns, upper);
 
-    let cpu = crate::arch::current_cpu() as usize;
-    let last = LAST_NS_PER_CPU[cpu].load(Ordering::Relaxed);
-    let next = if bounded_ns > last {
-        bounded_ns
-    } else {
-        last.saturating_add(1)
-    };
-    LAST_NS_PER_CPU[cpu].store(next, Ordering::Relaxed);
-    next
+    // Global strict monotonicity via compare-exchange max-update. A thread
+    // migrated between reads (e.g. clock_gettime around a yield) would
+    // otherwise observe equal/backward values: the BSP-tick `floor_ns` is only
+    // non-decreasing, so two reads with no intervening tick return the same
+    // value on different CPUs. Publishing the max here — bumping by 1 when the
+    // local sample is at/below the global last — makes every return strictly
+    // greater than every prior return on any CPU.
+    loop {
+        let last = LAST_NS.load(Ordering::Acquire);
+        let next = if bounded_ns > last {
+            bounded_ns
+        } else {
+            last.saturating_add(1)
+        };
+        match LAST_NS.compare_exchange(last, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
 }
 
 /// Calibrate APIC timer using PIT
@@ -654,9 +656,11 @@ pub fn get_timer_ticks_per_ms() -> u32 {
 
 /// APIC Timer interrupt handler
 ///
-/// Called by the IDT handler when the timer interrupt fires.
-/// Increments the tick counter and notifies the scheduler.
-pub fn timer_handler() {
+/// Called by the IDT handler when the timer interrupt fires. `frame` still
+/// carries the interrupted-mode hint for the scheduler's timer API shape,
+/// while user/kernel runtime attribution itself happens in the shared
+/// entry/exit hooks.
+pub fn timer_handler(frame: *const super::idt::InterruptFrame) {
     // Guard: LAPIC must be mapped before we can handle timer or send EOI
     if LAPIC_VIRTUAL_BASE.load(Ordering::Relaxed) == 0 {
         return;
@@ -674,7 +678,8 @@ pub fn timer_handler() {
     eoi();
 
     // Notify scheduler (may context-switch and never return)
-    crate::sched::timer_tick();
+    let user_mode = unsafe { (*frame).interrupted_user_mode() };
+    crate::event::timer::dispatch_tick(user_mode);
 }
 
 /// Send Inter-Processor Interrupt (IPI)
@@ -693,19 +698,16 @@ pub unsafe fn send_ipi(cpu_id: usize, kind: IpiKind) {
     // 3. Handler returns via interrupt epilogue
     // 4. CR3 still points to kernel VSpace (which includes current user mappings)
     // 5. Interrupt epilogue can safely return to user code
-    #[cfg(debug_assertions)]
-    {
-        // In debug builds, verify kernel PML4 entries are identical
-        // This is a simple check - a full implementation would verify all entries
-        debug_assert!(cpu_id < crate::arch::MAX_CPUS, "send_ipi: invalid CPU ID");
-    }
+    crate::kernel::bug::kassert!(cpu_id < crate::arch::MAX_CPUS, "send_ipi: invalid CPU ID");
 
     unsafe {
         // Ensure previous IPI has been delivered.
         // Log but continue on timeout — skipping a runtime IPI would cause
         // worse problems (missed reschedules, stale TLB entries).
         if !wait_icr_idle() {
-            crate::serial_puts("[APIC] WARNING: send_ipi pre-send ICR stuck, proceeding\n");
+            crate::kernel::printk::serial_puts(
+                "[APIC] WARNING: send_ipi pre-send ICR stuck, proceeding\n",
+            );
         }
 
         // Look up the real hardware APIC ID for this logical CPU index.
@@ -803,7 +805,7 @@ unsafe fn wait_icr_idle() -> bool {
         }
         core::hint::spin_loop();
     }
-    crate::serial_puts("[APIC] WARNING: ICR delivery timeout\n");
+    serial_puts_early("[APIC] WARNING: ICR delivery timeout\n");
     false
 }
 
@@ -811,6 +813,22 @@ unsafe fn wait_icr_idle() -> bool {
 unsafe extern "C" {
     static ap_trampoline_start: u8;
     static ap_trampoline_end: u8;
+}
+
+fn startup_spin_delay_us(us: u32) {
+    let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
+    if tsc_per_us != 0 {
+        let start = rdtsc();
+        let deadline = (tsc_per_us as u64).saturating_mul(us as u64);
+        while rdtsc().wrapping_sub(start) < deadline {
+            core::hint::spin_loop();
+        }
+        return;
+    }
+
+    for _ in 0..us.saturating_mul(512) {
+        core::hint::spin_loop();
+    }
 }
 
 /// Start Application Processors
@@ -824,15 +842,7 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
     use crate::mm::PHYS_MAP_OFFSET;
 
     unsafe {
-        // Serial debug
-        let serial = |s: &str| {
-            for byte in s.bytes() {
-                while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-                super::outb(0x3F8, byte);
-            }
-        };
-
-        serial("\n[SMP] Starting Application Processors\n");
+        serial_puts_early("\n[SMP] Starting Application Processors\n");
 
         // Copy trampoline code to physical 0x8000
         let tramp_src = &raw const ap_trampoline_start as *const u8;
@@ -842,28 +852,9 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
 
         core::ptr::copy_nonoverlapping(tramp_src, tramp_dst, tramp_size);
 
-        serial("[SMP] Trampoline copied to 0x8000 (");
-        // Print size
-        let mut buf = [0u8; 8];
-        let mut n = tramp_size;
-        let mut pos = 7;
-        if n == 0 {
-            buf[pos] = b'0';
-        } else {
-            while n > 0 {
-                buf[pos] = b'0' + (n % 10) as u8;
-                n /= 10;
-                if pos == 0 { break; }
-                pos -= 1;
-            }
-        }
-        for &c in &buf[(pos)..] {
-            if c != 0 {
-                while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-                super::outb(0x3F8, c);
-            }
-        }
-        serial(" bytes)\n");
+        serial_puts_early("[SMP] Trampoline copied to 0x8000 (");
+        serial_dec_early(tramp_size as u64);
+        serial_puts_early(" bytes)\n");
 
         // Store PML4 physical address (current CR3)
         let pml4_phys = super::paging::read_cr3();
@@ -884,17 +875,18 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
 
             let apic_id = desc.apic_id;
 
-            serial("[SMP] Starting AP APIC_ID=");
-            let digit = b'0' + apic_id;
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, digit);
-            serial("\n");
+            serial_puts_early("[SMP] Starting AP APIC_ID=");
+            serial_dec_early(apic_id as u64);
+            serial_putc_early(b'\n');
 
             // Allocate per-CPU kernel stack (16KB = 4 pages)
             const STACK_PAGES: usize = 4;
             const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-            let stack_phys = crate::mm::pmm_alloc_contiguous(STACK_PAGES)
+            let stack_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+                subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+            };
+            let stack_phys = crate::mm::pmm_alloc_contiguous_owned(STACK_PAGES, &stack_owner)
                 .expect("[SMP] Failed to allocate AP kernel stack");
             let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
 
@@ -930,92 +922,76 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             let verify_ptr = (TRAMPOLINE_BASE + PHYS_MAP_OFFSET) as *const u8;
             let byte0 = verify_ptr.read_volatile();
             let byte1 = verify_ptr.add(1).read_volatile();
-            serial("[SMP]   Trampoline verify: first bytes = ");
-            let hex = b"0123456789abcdef";
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, hex[((byte0 >> 4) & 0xF) as usize]);
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, hex[(byte0 & 0xF) as usize]);
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, b' ');
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, hex[((byte1 >> 4) & 0xF) as usize]);
-            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-            super::outb(0x3F8, hex[(byte1 & 0xF) as usize]);
-            serial(" (expect: fa fc)\n");
+            serial_puts_early("[SMP]   Trampoline verify: first bytes = ");
+            serial_hex_early(byte0 as u64);
+            serial_putc_early(b' ');
+            serial_hex_early(byte1 as u64);
+            serial_puts_early(" (expect: 0xfa 0xfc)\n");
 
             // Verify PML4 was stored
             let pml4_verify = (TRAMPOLINE_PML4 + PHYS_MAP_OFFSET) as *const u64;
-            serial("[SMP]   PML4 at 0x8FF0 = ");
-            crate::serial_hex_raw(pml4_verify.read_volatile());
-            serial("\n");
+            serial_puts_early("[SMP]   PML4 at 0x8FF0 = ");
+            serial_hex_early(pml4_verify.read_volatile());
+            serial_putc_early(b'\n');
 
-            // Set warm-reset vector (BIOS data area at 0x467)
-            // This tells the BIOS where to jump after INIT reset.
-            // Write the trampoline address as segment:offset (real mode far pointer).
-            let warm_reset_ptr = (0x467u64 + PHYS_MAP_OFFSET) as *mut u32;
-            warm_reset_ptr.write_volatile(0x0800_0000); // segment 0x0800, offset 0x0000
-
-            // Set CMOS shutdown status to 0x0A (jump via warm-reset vector)
-            super::outb(0x70, 0x0F); // select CMOS register 0x0F
-            super::outb(0x71, 0x0A); // shutdown status = warm reset
-
-            // Memory fence to ensure all writes are ordered
+            // SIPI vector 0x08 directly targets the 0x8000 trampoline.
+            // The old BIOS warm-reset vector path is unnecessary here and
+            // touches legacy BDA/CMOS state before every AP startup.
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
             // Send INIT IPI (level assert)
+            serial_puts_early("[SMP]   INIT assert\n");
             if !send_init_ipi(apic_id) {
-                serial("[SMP] INIT IPI failed for AP, skipping\n");
+                serial_puts_early("[SMP] INIT IPI failed for AP, skipping\n");
                 continue;
             }
+            serial_puts_early("[SMP]   INIT delivered\n");
 
             // Wait 10ms for INIT to be received and processed
+            serial_puts_early("[SMP]   INIT wait\n");
             super::pit::delay_us(10_000);
+            serial_puts_early("[SMP]   INIT wait done\n");
 
             // Intel MP spec requires deassert after INIT assert
-            if !send_init_deassert() {
-                serial("[SMP] INIT deassert failed for AP, skipping\n");
+            serial_puts_early("[SMP]   INIT deassert\n");
+            if !send_init_deassert(apic_id) {
+                serial_puts_early("[SMP] INIT deassert failed for AP, skipping\n");
                 continue;
             }
+            serial_puts_early("[SMP]   INIT deassert delivered\n");
             // 200us settling time before first SIPI
             super::pit::delay_us(200);
 
             // Send SIPI (twice per Intel spec)
             // SIPI vector = physical page number of trampoline code
+            serial_puts_early("[SMP]   SIPI #1\n");
             if !send_sipi(apic_id, SIPI_VECTOR) {
-                serial("[SMP] first SIPI failed for AP, skipping\n");
+                serial_puts_early("[SMP] first SIPI failed for AP, skipping\n");
                 continue;
             }
             super::pit::delay_us(200);
+            serial_puts_early("[SMP]   SIPI #2\n");
             if !send_sipi(apic_id, SIPI_VECTOR) {
-                serial("[SMP] second SIPI failed for AP, skipping\n");
+                serial_puts_early("[SMP] second SIPI failed for AP, skipping\n");
                 continue;
             }
+            serial_puts_early("[SMP]   SIPIs delivered\n");
 
             // Wait for AP to signal ready (timeout after 500ms)
-            let mut timeout = 500;
+            let mut timeout_us = 500_000u32;
             while !AP_READY[cpu_id as usize].load(core::sync::atomic::Ordering::SeqCst) {
-                super::pit::delay_us(1_000);
-                timeout -= 1;
-                if timeout == 0 {
-                    serial("[SMP] WARNING: AP did not respond\n");
+                startup_spin_delay_us(1_000);
+                timeout_us = timeout_us.saturating_sub(1_000);
+                if timeout_us == 0 {
+                    serial_puts_early("[SMP] WARNING: AP did not respond\n");
                     // Check if trampoline was even reached
                     let magic = magic_ptr.read_volatile();
                     if magic == 0xCAFE {
-                        serial("[SMP]   Trampoline WAS reached (magic=0xCAFE)\n");
+                        serial_puts_early("[SMP]   Trampoline WAS reached (magic=0xCAFE)\n");
                     } else {
-                        serial("[SMP]   Trampoline NOT reached (magic=0x");
-                        let digits = [
-                            b"0123456789abcdef"[((magic >> 12) & 0xF) as usize],
-                            b"0123456789abcdef"[((magic >> 8) & 0xF) as usize],
-                            b"0123456789abcdef"[((magic >> 4) & 0xF) as usize],
-                            b"0123456789abcdef"[(magic & 0xF) as usize],
-                        ];
-                        for &d in &digits {
-                            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-                            super::outb(0x3F8, d);
-                        }
-                        serial(")\n");
+                        serial_puts_early("[SMP]   Trampoline NOT reached (magic=");
+                        serial_hex_early(magic as u64);
+                        serial_puts_early(")\n");
                     }
 
                     // Check if the AP consumed the mailbox before we overwrite it.
@@ -1028,17 +1004,17 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
                         if magic == 0xCAFE {
                             // Trampoline reached but mailbox not yet consumed —
                             // AP is in mode transition. Spin briefly for consumption.
-                            serial("[SMP]   Waiting for mailbox consumption...\n");
+                            serial_puts_early("[SMP]   Waiting for mailbox consumption...\n");
                             let mut consumed_wait = 10; // 10ms
                             while consumed_wait > 0 {
-                                super::pit::delay_us(1_000);
+                                startup_spin_delay_us(1_000);
                                 if consumed_ptr.read_volatile() == 0xACE1 {
                                     break;
                                 }
                                 consumed_wait -= 1;
                             }
                             if consumed_ptr.read_volatile() != 0xACE1 {
-                                serial("[SMP]   Mailbox NOT consumed, poisoning\n");
+                                serial_puts_early("[SMP]   Mailbox NOT consumed, poisoning\n");
                             }
                         }
                     }
@@ -1050,23 +1026,21 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
 
                     // Reset timed-out AP to INIT state (Intel-recommended abort)
                     let _ = send_init_ipi(apic_id);
-                    super::pit::delay_us(10_000);
+                    startup_spin_delay_us(10_000);
 
                     break;
                 }
             }
 
             if AP_READY[cpu_id as usize].load(core::sync::atomic::Ordering::SeqCst) {
-                serial("[SMP] AP is online\n");
+                serial_puts_early("[SMP] AP is online\n");
             }
         }
 
-        serial("[SMP] AP startup complete. Online CPUs: ");
+        serial_puts_early("[SMP] AP startup complete. Online CPUs: ");
         let total = ap_boot_count() + 1; // +1 for BSP
-        let digit = b'0' + (total as u8);
-        while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
-        super::outb(0x3F8, digit);
-        serial("\n");
+        serial_dec_early(total as u64);
+        serial_putc_early(b'\n');
     }
 }
 
@@ -1095,17 +1069,17 @@ unsafe fn send_init_ipi(apic_id: u8) -> bool {
 ///
 /// This is required by the Intel MP specification after the INIT assert.
 /// It is a broadcast de-assert (all CPUs), not targeted.
-unsafe fn send_init_deassert() -> bool {
+unsafe fn send_init_deassert(apic_id: u8) -> bool {
     unsafe {
         // Wait for ICR to be idle
         if !wait_icr_idle() {
             return false;
         }
 
-        // Broadcast INIT de-assert (all including self)
+        // Targeted INIT de-assert for the AP that received INIT assert.
         // Delivery mode = INIT, Level = de-assert, Trigger = level
-        // Destination shorthand = All Including Self (bits 19:18 = 10)
-        lapic_write(LAPIC_ICR0, ICR_INIT | (1 << 15) | (0b10 << 18));
+        lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
+        lapic_write(LAPIC_ICR0, ICR_INIT | ICR_LEVEL_DEASSERT | (1 << 15));
 
         // Wait for delivery
         wait_icr_idle()
@@ -1148,7 +1122,10 @@ pub fn init_ap() {
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
 
         // Set initial count for 1ms ticks
-        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS.load(Ordering::Acquire));
+        lapic_write(
+            LAPIC_TIMER_INITIAL,
+            TIMER_TICKS_PER_MS.load(Ordering::Acquire),
+        );
 
         // Unmask timer - periodic mode
         let timer_config = (LAPIC_TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC;
@@ -1173,10 +1150,7 @@ pub fn init_ap() {
             let my_tsc = rdtsc();
             // elapsed_tsc = ticks_ms * 1000_us/ms * tsc_per_us
             let elapsed_tsc = ticks * 1000 * tsc_per_us as u64;
-            PER_CPU_TSC_BOOT[cpu_id].store(
-                my_tsc.wrapping_sub(elapsed_tsc),
-                Ordering::Release,
-            );
+            PER_CPU_TSC_BOOT[cpu_id].store(my_tsc.wrapping_sub(elapsed_tsc), Ordering::Release);
         } else {
             PER_CPU_TSC_BOOT[cpu_id].store(0, Ordering::Release);
         }
@@ -1197,7 +1171,7 @@ pub fn init_ap() {
 ///
 /// In debug builds, this precondition is verified:
 /// ```rust
-/// debug_assert!(KERNEL_PML4_ENTRIES_ARE_IDENTICAL);
+/// crate::kernel::bug::kassert!(KERNEL_PML4_ENTRIES_ARE_IDENTICAL);
 /// ```
 pub fn handle_ipi(kind: IpiKind) {
     match kind {
@@ -1322,7 +1296,7 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
     let virt = unsafe { super::paging::map_mmio_page(ioapic_phys as u64) };
     IOAPIC_BASE.store(virt, Ordering::Release);
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[IOAPIC] phys=");
         _g.hex(ioapic_phys as u64);
         _g.puts(" virt=");
@@ -1335,7 +1309,7 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
         let ver = ioapic_read(IOAPIC_REG_VER);
         let max_entry = ((ver >> 16) & 0xFF) as u32;
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[IOAPIC] version=");
             _g.hex(ver as u64);
             _g.puts(" max_entry=");
@@ -1370,7 +1344,7 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
 
     IOAPIC_READY.store(true, Ordering::Release);
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[IOAPIC] IRQ1 (keyboard) → vec 33, IRQ4 (COM1) → vec 36, dest APIC ");
         _g.dec(bsp_apic_id as u64);
         _g.putc(b'\n');

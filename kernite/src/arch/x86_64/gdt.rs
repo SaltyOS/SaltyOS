@@ -2,9 +2,15 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use core::mem::size_of;
 use super::cpu::MAX_CPUS;
-use crate::kdebug;
+use core::mem::size_of;
+
+unsafe extern "C" {
+    fn x86_gdt_lgdt(ptr: *const GdtPtr);
+    fn x86_gdt_sgdt(ptr: *mut GdtPtr);
+    fn x86_gdt_ltr(selector: u16);
+    fn x86_gdt_reload_segments();
+}
 
 /// GDT entry
 #[repr(C, packed)]
@@ -99,17 +105,17 @@ pub struct TssEntry {
 #[derive(Clone, Copy)]
 pub struct TaskStateSegment {
     pub reserved0: u32,
-    pub rsp0: u64,     // Stack pointer for CPL=0
-    pub rsp1: u64,     // Stack pointer for CPL=1
-    pub rsp2: u64,     // Stack pointer for CPL=2
+    pub rsp0: u64, // Stack pointer for CPL=0
+    pub rsp1: u64, // Stack pointer for CPL=1
+    pub rsp2: u64, // Stack pointer for CPL=2
     pub reserved1: u64,
-    pub ist1: u64,     // IST1 stack pointer
-    pub ist2: u64,     // IST2 stack pointer
-    pub ist3: u64,     // IST3 stack pointer
-    pub ist4: u64,     // IST4 stack pointer
-    pub ist5: u64,     // IST5 stack pointer
-    pub ist6: u64,     // IST6 stack pointer
-    pub ist7: u64,     // IST7 stack pointer
+    pub ist1: u64, // IST1 stack pointer
+    pub ist2: u64, // IST2 stack pointer
+    pub ist3: u64, // IST3 stack pointer
+    pub ist4: u64, // IST4 stack pointer
+    pub ist5: u64, // IST5 stack pointer
+    pub ist6: u64, // IST6 stack pointer
+    pub ist7: u64, // IST7 stack pointer
     pub reserved2: u64,
     pub reserved3: u16,
     pub iomap_base: u16, // I/O permission bitmap base (0xFFFF if none)
@@ -143,8 +149,8 @@ pub struct Gdt {
     null: GdtEntry,
     kernel_code: GdtEntry,
     kernel_data: GdtEntry,
-    user_data: GdtEntry,        // 0x18: must be before user_code for sysretq
-    user_code: GdtEntry,        // 0x20: sysretq computes CS = STAR[63:48]+16
+    user_data: GdtEntry, // 0x18: must be before user_code for sysretq
+    user_code: GdtEntry, // 0x20: sysretq computes CS = STAR[63:48]+16
     tss: TssEntry,
 }
 
@@ -159,8 +165,8 @@ static mut GDT: Gdt = Gdt {
     null: GdtEntry::null(),
     kernel_code: GdtEntry::kernel_code(),
     kernel_data: GdtEntry::kernel_data(),
-    user_data: GdtEntry::user_data(),       // 0x18
-    user_code: GdtEntry::user_code(),       // 0x20
+    user_data: GdtEntry::user_data(), // 0x18
+    user_code: GdtEntry::user_code(), // 0x20
     tss: TssEntry {
         limit_low: 0,
         base_low: 0,
@@ -177,7 +183,8 @@ static mut GDT: Gdt = Gdt {
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 /// Per-CPU TSS array (for APs; index 0 is unused since BSP uses the original TSS)
-static mut PER_CPU_TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::new() }; MAX_CPUS];
+static mut PER_CPU_TSS: [TaskStateSegment; MAX_CPUS] =
+    [const { TaskStateSegment::new() }; MAX_CPUS];
 
 /// Per-CPU GDT array (for APs; index 0 is unused since BSP uses the original GDT)
 static mut PER_CPU_GDT: [Gdt; MAX_CPUS] = [const {
@@ -203,7 +210,9 @@ static mut PER_CPU_GDT: [Gdt; MAX_CPUS] = [const {
 /// Set the kernel stack pointer in TSS (rsp0) for the current CPU
 pub unsafe fn set_tss_rsp0(stack_top: u64) {
     let cpu_id = super::cpu::current_cpu() as usize;
-    unsafe { set_tss_rsp0_cpu(cpu_id, stack_top); }
+    unsafe {
+        set_tss_rsp0_cpu(cpu_id, stack_top);
+    }
 }
 
 /// Set the kernel stack pointer in TSS (rsp0) for a specific CPU.
@@ -285,21 +294,13 @@ pub unsafe fn load_per_cpu(cpu_id: usize) {
         };
 
         // Load GDTR
-        core::arch::asm!(
-            "lgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack)
-        );
+        x86_gdt_lgdt(&gdt_ptr);
 
         // Reload segment registers
         reload_segments();
 
         // Load TSS (selector 0x28 = 5th entry)
-        core::arch::asm!(
-            "ltr {0:x}",
-            in(reg) 0x28u16,
-            options(nostack)
-        );
+        x86_gdt_ltr(0x28u16);
     }
 }
 
@@ -329,13 +330,13 @@ pub fn init() {
         // Set up TSS entry in GDT to point to TSS
         (*(&raw mut GDT)).tss = TssEntry::from_tss(&raw const TSS);
 
-        let gdt_ptr = GdtPtr {
+        let mut gdt_ptr = GdtPtr {
             limit: (size_of::<Gdt>() - 1) as u16,
             base: (&raw const GDT) as u64,
         };
 
         // DEBUG: Print what we're about to load
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("\n[GDT] Before lgdt:\n");
             _g.puts("  base: ");
             _g.hex(gdt_ptr.base);
@@ -348,65 +349,42 @@ pub fn init() {
             _g.putc(b'\n');
         });
 
-        core::arch::asm!(
-            "lgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack)
-        );
+        x86_gdt_lgdt(&gdt_ptr);
 
         // DEBUG: Read back GDTR to verify
-        let read_back_base: u64;
-        let read_back_limit: u16;
-        core::arch::asm!(
-            "sgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack)
-        );
-        read_back_base = gdt_ptr.base;
-        read_back_limit = gdt_ptr.limit;
+        x86_gdt_sgdt(&mut gdt_ptr);
+        let _read_back_base: u64;
+        let _read_back_limit: u16;
+        _read_back_base = gdt_ptr.base;
+        _read_back_limit = gdt_ptr.limit;
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[GDT] After lgdt (read back):\n");
             _g.puts("  base: ");
-            _g.hex(read_back_base);
+            _g.hex(_read_back_base);
             _g.puts("\n  limit: ");
-            _g.hex(read_back_limit as u64);
+            _g.hex(_read_back_limit as u64);
             _g.putc(b'\n');
         });
 
         // Reload segment registers (including CS via far return)
         reload_segments();
-        crate::kdebug!(arch, |_g| { _g.puts("[GDT] Segments reloaded successfully\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[GDT] Segments reloaded successfully\n");
+        });
 
         // Load TSS (must be AFTER GDT is loaded and segments are reloaded)
         // TSS selector is 0x28 (5th GDT entry, first is null)
-        core::arch::asm!(
-            "ltr {0:x}",
-            in(reg) 0x28u16,
-            options(nostack)
-        );
-        crate::kdebug!(arch, |_g| { _g.puts("[GDT] TSS loaded successfully\n"); });
+        x86_gdt_ltr(0x28u16);
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[GDT] TSS loaded successfully\n");
+        });
     }
 }
 
 unsafe fn reload_segments() {
     // SAFETY: Called after GDT is loaded with valid segments.
-    // This block uses push/retfq which modify RSP, so no `options(nostack)`.
     unsafe {
-        core::arch::asm!(
-            // Reload CS via far return
-            "push 0x08", // Kernel code segment
-            "lea rax, [rip + 2f]",
-            "push rax",
-            "retfq",
-            "2:",
-            // Reload data segments
-            "mov ax, 0x10", // Kernel data segment
-            "mov ds, ax",
-            "mov es, ax",
-            "mov fs, ax",
-            "mov gs, ax",
-            "mov ss, ax",
-        );
+        x86_gdt_reload_segments();
     }
 }

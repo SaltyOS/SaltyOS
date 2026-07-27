@@ -41,13 +41,19 @@ pub(crate) struct Superblock {
     pub(crate) label: [u8; 64],
     // Feature fields (offset 0x100). Added in the xattr/casefold/multi-user
     // revision; older images have zero here, which reads as "no new features".
-    pub(crate) compat_flags: u32,        // 0x100
-    pub(crate) compat_ro_flags: u32,     // 0x104
-    pub(crate) casefold_version: u32,    // 0x108
-    pub(crate) reserved2: u32,           // 0x10C
+    pub(crate) compat_flags: u32,     // 0x100
+    pub(crate) compat_ro_flags: u32,  // 0x104
+    pub(crate) casefold_version: u32, // 0x108
+    pub(crate) reserved2: u32,        // 0x10C
+    // Monotonic inode-number allocator (offset 0x110). The next inode number
+    // ever to be allocated from this volume. Persisted across mount cycles so
+    // ino reuse after umount/remount is impossible. Older images have zero
+    // here and are upgraded on first mount via a one-time B-tree scan
+    // (`legacy_upgrade_next_inode_seq`).
+    pub(crate) next_inode_seq: u64, // 0x110
     // Padding to 4KB
-    // 0x110 .. 0xFFC (3820 bytes), checksum is final 4 bytes at 0xFFC
-    pub(crate) reserved: [u8; 3820],
+    // 0x118 .. 0xFFC (3812 bytes), checksum is final 4 bytes at 0xFFC
+    pub(crate) reserved: [u8; 3812],
     pub(crate) checksum: u32,
 }
 

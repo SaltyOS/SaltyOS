@@ -1,15 +1,14 @@
 //! x86_64 ACPI support: MADT parsing (SMP CPU discovery) and FADT (shutdown).
 //!
-//! Uses the shared `crate::acpi` module for RSDP/XSDT/RSDT table walking.
+//! Uses the shared `crate::firmware::acpi` module for RSDP/XSDT/RSDT table walking.
 //! This file contains x86-specific ACPI code: BIOS RSDP scanning, MADT
 //! LAPIC/IOAPIC parsing, and FADT power management.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::cpu::MAX_CPUS;
-use crate::acpi::{self, SdtHeader};
+use crate::firmware::acpi::{self, SdtHeader};
 use crate::mm::PHYS_MAP_OFFSET;
-use crate::{kdebug, kinfo};
 
 // ---------------------------------------------------------------------------
 // MADT types (x86-specific: Local APIC / I/O APIC)
@@ -107,7 +106,7 @@ const LAPIC_FLAG_ONLINE_CAPABLE: u32 = 1 << 1;
 /// Returns the physical address of the RSDP, or 0 if not found.
 pub unsafe fn scan_for_rsdp() -> u64 {
     unsafe {
-        crate::serial_puts("[ACPI] Scanning for RSDP...\n");
+        crate::kernel::printk::serial_puts("[ACPI] Scanning for RSDP...\n");
 
         // Search EBDA (address stored at BDA 0x040E, segment value)
         let ebda_segment_ptr = acpi::phys_to_ptr::<u16>(0x040E);
@@ -116,7 +115,7 @@ pub unsafe fn scan_for_rsdp() -> u64 {
 
         if ebda_base >= 0x80000 && ebda_base < 0xA0000 {
             if let Some(addr) = scan_region_for_rsdp(ebda_base, 1024) {
-                crate::kdebug!(arch, |_g| {
+                crate::kernel::printk::kdebug!(arch, |_g| {
                     _g.puts("[ACPI] Found RSDP in EBDA at ");
                     _g.hex(addr);
                     _g.putc(b'\n');
@@ -127,7 +126,7 @@ pub unsafe fn scan_for_rsdp() -> u64 {
 
         // Search main BIOS area: 0xE0000 - 0xFFFFF
         if let Some(addr) = scan_region_for_rsdp(0xE0000, 0x20000) {
-            crate::kdebug!(arch, |_g| {
+            crate::kernel::printk::kdebug!(arch, |_g| {
                 _g.puts("[ACPI] Found RSDP in BIOS area at ");
                 _g.hex(addr);
                 _g.putc(b'\n');
@@ -135,7 +134,7 @@ pub unsafe fn scan_for_rsdp() -> u64 {
             return addr;
         }
 
-        crate::serial_puts("[ACPI] RSDP not found\n");
+        crate::kernel::printk::serial_puts("[ACPI] RSDP not found\n");
         0
     }
 }
@@ -174,11 +173,11 @@ unsafe fn scan_region_for_rsdp(base_phys: u64, length: usize) -> Option<u64> {
 /// `rsdp_phys` must be a valid physical address of the ACPI RSDP structure.
 pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
     if rsdp_phys == 0 {
-        crate::serial_puts("[ACPI] No RSDP address provided\n");
+        crate::kernel::printk::serial_puts("[ACPI] No RSDP address provided\n");
         return None;
     }
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[ACPI] RSDP at phys ");
         _g.hex(rsdp_phys);
         _g.putc(b'\n');
@@ -187,12 +186,12 @@ pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
     let madt_phys = match unsafe { acpi::find_table(rsdp_phys, b"APIC") } {
         Some(addr) => addr,
         None => {
-            crate::serial_puts("[ACPI] MADT not found\n");
+            crate::kernel::printk::serial_puts("[ACPI] MADT not found\n");
             return None;
         }
     };
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[ACPI] MADT at phys ");
         _g.hex(madt_phys);
         _g.putc(b'\n');
@@ -222,7 +221,7 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
     // Read BSP's APIC ID from the LAPIC ID register to identify which CPU is BSP
     let bsp_apic_id = unsafe { read_bsp_apic_id() };
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[ACPI] BSP APIC ID: ");
         _g.dec(bsp_apic_id as u64);
         _g.putc(b'\n');
@@ -254,12 +253,14 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
                         };
                         info.cpu_count += 1;
 
-                        crate::kdebug!(arch, |_g| {
+                        crate::kernel::printk::kdebug!(arch, |_g| {
                             _g.puts("[ACPI]   CPU ");
                             _g.dec(lapic.processor_id as u64);
                             _g.puts(" APIC_ID=");
                             _g.dec(lapic.apic_id as u64);
-                            if is_bsp { _g.puts(" (BSP)"); }
+                            if is_bsp {
+                                _g.puts(" (BSP)");
+                            }
                             _g.putc(b'\n');
                         });
                     }
@@ -271,7 +272,7 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
                     info.io_apic_addr = io_apic.address;
                     info.io_apic_gsi_base = io_apic.gsi_base;
 
-                    crate::kdebug!(arch, |_g| {
+                    crate::kernel::printk::kdebug!(arch, |_g| {
                         _g.puts("[ACPI]   I/O APIC id=");
                         _g.dec(io_apic.id as u64);
                         _g.puts(" addr=");
@@ -290,17 +291,13 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
         offset += entry_len;
     }
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[ACPI] Found ");
         _g.dec(info.cpu_count as u64);
         _g.puts(" CPU(s)\n");
     });
 
-    if info.cpu_count > 0 {
-        Some(info)
-    } else {
-        None
-    }
+    if info.cpu_count > 0 { Some(info) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,21 +327,21 @@ static mut ACPI_POWER: AcpiPowerInfo = AcpiPowerInfo {
 /// We only need fields up to pm1b_cnt_blk (offset 68 + 4 = 72 bytes)
 #[repr(C, packed)]
 struct Fadt {
-    header: SdtHeader,          // 0..36
-    firmware_ctrl: u32,         // 36
-    dsdt: u32,                  // 40
-    _reserved1: u8,             // 44
-    preferred_pm_profile: u8,   // 45
-    sci_int: u16,               // 46
-    smi_cmd: u32,               // 48
-    acpi_enable: u8,            // 52
-    acpi_disable: u8,           // 53
-    s4bios_req: u8,             // 54
-    pstate_cnt: u8,             // 55
-    pm1a_evt_blk: u32,          // 56
-    pm1b_evt_blk: u32,          // 60
-    pm1a_cnt_blk: u32,          // 64
-    pm1b_cnt_blk: u32,          // 68
+    header: SdtHeader,        // 0..36
+    firmware_ctrl: u32,       // 36
+    dsdt: u32,                // 40
+    _reserved1: u8,           // 44
+    preferred_pm_profile: u8, // 45
+    sci_int: u16,             // 46
+    smi_cmd: u32,             // 48
+    acpi_enable: u8,          // 52
+    acpi_disable: u8,         // 53
+    s4bios_req: u8,           // 54
+    pstate_cnt: u8,           // 55
+    pm1a_evt_blk: u32,        // 56
+    pm1b_evt_blk: u32,        // 60
+    pm1a_cnt_blk: u32,        // 64
+    pm1b_cnt_blk: u32,        // 68
 }
 
 /// Parse the FADT to extract PM1a/PM1b control block ports for shutdown.
@@ -359,7 +356,7 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
     let fadt_phys = match unsafe { acpi::find_table(rsdp_phys, b"FACP") } {
         Some(addr) => addr,
         None => {
-            crate::serial_puts("[ACPI] FADT not found\n");
+            crate::kernel::printk::serial_puts("[ACPI] FADT not found\n");
             return;
         }
     };
@@ -369,7 +366,7 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
 
     // Validate minimum length
     if (fadt.header.length as usize) < core::mem::size_of::<Fadt>() {
-        crate::serial_puts("[ACPI] FADT too short\n");
+        crate::kernel::printk::serial_puts("[ACPI] FADT too short\n");
         return;
     }
 
@@ -384,7 +381,7 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
         ACPI_POWER.valid = pm1a != 0;
     }
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[ACPI] FADT parsed: PM1a_CNT=");
         _g.hex(pm1a as u64);
         _g.puts(" PM1b_CNT=");
@@ -406,7 +403,8 @@ pub fn get_power_info() -> &'static AcpiPowerInfo {
 /// Read the BSP's Local APIC ID from the APIC ID register
 unsafe fn read_bsp_apic_id() -> u8 {
     let apic_base = super::apic::LAPIC_BASE + PHYS_MAP_OFFSET;
-    let id_reg = unsafe { ((apic_base + super::apic::LAPIC_ID as u64) as *const u32).read_volatile() };
+    let id_reg =
+        unsafe { ((apic_base + super::apic::LAPIC_ID as u64) as *const u32).read_volatile() };
     // APIC ID is in bits 24-31
     ((id_reg >> 24) & 0xFF) as u8
 }

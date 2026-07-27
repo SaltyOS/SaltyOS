@@ -1,0 +1,6 @@
+[Unit]
+Name=pcidrv-ep.socket
+
+[Socket]
+Provider=pcidrv
+Alias=pcidrv_ep

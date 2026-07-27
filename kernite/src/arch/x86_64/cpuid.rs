@@ -8,7 +8,10 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use crate::{kdebug, kerror};
+
+unsafe extern "C" {
+    fn x86_cpuid_leaf(leaf: u32, subleaf: u32, out: *mut u32);
+}
 
 const FEAT_SSE: u32 = 1 << 0;
 const FEAT_SSE2: u32 = 1 << 1;
@@ -71,26 +74,13 @@ fn cpu_bits(cpu_id: usize) -> u32 {
 ///
 /// Returns (eax, ebx, ecx, edx).
 unsafe fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    let eax: u32;
-    let ebx: u32;
-    let ecx: u32;
-    let edx: u32;
-    // SAFETY: rbx is callee-saved and LLVM reserves it, so we must
-    // save/restore it manually around cpuid.
+    let mut regs = [0u32; 4];
+    // SAFETY: The assembly helper preserves RBX and writes exactly four
+    // u32 registers into `regs`.
     unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            inlateout("eax") leaf => eax,
-            ebx_out = lateout(reg) ebx,
-            inlateout("ecx") subleaf => ecx,
-            lateout("edx") edx,
-            // push/pop rbx touches the current stack, so `nostack` is invalid.
-        );
+        x86_cpuid_leaf(leaf, subleaf, regs.as_mut_ptr());
     }
-    (eax, ebx, ecx, edx)
+    (regs[0], regs[1], regs[2], regs[3])
 }
 
 /// CPUID leaf 1: returns (ecx, edx) feature flags.
@@ -174,43 +164,43 @@ fn read_local_features() -> CpuFeatures {
     }
 }
 
-fn log_snapshot(cpu_id: usize, f: CpuFeatures) {
-    crate::kdebug!(arch, |_g| {
+fn log_snapshot(_cpu_id: usize, _f: CpuFeatures) {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[CPUID] CPU");
-        _g.dec(cpu_id as u64);
+        _g.dec(_cpu_id as u64);
         _g.puts(" SSE=");
-        _g.dec(has_bit(f.bits, FEAT_SSE) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_SSE) as u64);
         _g.puts(" SSE2=");
-        _g.dec(has_bit(f.bits, FEAT_SSE2) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_SSE2) as u64);
         _g.puts(" FXSR=");
-        _g.dec(has_bit(f.bits, FEAT_FXSR) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_FXSR) as u64);
         _g.puts(" XSAVE=");
-        _g.dec(has_bit(f.bits, FEAT_XSAVE) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_XSAVE) as u64);
         _g.puts(" INV_TSC=");
-        _g.dec(has_bit(f.bits, FEAT_INVARIANT_TSC) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_INVARIANT_TSC) as u64);
         _g.puts(" SMEP=");
-        _g.dec(has_bit(f.bits, FEAT_SMEP) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_SMEP) as u64);
         _g.puts(" SMAP=");
-        _g.dec(has_bit(f.bits, FEAT_SMAP) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_SMAP) as u64);
         _g.puts(" RDRAND=");
-        _g.dec(has_bit(f.bits, FEAT_RDRAND) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_RDRAND) as u64);
         _g.puts(" RDSEED=");
-        _g.dec(has_bit(f.bits, FEAT_RDSEED) as u64);
+        _g.dec(has_bit(_f.bits, FEAT_RDSEED) as u64);
         _g.puts(" area_size=");
-        _g.dec(f.xsave_area_size as u64);
+        _g.dec(_f.xsave_area_size as u64);
         _g.putc(b'\n');
     });
 }
 
-fn log_global_downgrade(cpu_id: usize, old_bits: u32, new_bits: u32) {
+fn log_global_downgrade(_cpu_id: usize, old_bits: u32, new_bits: u32) {
     let dropped = old_bits & !new_bits;
     if dropped == 0 {
         return;
     }
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[CPUID] Global feature downgrade by CPU");
-        _g.dec(cpu_id as u64);
+        _g.dec(_cpu_id as u64);
         _g.puts(":");
         if has_bit(dropped, FEAT_SSE) {
             _g.puts(" SSE");
@@ -249,7 +239,7 @@ fn validate_required_features(cpu_id: usize, bits: u32) {
         return;
     }
 
-    crate::kerror!(|_g| {
+    crate::kernel::printk::kerror!(|_g| {
         _g.puts("*** FATAL: CPU");
         _g.dec(cpu_id as u64);
         _g.puts(" missing required CPUID feature(s):");

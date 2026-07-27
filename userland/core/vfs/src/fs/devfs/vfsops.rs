@@ -1,149 +1,175 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! devfs `VfsOps` — mount, unmount, root, vget, statfs, sync.
+//
+//! devfs `VfsOps`. Mount allocates a `DevfsMountData` page, seeds
+//! the root directory plus all entries from `DEVFS_REGISTRATIONS`,
+//! and adds the synthetic `pts/` directory. Subsequent PTY slave
+//! lookups extend the parallel arrays at runtime.
 
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::VStatfs;
-use crate::vfs_core::mount::Mount;
-use crate::vfs_core::mount_ctl;
-use crate::vfs_core::vfs::VfsOps;
-use crate::vfs_core::vnode::{VnodeHandle, VN_ROOT, VT_CHR, VT_DIR};
+use crate::arena::handle::Handle;
+use crate::core::error::VfsError;
+use crate::core::file::VStatfs;
+use crate::core::identity::{BackendNodeId, VnodeKey};
+use crate::core::vnode::{VN_ROOT, VnodeHandle, VnodeKind};
+use crate::core::vop_context::OwnerMountCtx;
 
 use super::{
-    alloc_vdata, record_vnode, DevKind, DevfsMountData, DEVFS_REGISTRATIONS,
-    MAX_DEVFS_VNODES,
+    DEVFS_REGISTRATIONS, DevKind, DevfsMountData, MAX_DEVFS_VNODES, alloc_vdata, record_vnode,
 };
 
-// =========================================================================
-// VfsOps function implementations
-// =========================================================================
-
-/// Mount a new devfs instance.
-///
-/// Allocates `DevfsMountData`, populates the root directory vnode and one
-/// vnode per static registration entry, plus the synthetic `pts/` directory.
-/// All vnodes are allocated from the global arena via trampolines.
-///
-/// # Safety
-///
-/// `mp` must be a valid, freshly-allocated `Mount` slot. Arena trampolines
-/// must be active.
-unsafe fn devfs_mount(
-    mp: *mut Mount,
-    _source: u64,
-    _opts_ptr: *const u8,
-    _opts_len: u8,
-) -> VfsResult<()> {
+pub(crate) unsafe fn devfs_mount(ctx: &mut OwnerMountCtx<'_>) -> Result<VnodeHandle, VfsError> {
     unsafe {
-        let bytes = core::mem::size_of::<DevfsMountData>();
+        let bytes = ::core::mem::size_of::<DevfsMountData>();
         let pages = (bytes + 4095) / 4096;
         let ptr = crate::server::mem::map_anon((pages * 4096) as u64);
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return Err(VfsError::NoSpace);
+            return Err(VfsError::NoMem);
         }
-        core::ptr::write_bytes(ptr, 0, pages * 4096);
-        (*mp).data = ptr;
+        ::core::ptr::write_bytes(ptr, 0, pages * 4096);
+        (*ctx.mount).data = ptr;
 
-        let mount_handle = (*mp).id as u32;
+        let mount_handle = ctx.mount_handle;
+        let fs_instance_id = (*ctx.mount).fs_instance_id;
 
-        // id 0: root directory vnode.
-        let (root_vh, root_vp) = mount_ctl::trampoline_alloc_vnode()
-            .ok_or(VfsError::NoSpace)?;
-        let mount_handle_h = mount_ctl::trampoline_mount_handle_from_slot((*mp).id as u32)
-            .ok_or(VfsError::Io)?;
-        (*root_vp).vtype = VT_DIR;
-        (*root_vp).id = 0;
+        // id 0: root directory.
+        let (root_vh, root_vp) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        (*root_vp).kind = VnodeKind::Directory;
+        (*root_vp).key = VnodeKey {
+            fs_instance_id,
+            backend_id: BackendNodeId::new(0, 0),
+        };
+        (*root_vp).backend_seq = 0;
         (*root_vp).flags |= VN_ROOT;
-        // Root has nlink = 2 (self + ".") by convention; "pts" subdir adds +1.
         (*root_vp).nlink = 3;
-        (*root_vp).mount = mount_handle_h;
+        (*root_vp).mount = mount_handle;
+        (*root_vp).fs_instance_id = fs_instance_id;
         (*root_vp).ops = &raw const super::DEVFS_VOPS;
 
-        let vd = alloc_vdata(ptr);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = alloc_vdata(ptr);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
-        (*vd).kind = DevKind::Console; // Root reuses Console kind slot; kind unused for dirs.
-        (*vd).sub_id = 0;
-        (*vd).mode = 0o040755;
-        (*root_vp).data = vd as *mut u8;
+        // Root carries a placeholder `Console` kind — the
+        // `is_root` discriminator is the directory's mode bits;
+        // dispatch never matches the root against the device
+        // routing table.
+        (*vdata).kind = DevKind::Console;
+        (*vdata).sub_id = 0;
+        (*vdata).mode = 0o040755;
+        (*vdata).generation = 0;
+        (*root_vp).data = vdata as *mut u8;
+        // devfs nodes are mount-lifetime singletons: pin them so the
+        // reclaim sweep never frees a cached vnode out from under
+        // vnode_handles[]. devfs_lookup / devfs_vget hand those cached
+        // handles back without a liveness check, so an unpinned devfs
+        // vnode that hits open_refcount==0 gets reclaimed and the cache
+        // is left dangling (breaks the next open of e.g. /dev/console).
+        (*root_vp).pin();
         record_vnode(ptr, root_vh, 0);
 
-        (*mp).root_vnode = root_vh;
-
-        // Populate one vnode per static device entry.
         let mut id: u64 = 1;
         for reg in DEVFS_REGISTRATIONS {
-            let (vh, vp) = mount_ctl::trampoline_alloc_vnode()
-                .ok_or(VfsError::NoSpace)?;
-            (*vp).vtype = VT_CHR;
-            (*vp).id = id;
-            (*vp).nlink = 1;
-            (*vp).mount = mount_handle_h;
-            (*vp).ops = &raw const super::DEVFS_VOPS;
+            let (vnode_h, vnode_ptr) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+            (*vnode_ptr).kind = VnodeKind::CharDev;
+            (*vnode_ptr).key = VnodeKey {
+                fs_instance_id,
+                backend_id: BackendNodeId::new(id, 0),
+            };
+            (*vnode_ptr).backend_seq = 0;
+            (*vnode_ptr).nlink = 1;
+            (*vnode_ptr).mount = mount_handle;
+            (*vnode_ptr).fs_instance_id = fs_instance_id;
+            (*vnode_ptr).ops = &raw const super::DEVFS_VOPS;
 
-            let vd = alloc_vdata(ptr);
-            if vd.is_null() {
-                return Err(VfsError::NoSpace);
+            let vdata = alloc_vdata(ptr);
+            if vdata.is_null() {
+                return Err(VfsError::NoMem);
             }
-            (*vd).kind = reg.kind;
-            (*vd).sub_id = 0;
-            (*vd).mode = reg.mode;
-            (*vp).data = vd as *mut u8;
-            record_vnode(ptr, vh, id);
+            (*vdata).kind = reg.kind;
+            (*vdata).sub_id = 0;
+            (*vdata).mode = reg.mode;
+            (*vdata).generation = 0;
+            (*vnode_ptr).data = vdata as *mut u8;
+            (*vnode_ptr).pin(); // singleton device node — see root pin above
+            record_vnode(ptr, vnode_h, id);
 
             id += 1;
         }
 
-        // Synthetic `pts/` directory vnode.
-        let (pts_vh, pts_vp) = mount_ctl::trampoline_alloc_vnode()
-            .ok_or(VfsError::NoSpace)?;
-        (*pts_vp).vtype = VT_DIR;
-        (*pts_vp).id = id;
+        // Synthetic /dev/pts directory.
+        let (pts_vh, pts_vp) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        (*pts_vp).kind = VnodeKind::Directory;
+        (*pts_vp).key = VnodeKey {
+            fs_instance_id,
+            backend_id: BackendNodeId::new(id, 0),
+        };
+        (*pts_vp).backend_seq = 0;
         (*pts_vp).nlink = 2;
-        (*pts_vp).mount = mount_handle_h;
+        (*pts_vp).mount = mount_handle;
+        (*pts_vp).fs_instance_id = fs_instance_id;
         (*pts_vp).ops = &raw const super::DEVFS_VOPS;
 
-        let vd = alloc_vdata(ptr);
-        if vd.is_null() {
-            return Err(VfsError::NoSpace);
+        let vdata = alloc_vdata(ptr);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
         }
-        (*vd).kind = DevKind::PtsDir;
-        (*vd).sub_id = 0;
-        (*vd).mode = 0o040755;
-        (*pts_vp).data = vd as *mut u8;
+        (*vdata).kind = DevKind::PtsDir;
+        (*vdata).sub_id = 0;
+        (*vdata).mode = 0o040755;
+        (*vdata).generation = 0;
+        (*pts_vp).data = vdata as *mut u8;
+        (*pts_vp).pin(); // singleton device node — see root pin above
         record_vnode(ptr, pts_vh, id);
 
-        Ok(())
+        // PTY 0 is the console PTY, activated by posix_ttysrv at
+        // boot and never torn down. Seed `/dev/pts/0` so callers
+        // that receive pty id 0 can resolve the slave side through
+        // normal VFS namei rather than a side-channel.
+        id += 1;
+        let (pty0_vh, pty0_vp) = ctx.alloc_vnode().ok_or(VfsError::NoMem)?;
+        (*pty0_vp).kind = VnodeKind::CharDev;
+        (*pty0_vp).key = VnodeKey {
+            fs_instance_id,
+            backend_id: BackendNodeId::new(id, 0),
+        };
+        (*pty0_vp).backend_seq = 0;
+        (*pty0_vp).nlink = 1;
+        (*pty0_vp).mount = mount_handle;
+        (*pty0_vp).fs_instance_id = fs_instance_id;
+        (*pty0_vp).ops = &raw const super::DEVFS_VOPS;
+
+        let vdata = alloc_vdata(ptr);
+        if vdata.is_null() {
+            return Err(VfsError::NoMem);
+        }
+        (*vdata).kind = DevKind::PtySlave;
+        (*vdata).sub_id = 0;
+        (*vdata).mode = 0o020620;
+        (*vdata).generation = 0;
+        (*pty0_vp).data = vdata as *mut u8;
+        (*pty0_vp).pin(); // singleton device node — see root pin above
+        record_vnode(ptr, pty0_vh, id);
+
+        Ok(root_vh)
     }
 }
 
-/// Unmount devfs. Releases mount-private data.
-///
-/// # Safety
-///
-/// `mp` must be a valid pointer to an active devfs mount.
-unsafe fn devfs_unmount(mp: *mut Mount, _force: bool) -> VfsResult<()> {
+pub(crate) unsafe fn devfs_unmount(ctx: &mut OwnerMountCtx<'_>) -> Result<(), VfsError> {
     unsafe {
-        let data = (*mp).data;
+        let data = (*ctx.mount).data;
         if !data.is_null() {
-            let bytes = core::mem::size_of::<DevfsMountData>();
+            let bytes = ::core::mem::size_of::<DevfsMountData>();
             let pages = (bytes + 4095) / 4096;
             crate::server::mem::unmap(data, (pages * 4096) as u64);
-            (*mp).data = core::ptr::null_mut();
+            (*ctx.mount).data = ::core::ptr::null_mut();
         }
-        (*mp).root_vnode = VnodeHandle::INVALID;
+        (*ctx.mount).root = Handle::INVALID;
         Ok(())
     }
 }
 
-/// Return the root vnode handle.
-///
-/// # Safety
-///
-/// `mp` must be a valid pointer to an active devfs mount.
-unsafe fn devfs_root(mp: *mut Mount) -> VfsResult<VnodeHandle> {
+pub(crate) unsafe fn devfs_root(ctx: &mut OwnerMountCtx<'_>) -> Result<VnodeHandle, VfsError> {
     unsafe {
-        let root = (*mp).root_vnode;
+        let root = (*ctx.mount).root;
         if !root.is_valid() {
             return Err(VfsError::Io);
         }
@@ -151,58 +177,43 @@ unsafe fn devfs_root(mp: *mut Mount) -> VfsResult<VnodeHandle> {
     }
 }
 
-/// Look up a vnode by its backend-specific id.
-///
-/// Searches the parallel arrays for a matching id.
-///
-/// # Safety
-///
-/// `mp` must be a valid pointer to an active devfs mount.
-unsafe fn devfs_vget(mp: *mut Mount, id: u64) -> VfsResult<VnodeHandle> {
+pub(crate) unsafe fn devfs_vget(
+    ctx: &mut OwnerMountCtx<'_>,
+    id: u64,
+) -> Result<VnodeHandle, VfsError> {
     unsafe {
-        let md = (*mp).data as *const DevfsMountData;
+        let md = (*ctx.mount).data as *const DevfsMountData;
         for i in 0..(*md).count {
             if (*md).vnode_ids[i] == id {
                 return Ok((*md).vnode_handles[i]);
             }
         }
-        Err(VfsError::NotFound)
+        Err(VfsError::NoEnt)
     }
 }
 
-/// Fill filesystem statistics for devfs.
-unsafe fn devfs_statfs(mp: *mut Mount, out: *mut VStatfs) -> VfsResult<()> {
+pub(crate) unsafe fn devfs_statfs(
+    ctx: &mut OwnerMountCtx<'_>,
+    out: *mut VStatfs,
+) -> Result<(), VfsError> {
     unsafe {
-        let md = (*mp).data as *const DevfsMountData;
+        let md = (*ctx.mount).data as *const DevfsMountData;
         (*out).bsize = 4096;
+        (*out).frsize = 4096;
         (*out).blocks = 0;
         (*out).bfree = 0;
         (*out).bavail = 0;
         (*out).files = (*md).count as u64;
         (*out).ffree = (MAX_DEVFS_VNODES - (*md).count) as u64;
-        (*out).fs_type = [0; 16];
-        let ft = &mut (*out).fs_type;
-        ft[..5].copy_from_slice(b"devfs");
-        (*out).flags = 0;
-        (*out).name_max = 255;
+        (*out).favail = (*out).ffree;
+        (*out).fsid = (*ctx.mount).fs_instance_id.0;
+        (*out).flag = 0;
+        (*out).namemax = 255;
+        (*out).set_fs_name(b"devfs");
         Ok(())
     }
 }
 
-/// Sync — no-op for devfs (no persistent backing store).
-unsafe fn devfs_sync(_mp: *mut Mount) -> VfsResult<()> {
+pub(crate) unsafe fn devfs_sync(_ctx: &mut OwnerMountCtx<'_>) -> Result<(), VfsError> {
     Ok(())
 }
-
-// =========================================================================
-// Static dispatch table
-// =========================================================================
-
-pub(super) static DEVFS_VFSOPS: VfsOps = VfsOps {
-    mount: devfs_mount,
-    unmount: devfs_unmount,
-    root: devfs_root,
-    vget: devfs_vget,
-    statfs: devfs_statfs,
-    sync: devfs_sync,
-};

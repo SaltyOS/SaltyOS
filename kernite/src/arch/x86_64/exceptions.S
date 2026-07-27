@@ -20,9 +20,13 @@
 .global exception_stub_\vector
 .type exception_stub_\vector, @function
 exception_stub_\vector:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
     push $0                     // dummy error code
     push $\vector               // vector number
     jmp exception_common
+    .cfi_endproc
 .size exception_stub_\vector, . - exception_stub_\vector
 .endm
 
@@ -31,9 +35,13 @@ exception_stub_\vector:
 .global exception_stub_\vector
 .type exception_stub_\vector, @function
 exception_stub_\vector:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
     // error code already on stack from CPU
     push $\vector               // vector number
     jmp exception_common
+    .cfi_endproc
 .size exception_stub_\vector, . - exception_stub_\vector
 .endm
 
@@ -87,7 +95,12 @@ exception_stub_no_error    31   // (reserved)
 //   [RSP+8]  error_code (real or dummy 0)
 //   [RSP+0]  vector number
 
+.type exception_common, @function
 exception_common:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
+
     // Check if exception came from user mode (CS RPL != 0)
     testb $3, 24(%rsp)
     jz 1f
@@ -132,7 +145,11 @@ exception_common:
     // 184 mod 16 = 8, so we need to subtract 8 to align.
     sub $8, %rsp
 
-    // No global lock for exceptions — per-endpoint locks and per-CPU scheduler
+    // Charge the pre-exception window and flip the current continuation into
+    // kernel accounting before running the Rust handler.
+    call sched_runtime_enter_kernel
+
+    // No global lock for exceptions — per-IPC-core locks and per-CPU scheduler
     // locks handle synchronization (Zircon-style per-object locking).
 
     // Pass pointer to ExceptionFrame (above alignment padding)
@@ -166,9 +183,32 @@ exception_common:
     // CS is at RSP+8
     testb $3, 8(%rsp)
     jz 2f
+    // Keep the restored user register image non-preemptible until iretq.
+    cli
+    push %r11
+    push %r10
+    push %r9
+    push %r8
+    push %rdi
+    push %rsi
+    push %rdx
+    push %rcx
+    push %rax
+    call sched_runtime_exit_to_user
+    pop %rax
+    pop %rcx
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r8
+    pop %r9
+    pop %r10
+    pop %r11
     swapgs
 2:
     iretq
+    .cfi_endproc
+.size exception_common, . - exception_common
 
 // ---------------------------------------------------------------------------
 // IRQ stubs: save caller-saved registers, call handler, swapgs as needed
@@ -181,6 +221,10 @@ exception_common:
 .global irq_stub_\name
 .type irq_stub_\name, @function
 irq_stub_\name:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
+
     // Check if from user mode
     testb $3, 8(%rsp)
     jz 1f
@@ -191,7 +235,8 @@ irq_stub_\name:
     pushfq
     andq $~(1 << 18), (%rsp)
     popfq
-    // Save caller-saved registers
+    // Save caller-saved registers — the push order here must match
+    // `InterruptFrame` in `arch/x86_64/idt.rs` (top of stack = first field).
     push %rax
     push %rcx
     push %rdx
@@ -201,6 +246,12 @@ irq_stub_\name:
     push %r9
     push %r10
     push %r11
+    call sched_runtime_enter_kernel
+    // Pass a pointer to the saved `InterruptFrame` as the first argument.
+    // The timer backend still forwards the interrupted-mode hint through
+    // this frame, but runtime attribution itself already happened in the
+    // shared entry hook above.
+    mov %rsp, %rdi
     call irq_handler_\name
     // Restore caller-saved registers
     pop %r11
@@ -215,9 +266,31 @@ irq_stub_\name:
     // Check if returning to user mode
     testb $3, 8(%rsp)
     jz 2f
+    // Keep the restored user register image non-preemptible until iretq.
+    cli
+    push %r11
+    push %r10
+    push %r9
+    push %r8
+    push %rdi
+    push %rsi
+    push %rdx
+    push %rcx
+    push %rax
+    call sched_runtime_exit_to_user
+    pop %rax
+    pop %rcx
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r8
+    pop %r9
+    pop %r10
+    pop %r11
     swapgs
 2:
     iretq
+    .cfi_endproc
 .size irq_stub_\name, . - irq_stub_\name
 .endm
 
@@ -236,6 +309,10 @@ irq_stub_nobkl ipi_tlb_shootdown_all
 .global irq_stub_generic_\vector
 .type irq_stub_generic_\vector, @function
 irq_stub_generic_\vector:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
+
     // Check if from user mode
     testb $3, 8(%rsp)
     jz 1f
@@ -256,6 +333,7 @@ irq_stub_generic_\vector:
     push %r9
     push %r10
     push %r11
+    call sched_runtime_enter_kernel
     // 9 pushes + 5 CPU pushes = 112 bytes, 16-byte aligned
     // No global lock — IRQ handlers use per-object locks internally
     // Pass vector number as argument
@@ -274,9 +352,31 @@ irq_stub_generic_\vector:
     // Check if returning to user mode
     testb $3, 8(%rsp)
     jz 2f
+    // Keep the restored user register image non-preemptible until iretq.
+    cli
+    push %r11
+    push %r10
+    push %r9
+    push %r8
+    push %rdi
+    push %rsi
+    push %rdx
+    push %rcx
+    push %rax
+    call sched_runtime_exit_to_user
+    pop %rax
+    pop %rcx
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r8
+    pop %r9
+    pop %r10
+    pop %r11
     swapgs
 2:
     iretq
+    .cfi_endproc
 .size irq_stub_generic_\vector, . - irq_stub_generic_\vector
 .endm
 

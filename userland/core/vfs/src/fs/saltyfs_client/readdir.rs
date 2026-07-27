@@ -1,130 +1,92 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! SaltyFS readdir — SHM-based streaming with batch caching.
+//
+//! SHM-batch readdir helpers shared between the saltyfs vop
+//! layer (issue side) and the completion router (parse side).
 //!
-//! The SaltyFS server streams readdir entries into VFS SHM as fixed-size
-//! 96-byte records via `handle_readdir`. This module issues the IPC call,
-//! parses the SHM entries, and emits them through the `ReaddirEmit` callback.
+//! SaltyFS encodes one readdir entry as 96 bytes laid out as:
+//!
+//! | offset | bytes | field            |
+//! |-------:|------:|------------------|
+//! |      0 |     8 | u64 ino          |
+//! |      8 |    16 | reserved         |
+//! |     24 |     8 | reserved         |
+//! |     32 |     4 | u32 mode         |
+//! |     36 |    12 | reserved         |
+//! |     48 |     1 | u8 d_type (raw)  |
+//! |     49 |     1 | u8 name_len      |
+//! |     50 |     2 | reserved         |
+//! |     52 |    44 | name bytes (utf8 |
+//! |        |       |   no NUL pad)    |
+//!
+//! Layout is fixed per saltyfs ABI; do not refactor without
+//! bumping the ABI tag the daemon negotiates at
+//! `BACKEND_OPEN_SESSION`. The completion router copies
+//! `bytes_written` bytes out of the SHM ring before releasing
+//! credit; the daemon's drain hook must honour the same offset
+//! / length contract.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::ipc;
-use trona::protocol::*;
-use trona::types::core::*;
+use crate::core::vnode::{VT_DIR, VT_LNK, VT_REG};
 
-use crate::personality::posix::consts::*;
-use crate::server::consts::*;
-use crate::vfs_core::error::{VfsError, VfsResult};
-use crate::vfs_core::file::VAttr;
-use crate::vfs_core::vop::ReaddirEmit;
+const SALTYFS_DIR_TYPE_REG: u8 = 1;
+const SALTYFS_DIR_TYPE_DIR: u8 = 4;
+const SALTYFS_DIR_TYPE_LNK: u8 = 7;
 
-use super::rpc::ipc_ctx;
-use super::types::SaltyfsMountData;
+/// Maximum readdir entry name length the saltyfs ABI allows.
+pub(crate) const READDIR_NAME_MAX: usize = 44;
 
-/// Size of one readdir entry in the SHM stream.
-const READDIR_ENTRY_BYTES: usize = 96;
+/// Bytes per readdir entry in the SHM ring layout described
+/// above.
+pub(crate) const READDIR_ENTRY_BYTES: usize = 96;
 
-/// Maximum name length within a readdir entry.
-const READDIR_NAME_MAX: usize = 44;
-
-/// Perform a SHM-based readdir against the remote SaltyFS.
-///
-/// `cookie` is an opaque cursor (0 to start). On return, `*cookie` is updated
-/// to the next cursor value (0 = EOF).
-///
-/// Requires SHM transport to be active.
-pub(super) unsafe fn saltyfs_readdir_shm(
-    md: *mut SaltyfsMountData,
-    dir_ino: u64,
-    cookie: *mut u64,
-    emit: ReaddirEmit<'_>,
-) -> VfsResult<()> {
-    unsafe {
-        let start_cookie = *cookie;
-        if !(*md).shm_active {
-            return Err(VfsError::NotSupported);
-        }
-
-        let shm_vaddr = (*md).shm_vaddr;
-        let shm_size = (*md).shm_size;
-        if shm_size == 0 {
-            return Err(VfsError::NotSupported);
-        }
-
-        let shm_offset: u64 = 0;
-        let buf_bytes = shm_size;
-
-        let mut req = TronaMsg::zeroed();
-        req.label = SALTYFS_READDIR;
-        req.regs[0] = dir_ino;
-        req.regs[1] = *cookie;
-        req.regs[2] = shm_offset;
-        req.regs[3] = buf_bytes;
-        req.length = 4;
-
-        let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), (*md).fs_cap, &raw const req, &raw mut reply);
-
-        if err != 0 {
-            return Err(VfsError::Io);
-        }
-
-        if reply.label != TRONA_OK {
-            return Err(VfsError::Io);
-        }
-
-        let next_cursor = reply.regs[0];
-        let entries_written = reply.regs[1] as usize;
-        let _bytes_written = reply.regs[2] as usize;
-
-        if entries_written == 0 {
-            *cookie = 0;
-            return Ok(());
-        }
-
-        let base = (shm_vaddr + shm_offset) as *const u8;
-        let attr = VAttr::zeroed();
-
-        for i in 0..entries_written {
-            let entry_ptr = base.add(i * READDIR_ENTRY_BYTES);
-
-            let ino = core::ptr::read_unaligned(entry_ptr as *const u64);
-            let mode = core::ptr::read_unaligned(entry_ptr.add(32) as *const u32);
-            let dir_type = *entry_ptr.add(48);
-            let mut name_len = *entry_ptr.add(49) as usize;
-            if name_len > READDIR_NAME_MAX {
-                name_len = READDIR_NAME_MAX;
-            }
-            let name_ptr = entry_ptr.add(52);
-
-            if name_len == 0 {
-                continue;
-            }
-
-            let d_type = if dir_type != 0 {
-                dir_type
-            } else {
-                mode_to_dtype(mode)
-            };
-
-            if !emit(ino, name_ptr, name_len as u8, d_type, &attr) {
-                *cookie = start_cookie + i as u64 + 1;
-                return Ok(());
-            }
-        }
-
-        *cookie = next_cursor;
-        Ok(())
+/// Translate a POSIX `mode` into a `d_type` byte for callers
+/// whose backend left the `d_type` slot zero. Falls back to
+/// regular-file when the type bits do not match a known
+/// catalogue entry — this matches glibc's `getdents` behaviour
+/// for filesystems that don't carry per-entry type bytes
+/// (FAT family).
+#[inline]
+pub(crate) fn mode_to_dtype(mode: u32) -> u8 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFLNK: u32 = 0o120000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
+    match mode & S_IFMT {
+        S_IFREG => 8,
+        S_IFDIR => 4,
+        S_IFLNK => 10,
+        S_IFCHR => 2,
+        S_IFBLK => 6,
+        S_IFIFO => 1,
+        S_IFSOCK => 12,
+        _ => 8,
     }
 }
 
-/// Map POSIX mode bits to d_type for readdir.
+/// Translate the saltyfs ABI's `d_type` byte to a `VnodeKind`-
+/// compatible byte. Used by `alloc_saltyfs_vnode_via_state` when
+/// the backend provided a non-zero `d_type` and the cache wants
+/// to skip the mode-bit derivation.
 #[inline]
-fn mode_to_dtype(mode: u32) -> u8 {
-    match mode & S_IFMT_L {
-        S_IFDIR_L => 4,  // DT_DIR
-        S_IFREG_L => 8,  // DT_REG
-        S_IFLNK_L => 10, // DT_LNK
-        S_IFCHR_L => 2,  // DT_CHR
-        _ => 0,          // DT_UNKNOWN
+pub(crate) fn dtype_to_vtype(dtype: u8) -> u8 {
+    match dtype {
+        SALTYFS_DIR_TYPE_DIR => VT_DIR,
+        SALTYFS_DIR_TYPE_LNK | 10 => VT_LNK,
+        _ => VT_REG,
+    }
+}
+
+/// Translate SaltyFS's compact on-disk dir_type encoding to the
+/// POSIX d_type byte the public `getdents` reply exposes.
+#[inline]
+pub(crate) fn dir_type_to_dtype(dir_type: u8, mode: u32) -> u8 {
+    match dir_type {
+        SALTYFS_DIR_TYPE_REG => 8,
+        SALTYFS_DIR_TYPE_DIR => 4,
+        SALTYFS_DIR_TYPE_LNK => 10,
+        _ => mode_to_dtype(mode),
     }
 }

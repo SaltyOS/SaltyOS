@@ -11,7 +11,8 @@
 //! - Offset 4: padding
 //! - Offset 8: kernel_stack (u64)
 //! - Offset 16: saved_rsp (u64) — scratch only, NOT used for return
-//! - Offset 40: stack_canary (u64) — per-CPU canary for stack overflow detection
+//! - Offset 24: invoke_seq (u64) — per-CPU monotonic invoke counter
+//! - Offset 32: stack_canary (u64) — per-CPU canary for stack overflow detection
 //!
 //! CRITICAL: The user RSP is saved on the per-thread kernel stack, NOT in
 //! per-CPU data. This ensures it survives context switches when another
@@ -24,6 +25,10 @@
 .type syscall_entry, @function
 
 syscall_entry:
+    .cfi_startproc
+    .cfi_def_cfa %rsp, 0
+    .cfi_undefined %rip
+
     # Swap GS to access per-CPU data (GS points to PerCpuData)
     swapgs
 
@@ -59,26 +64,89 @@ syscall_entry:
     push %rax  # Original Syscall Number
 
     # 16 pushes (user_rsp + 15 GPRs) = 128 bytes = 16-byte aligned!
+    call sched_runtime_enter_kernel
+    # Restore the user-visible caller-saved registers the fastpath dispatch
+    # still needs in-register. The hook only consumed the saved stack image.
+    mov 0(%rsp), %rax
+    mov 24(%rsp), %rdx
+    mov 32(%rsp), %rsi
+    mov 40(%rsp), %rdi
+    mov 56(%rsp), %r8
+    mov 64(%rsp), %r9
+    mov 72(%rsp), %r10
 
     # No lock acquired here — each Rust handler acquires the lock(s) it needs.
 
     # --------------------------------------------------------------------------
     # IPC Fastpath Dispatch
     # --------------------------------------------------------------------------
-    # At this point, all GPRs still hold their original user-space values
-    # (push copies to stack but does not modify the register).
+    # Hand the syscall to `kernite_try_sys_invoke_fastpath` (Rust). On
+    # success it stamps `(error, value)` into a stack-allocated
+    # `SyscallResult` and returns 1; otherwise it returns 0 and we
+    # fall through to the slowpath. The helper sees the same User
+    # ABI tuple the slowpath does, after we marshal it through System V.
     #
-    # Check for Call (2), ReplyRecv (3), or ReplyRecvAny (24) — the
-    # client-server hot path.
-    # Fastpath functions use System V ABI:
-    #   RDI=cap_ptr  RSI=msg_info  RDX=mr0  RCX=mr1  R8=mr2  R9=mr3
-    # Only R10→RCX needs remapping.
-    cmp $2, %rax
-    je .Lfastpath_call
-    cmp $3, %rax
-    je .Lfastpath_reply_recv
-    cmp $24, %rax
-    je .Lfastpath_reply_recv_any
+    # Register state at this label (User ABI, restored by the entry
+    # hook above): rax=syscall, rdi=arg0, rsi=arg1, rdx=arg2,
+    # r10=arg3, r8=arg4, r9=arg5.
+    #
+    # System V layout for the fastpath helper:
+    #   rdi  arg0 = rax (syscall)
+    #   rsi  arg1 = rdi (cap_ptr)
+    #   rdx  arg2 = rsi (label)
+    #   rcx  arg3 = rdx (arg0)
+    #   r8   arg4 = r10 (arg1)
+    #   r9   arg5 = r8  (arg2)
+    #   [rsp+0]  arg6 = r9  (arg3)
+    #   [rsp+8]  arg7 = &out
+    # The 16 bytes above the helper-arg slots host the
+    # `SyscallResult` out-buffer.
+
+    sub $32, %rsp
+    # Save user_r9 (arg3) BEFORE we clobber r9 in the System V remap.
+    mov %r9, 0(%rsp)
+
+    mov %r8,  %r9                # r9  = user_r8  (arg2)
+    mov %r10, %r8                # r8  = user_r10 (arg1)
+    mov %rdx, %rcx               # rcx = user_rdx (arg0)
+    mov %rsi, %rdx               # rdx = user_rsi (label)
+    mov %rdi, %rsi               # rsi = user_rdi (cap_ptr)
+    mov %rax, %rdi               # rdi = syscall
+
+    lea 16(%rsp), %r10           # r10 = &out (SyscallResult slot)
+    mov %r10, 8(%rsp)            # arg7 = out pointer
+
+    call kernite_try_sys_invoke_fastpath
+
+    test %rax, %rax
+    jz .Lfastpath_miss
+
+    # Handled — stamp the return frame's saved rax/rdx slots and jump
+    # to the shared return path. The saved-state image lives at
+    # [rsp+32 .. rsp+32+128] after our 32-byte allocation, so the
+    # original `[rsp+0]` (saved rax) is now at `[rsp+32]` and the
+    # original `[rsp+24]` (saved rdx) is now at `[rsp+56]`.
+    mov 16(%rsp), %rax           # error  = SyscallResult.error
+    mov 24(%rsp), %rdx           # value  = SyscallResult.value
+    mov %rax, 32(%rsp)           # saved-rax slot
+    mov %rdx, 56(%rsp)           # saved-rdx slot
+    add $32, %rsp                # undo fastpath frame
+    jmp .Lreturn
+
+.Lfastpath_miss:
+    add $32, %rsp                # undo fastpath frame
+    # The helper clobbered every System V volatile register; refresh
+    # the User ABI snapshot from the saved-state image (the same
+    # restore the entry hook performs at line 66) so the slowpath
+    # sees pristine input.
+    mov 0(%rsp), %rax
+    mov 24(%rsp), %rdx
+    mov 32(%rsp), %rsi
+    mov 40(%rsp), %rdi
+    mov 56(%rsp), %r8
+    mov 64(%rsp), %r9
+    mov 72(%rsp), %r10
+    # Fall through.
 
 .Lslowpath:
     # --------------------------------------------------------------------------
@@ -109,14 +177,14 @@ syscall_entry:
     sub  $16, %rsp
     mov  80(%rsp), %r10
     mov  %r10, (%rsp)
-    mov  %gs:40, %r10
+    mov  %gs:32, %r10
     mov  %r10, 8(%rsp)
 
     call syscall_handle_rust
 
     # Verify stack canary before returning to userspace
     mov  8(%rsp), %r10
-    cmp  %r10, %gs:40
+    cmp  %r10, %gs:32
     jne  .Lstack_corrupt
 
     add  $16, %rsp
@@ -132,6 +200,9 @@ syscall_entry:
 
 .Lreturn:
     # No lock to release — Rust handlers release their own locks.
+    # Handlers restore the caller's IRQ state before returning here. Keep the
+    # unpacked return frame non-preemptible until sysretq installs user RFLAGS.
+    cli
 
     # --------------------------------------------------------------------------
     # Context Restoration
@@ -152,6 +223,28 @@ syscall_entry:
     pop %r14
     pop %r15
 
+    # Charge the final kernel window as system time and flip to user mode as
+    # late as we can while preserving the restored user register image.
+    push %r11
+    push %r10
+    push %r9
+    push %r8
+    push %rdi
+    push %rsi
+    push %rdx
+    push %rcx
+    push %rax
+    call sched_runtime_exit_to_user
+    pop %rax
+    pop %rcx
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r8
+    pop %r9
+    pop %r10
+    pop %r11
+
     # Restore user RSP from kernel stack (per-thread, NOT from %gs:16!)
     pop %rsp
 
@@ -161,87 +254,13 @@ syscall_entry:
     sysretq
 
     # --------------------------------------------------------------------------
-    # Fastpath: Call (syscall 2)
-    # --------------------------------------------------------------------------
-    # Register state: RDI=cap_ptr RSI=msg_info RDX=mr0 R10=mr1 R8=mr2 R9=mr3
-    # Remap R10 → RCX for System V, then call fastpath_call_rust.
-    # Returns FastpathResult { status: u64, value: u64 } in RAX:RDX.
-    # If status == 0, fall through to slowpath (all regs still on stack).
-.Lfastpath_call:
-    mov %r10, %rcx
-    call fastpath_call_rust
-    test %rax, %rax
-    jz .Lfastpath_call_bail
-    # Fastpath succeeded: write return values to stack slots
-    movq $0, 0(%rsp)           # saved RAX = 0 (no error)
-    mov %rdx, 24(%rsp)         # saved RDX = return value
-    jmp .Lreturn
-
-.Lfastpath_call_bail:
-    # Restore original register values from stack for slowpath.
-    # The fastpath Rust function follows C ABI and preserves callee-saved
-    # regs (rbx, rbp, r12-r15), but may have clobbered caller-saved regs
-    # (rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11).
-    # Reload from stack: [0]=rax [8]=rbx [16]=rcx [24]=rdx [32]=rsi
-    # [40]=rdi [48]=rbp [56]=r8 [64]=r9 [72]=r10 [80]=r11
-    mov 0(%rsp), %rax
-    mov 24(%rsp), %rdx
-    mov 32(%rsp), %rsi
-    mov 40(%rsp), %rdi
-    mov 56(%rsp), %r8
-    mov 64(%rsp), %r9
-    mov 72(%rsp), %r10
-    jmp .Lslowpath
-
-    # --------------------------------------------------------------------------
-    # Fastpath: ReplyRecv (syscall 3)
-    # --------------------------------------------------------------------------
-.Lfastpath_reply_recv:
-    mov %r10, %rcx
-    call fastpath_reply_recv_rust
-    test %rax, %rax
-    jz .Lfastpath_reply_recv_bail
-    # Fastpath succeeded
-    movq $0, 0(%rsp)           # saved RAX = 0 (no error)
-    mov %rdx, 24(%rsp)         # saved RDX = badge
-    jmp .Lreturn
-
-.Lfastpath_reply_recv_bail:
-    # Restore clobbered registers for slowpath
-    mov 0(%rsp), %rax
-    mov 24(%rsp), %rdx
-    mov 32(%rsp), %rsi
-    mov 40(%rsp), %rdi
-    mov 56(%rsp), %r8
-    mov 64(%rsp), %r9
-    mov 72(%rsp), %r10
-    jmp .Lslowpath
-
-.Lfastpath_reply_recv_any:
-    mov %r10, %rcx
-    call fastpath_reply_recv_any_rust
-    test %rax, %rax
-    jz .Lfastpath_reply_recv_any_bail
-    movq $0, 0(%rsp)
-    mov %rdx, 24(%rsp)
-    jmp .Lreturn
-
-.Lfastpath_reply_recv_any_bail:
-    mov 0(%rsp), %rax
-    mov 24(%rsp), %rdx
-    mov 32(%rsp), %rsi
-    mov 40(%rsp), %rdi
-    mov 56(%rsp), %r8
-    mov 64(%rsp), %r9
-    mov 72(%rsp), %r10
-    jmp .Lslowpath
-
-    # --------------------------------------------------------------------------
     # Stack Canary Corruption Handler
     # --------------------------------------------------------------------------
 .Lstack_corrupt:
     lea  stack_canary_msg(%rip), %rdi
     call kernel_panic
+    .cfi_endproc
+.size syscall_entry, . - syscall_entry
 
 .section .rodata
 stack_canary_msg:

@@ -1,0 +1,26 @@
+Guard LinuxProcessTable's raw capget syscall behind SYS_capget.
+
+SaltyOS reuses htop's Linux process-table backend because its procfs is a
+Linux-format projection, but basaltc intentionally does not expose Linux raw
+syscall numbers or the syscall(2) variadic ABI.  If the target libc does not
+provide SYS_capget, treat the optional elevated-privilege marker as absent.
+--- a/linux/LinuxProcessTable.c
++++ b/linux/LinuxProcessTable.c
+@@ -1817,6 +1817,7 @@ static bool LinuxProcessTable_recurseProcTree(ProcessTable* pt, openat_arg_t pro
+ 
+       /* Gather permitted capabilities (thread-specific data) for non-root process. */
+       if (proc->st_uid != 0 && proc->elevated_priv != TRI_OFF) {
++#ifdef SYS_capget
+          struct __user_cap_header_struct header = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = Process_getPid(proc) };
+          struct __user_cap_data_struct data;
+ 
+@@ -1826,6 +1827,9 @@ static bool LinuxProcessTable_recurseProcTree(ProcessTable* pt, openat_arg_t pro
+          } else {
+             proc->elevated_priv = TRI_OFF;
+          }
++#else
++         proc->elevated_priv = TRI_OFF;
++#endif
+       }
+ 
+       if (ss->flags & PROCESS_FLAG_LINUX_CGROUP)

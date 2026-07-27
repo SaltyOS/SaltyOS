@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O request handlers and dispatch logic.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_protocol::common::{
+    TRONA_BAD_ADDRESS, TRONA_BUSY, TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION,
+    TRONA_OUT_OF_MEMORY, TRONA_OUT_OF_RANGE,
+};
 
 use crate::virtio::*;
-use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};
-use crate::{QUEUE_SIZE, AVAIL_IDX, LAST_USED_IDX, QUEUE_AVAIL_OFF, QUEUE_USED_OFF};
-use crate::{SHM_VADDR, SHM_SIZE, SECTOR_SIZE, BLK_SHM_ID};
+use crate::{AVAIL_IDX, LAST_USED_IDX, QUEUE_AVAIL_OFF, QUEUE_SIZE, QUEUE_USED_OFF};
+use crate::{BLK_SHM_IDX, SECTOR_SIZE, SHM_SIZE, SHM_VADDR};
+use crate::{CAPACITY_SECTORS, USING_MODERN_TRANSPORT, VIRTIO_INITIALIZED, VQUEUE_BASE};
 
 /// Read ISR status (transport-aware).
 fn read_isr() -> u8 {
@@ -154,7 +156,9 @@ pub(crate) fn handle_read(msg: &TronaMsg) -> TronaMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                trona::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio read timeout\n"); });
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[blkdrv] virtio read timeout\n");
+                });
                 let _ = read_isr();
                 reply.label = TRONA_BUSY;
                 return reply;
@@ -172,7 +176,7 @@ pub(crate) fn handle_read(msg: &TronaMsg) -> TronaMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[blkdrv] read error status=");
                 _lb.dec(status as u64);
                 _lb.putc(b'\n');
@@ -300,7 +304,9 @@ pub(crate) fn handle_write(msg: &TronaMsg) -> TronaMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                trona::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio write timeout\n"); });
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[blkdrv] virtio write timeout\n");
+                });
                 let _ = read_isr();
                 reply.label = TRONA_BUSY;
                 return reply;
@@ -316,7 +322,7 @@ pub(crate) fn handle_write(msg: &TronaMsg) -> TronaMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[blkdrv] write error status=");
                 _lb.dec(status as u64);
                 _lb.putc(b'\n');
@@ -341,10 +347,18 @@ pub(crate) fn handle_get_info() -> TronaMsg {
     reply
 }
 
-pub(crate) fn handle_get_shm_id() -> TronaMsg {
+pub(crate) fn handle_get_shm_id() -> (
+    TronaMsg,
+    Option<trona_runtime::core::slot_alloc::TransferCap>,
+) {
     let mut reply = TronaMsg::zeroed();
+    let shm_idx = unsafe { *(&raw const BLK_SHM_IDX) };
+    let Some(tc) = crate::stage_shm_cap_for_reply() else {
+        reply.label = TRONA_OUT_OF_MEMORY;
+        return (reply, None);
+    };
     reply.label = 0;
     reply.length = 1;
-    reply.regs[0] = BLK_SHM_ID;
-    reply
+    reply.regs[0] = shm_idx;
+    (reply, Some(tc))
 }

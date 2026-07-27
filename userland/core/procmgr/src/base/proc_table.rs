@@ -2,22 +2,50 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::layout::VmLayoutPlan;
-use trona::types::core::Cap;
+use trona_kernel::core_types::Cap;
+use trona_runtime::spawn::layout::VmLayoutPlan;
 
-use crate::base::child_layout::ChildCapLayout;
 use crate::personality::PersonalityKind;
+use trona_runtime::spawn::layout::ChildCapLayout;
 
 // ---- Process states ----
+//
+// Free → Spawning → Running ┬─► (Exiting transient) ─► Zombie ─► Reaped ─► Free
+//                           │                              ▲
+//                           └─── SIGTERM / core_exit_sequence ────────────┘
+//
+// - `Exiting` is a very short transient state held only while
+//   `core_exit_sequence` is running the parent-visibility work (TCB
+//   suspend, ExitRecord population, SIGCHLD, waiter wake). It flips
+//   to `Zombie` synchronously, without waiting for backend teardown.
+// - `Zombie` means a terminal completion event has been published for
+//   the process and the creator/observer side may consume it. POSIX
+//   `waitpid` is one consumer of that core completion plane.
+//   Backend teardown (mmsrv / rsrcsrv / cspace / VFS) runs
+//   asynchronously via the teardown pump — it may still be in flight.
+// - `Reaped` means the terminal exit completion has been consumed. The live
+//   slot cannot be recycled until the teardown pump marks
+//   `teardown_steps_done == STEP_ALL` (or `teardown_abandoned == true`
+//   after the hard deadline).
+//
+// Invariants preserved across the whole state machine:
+// - SIGCHLD-once: at most one SIGCHLD per process lifetime.
+// - Waitpid-progress: Zombie latency from exit is O(1) syscall,
+//   independent of backend teardown outcome.
+// - Slot-reuse-safety: the `Reaped → Free` recycle transition only
+//   fires from `cleanup_proc_resources` inside the teardown pump (or
+//   `handle_wait` when teardown has already completed) — never from
+//   the mainline exit path.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
-    Free     = 0,
+    Free = 0,
     Spawning = 1,
-    Running  = 2,
-    Stopped  = 3,
-    Exiting  = 4,
-    Zombie   = 5,
+    Running = 2,
+    Stopped = 3,
+    Exiting = 4,
+    Zombie = 5,
+    Reaped = 6,
 }
 
 impl ProcessState {
@@ -26,7 +54,7 @@ impl ProcessState {
     }
 
     pub fn is_transitional(self) -> bool {
-        matches!(self, Self::Spawning | Self::Exiting)
+        matches!(self, Self::Spawning | Self::Exiting | Self::Reaped)
     }
 }
 
@@ -44,6 +72,35 @@ pub const SIG_DISP_CATCH: u8 = 2;
 pub const INITIAL_CAPACITY: usize = 16;
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_EXE_PATH_LEN: usize = 128;
+/// Capacity of the per-process argv snapshot buffer.
+pub const ARGV_BUF_LEN: usize = 512;
+
+// ---- Observer completion event kinds ----
+pub const COMPLETION_EVENT_NONE: u8 = 0;
+pub const COMPLETION_EVENT_EXITED: u8 = 1;
+pub const COMPLETION_EVENT_STOPPED: u8 = 2;
+pub const COMPLETION_EVENT_CONTINUED: u8 = 3;
+pub const COMPLETION_EVENT_FORK_COMMITTED: u8 = 4;
+pub const OBSERVER_EVENT_RECORDS: usize = 128;
+
+#[derive(Clone, Copy)]
+pub struct ObserverEventRecord {
+    pub kind: u8,
+    pub pid: u32,
+    pub status: i32,
+    pub cookie: u64,
+}
+
+impl ObserverEventRecord {
+    pub const fn zeroed() -> Self {
+        Self {
+            kind: COMPLETION_EVENT_NONE,
+            pid: 0,
+            status: 0,
+            cookie: 0,
+        }
+    }
+}
 
 // ---- Per-process shared library mapping ----
 pub const MAX_PROC_MAPPED_LIBS: usize = 8;
@@ -174,18 +231,18 @@ impl PersonalityState {
 // Thread table (per-process; main thread excluded)
 // ===========================================================================
 
-/// Maximum auxiliary threads (PM_THREAD_CREATE) per process.
+/// Maximum auxiliary threads (INIT_THREAD_CREATE) per process.
 /// Main thread (tid=0) is tracked via the Process struct itself, not here.
 pub const MAX_THREADS_PER_PROC: usize = 63;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-    Unused   = 0,
+    Unused = 0,
     Creating = 1,
-    Running  = 2,
-    Exiting  = 3,
-    Zombie   = 4,
+    Running = 2,
+    Exiting = 3,
+    Zombie = 4,
 }
 
 /// Per-thread state record. Auxiliary threads only — the main thread's
@@ -198,7 +255,7 @@ pub struct ThreadEntry {
     /// are assigned monotonically from `Process::next_tid`.
     pub tid: u32,
     /// procmgr-side cap slot for this thread's TCB. Caller (libpthread)
-    /// receives a derived copy via cap_transfer in PM_THREAD_CREATE reply.
+    /// receives a derived copy via cap_transfer in INIT_THREAD_CREATE reply.
     pub tcb_cap: Cap,
     /// procmgr-side cap slot for this thread's SchedContext.
     pub sc_cap: Cap,
@@ -210,12 +267,20 @@ pub struct ThreadEntry {
     pub rsrcsrv_handles: [u64; 3],
     /// Exit value passed by `pthread_exit` (or 0 if still running).
     pub retval: u64,
-    /// Saved reply cap of a `PM_THREAD_JOIN` caller waiting for this thread
-    /// to exit. 0 if no joiner is currently parked.
+    /// Saved reply endpoint of a `INIT_THREAD_JOIN` caller waiting for this
+    /// thread to exit. 0 if no joiner is currently parked.
     pub joiner_reply_cap: Cap,
     /// Where the IPC buffer frame is mapped in the child's VSpace.
     /// Needed for cleanup (`vspace_unmap`) at reap time.
     pub ipc_buf_vaddr: u64,
+    /// Base VA of the thread's stack reserve in the child's VSpace
+    /// (== `stack_base` passed in the `INIT_THREAD_CREATE` wire). Zero
+    /// when no stack was published — legacy pre-I21 creates that
+    /// libtrona is now rejected on, kept here only for defensive
+    /// `0` handling. Used on detached-thread reap to instruct mmsrv
+    /// to tear down the MAP_STACK region so detached-thread stacks
+    /// do not leak until process exit.
+    pub stack_base: u64,
 }
 
 impl ThreadEntry {
@@ -231,6 +296,7 @@ impl ThreadEntry {
             retval: 0,
             joiner_reply_cap: 0,
             ipc_buf_vaddr: 0,
+            stack_base: 0,
         }
     }
 }
@@ -259,8 +325,22 @@ pub struct Process {
     // ---- Generic core (subsystem-neutral) ----
     pub state: ProcessState,
     pub pid: u32,
+    /// POSIX parent pid. Preserved for POSIX APIs and exported process
+    /// metadata (`getppid`, `/proc`, kinfo snapshots). This is not the
+    /// authoritative completion observer field.
     pub ppid: u32,
-    pub exit_code: i32,
+    /// Core process-lifecycle observer pid. Terminal completions are
+    /// published to this observer's lifecycle event queue regardless of the
+    /// personality-specific API surface layered above it.
+    ///
+    /// Today POSIX and Win32 both seed this to the creator pid, but the
+    /// field exists so future personalities can diverge from POSIX
+    /// parenthood without changing the lifecycle core.
+    pub completion_observer_pid: u32,
+    /// Parent-visible exit record. Valid only when
+    /// `state ∈ {Zombie, Reaped}`. Populated exactly once during the
+    /// `Running → Zombie` transition in `core_exit_sequence`.
+    pub exit: crate::base::exit_record::ExitRecord,
     /// Capability badge used for per-process IPC identity.
     ///
     /// mmsrv and VFS client state are keyed by this badge. It is currently
@@ -273,7 +353,7 @@ pub struct Process {
     pub sc_cap: Cap,
     /// Per-spawn layout of well-known caps inside this child's CSpace.
     /// Populated by spawn_tx/fork_exec from a `ChildSlotAlloc` cursor and
-    /// communicated to the child via `AT_TRONA_*` auxv tags.
+    /// communicated to the child via the startup block.
     pub cap_layout: ChildCapLayout,
     /// Base cap slot and count for this process's objects in procmgr CSpace.
     pub slot_base: Cap,
@@ -286,11 +366,40 @@ pub struct Process {
     pub layout: VmLayoutPlan,
     /// Whether this process is registered with mmsrv.
     pub mmsrv_registered: bool,
+    /// True while a spawn/fork child has been published into the proctab for
+    /// rollback-safe cleanup, but has not yet committed as a normal process.
+    pub launch_pending: bool,
     /// Whether this process has a pre-created service EP in its CSpace.
     /// The child-side slot index is recorded in `cap_layout.service_ep`.
     pub has_service_ep: bool,
-    /// Restart on exit (set by SPAWN_FLAG_RESPAWN).
+    /// Restart on exit (set by SPAWN_FLAG_RESPAWN). Enable bit; the
+    /// actual policy is carried in `respawn_policy`.
     pub respawn: bool,
+    /// `RESPAWN_NEVER` / `RESPAWN_ALWAYS` / `RESPAWN_ON_FAILURE` —
+    /// forwarded from init's unit `Restart=` setting via
+    /// `spawn_flags_with_respawn_policy()`. Procmgr consults this when
+    /// `respawn` is set: always re-spawn for `Always`, re-spawn only on
+    /// non-zero exit for `OnFailure`.
+    pub respawn_policy: u8,
+    /// Exponential backoff state: number of consecutive failures in the
+    /// current window. Reset to 0 on a successful respawn (i.e. the
+    /// respawned child has survived at least `RESPAWN_WINDOW_NS`).
+    pub respawn_attempt_count: u32,
+    /// Monotonic tick at which procmgr may next fire a respawn for this
+    /// unit. 0 = no pending respawn.
+    pub respawn_next_ready_tick: u64,
+    /// Monotonic tick of the first failure in the current window; used
+    /// to decide when to declare the unit degraded and stop respawning.
+    pub respawn_first_attempt_tick: u64,
+    /// Stdio handoff discriminator at spawn time — one of
+    /// `STDIO_MODE_CONSOLE` / `STDIO_MODE_PTY` / `STDIO_MODE_INHERIT`.
+    /// Preserved across exec so a respawn reinstates the same stdio
+    /// source. `STDIO_MODE_PTY` is the service-level "tty" contract:
+    /// procmgr/VFS preinstall tty-backed stdio into slots 0/1/2 and
+    /// seed controlling-tty session state before first resume. CONSOLE
+    /// mode leaves slots 0/1/2 empty and the child's libc does a lazy
+    /// `/dev/console` bind on first use.
+    pub stdio_mode: u8,
     /// NUL-terminated binary name for respawn.
     pub respawn_binary: [u8; MAX_NAME_LEN],
     /// NUL-terminated process name (set at spawn/exec).
@@ -302,7 +411,7 @@ pub struct Process {
     /// Readiness badge bit assigned to this process (Type=notify only).
     /// Index into the shared procmgr BOUND_NTFN badge word — when the child
     /// invokes `SYS_SIGNAL(readiness_ntfn)`, the kernel ORs `1 << bit` into
-    /// procmgr's notification word, waking `reply_recv`. Value is
+    /// procmgr's notification word, waking `mp_write_reply_read`. Value is
     /// `readiness::BIT_NONE` when unassigned (fork/exec, non-notify svc, or
     /// after completion/timeout).
     pub ready_badge_bit: u8,
@@ -320,23 +429,94 @@ pub struct Process {
     pub signal_ntfn: Cap,
     /// Last wait/stop status observed for this process.
     pub stop_status: i32,
-    /// Saved reply cap for a specific-child waiter parked on this process.
-    pub waiter_reply: Cap,
-    pub waiter_pid: u32,
-    /// Saved reply cap for a parent waiting on any child.
-    pub any_waiter_reply: Cap,
-    pub waiting_for_any: u8,
+    /// Latest lifecycle event reflected in this child slot.
+    ///
+    /// The observer-owned event record queue is authoritative; this slot-local
+    /// copy exists so signal/teardown paths can reason about the process's
+    /// current published state without re-scanning the observer's queue.
+    pub completion_event_kind: u8,
+    /// Payload/status associated with `completion_event_kind`.
+    pub completion_event_status: i32,
+    /// Auxiliary cookie associated with the current lifecycle event.
+    pub completion_event_cookie: u64,
+    /// Observer-owned completion waiter reply endpoint (0 = not parked).
+    /// `completion_wait_reply != 0` is the canonical "an observer is
+    /// blocked waiting for a completion event" predicate; stored by
+    /// the POSIX `waitpid` adapter, cleared by
+    /// `publish_completion_event` on wake or by
+    /// `complete_parent_wait_timeout` on deadline expiry.
+    pub completion_wait_reply: Cap,
+    /// Target pid for the parked completion wait. `u32::MAX` encodes any-child;
+    /// any other value is a specific child pid.
+    pub completion_wait_target_pid: u32,
+    /// Adapter-specific wait options associated with the parked
+    /// completion waiter. POSIX uses this for `WNOHANG` /
+    /// `WUNTRACED`; the core queue uses it only as a filter hint when
+    /// trying to wake a parked observer.
+    pub completion_wait_options: u32,
+    /// Absolute CLOCK_MONOTONIC deadline (ns) for the parked waiter.
+    /// 0 = no deadline.
+    pub completion_wait_deadline_ns: u64,
+    /// One-shot deferred retry deadline for waking a parked waitpid
+    /// caller after an reply-marked MP_WRITE failure. 0 = no retry pending.
+    ///
+    /// The completion FIFO remains the authoritative completion state; this
+    /// deadline only drives a best-effort wake retry before falling
+    /// back to leaving the event queued for a later wait call.
+    pub completion_wait_wake_retry_deadline_ns: u64,
+    /// Number of valid records in `observer_events`.
+    pub observer_event_count: u16,
+    /// Observer-owned packed lifecycle event queue.
+    ///
+    /// This is the authoritative completion/recovery plane for child events.
+    /// POSIX `waitpid` and `INIT_FORK_RESULT` are both adapters over these
+    /// records; Win32 and future personalities can project their own wait
+    /// semantics from the same source.
+    pub observer_events: [ObserverEventRecord; OBSERVER_EVENT_RECORDS],
     /// NUL-terminated executable path used for /proc/<pid>/exe.
     pub exe_path: [u8; MAX_EXE_PATH_LEN],
     /// Whether PM_RESUME must wait for the child readiness notification once.
     pub wait_ready_on_resume: bool,
     /// Timeout used when waiting for the child's readiness signal after resume.
     pub ready_timeout_ns: u64,
-    /// CNode slot holding the saved reply cap for a deferred readiness wait.
+    /// Saved reply endpoint for a deferred readiness wait.
     /// 0 = no pending readiness wait.
     pub pending_ready_reply: Cap,
-    /// Absolute deadline (ns) for the pending readiness timeout.
+    /// Absolute CLOCK_MONOTONIC deadline (ns) for the pending readiness timeout.
     pub pending_ready_deadline_ns: u64,
+
+    // ---- Backend teardown state ----
+    //
+    // Populated when the process enters `Zombie` (or an aborted
+    // `launch_pending` spawn path). The teardown pump in
+    // `lifecycle::exit::process_pending_teardowns` progresses these
+    // independently of parent-visibility.
+    /// Bitmap of completed teardown steps (see `base::teardown::STEP_*`).
+    /// When equal to `STEP_ALL`, the slot is eligible for recycling.
+    pub teardown_steps_done: u8,
+    /// True when the teardown hard deadline expired with steps still
+    /// missing. Backend state keyed by this badge may be stale; the
+    /// slot is still recyclable. Mutually compatible with
+    /// `teardown_steps_done` — bits only get set when a step
+    /// genuinely succeeded.
+    pub teardown_abandoned: bool,
+    /// Absolute CLOCK_MONOTONIC deadline (ns) at which the pump may retry the next
+    /// pending teardown step. 0 = no pending retry.
+    pub teardown_retry_deadline_ns: u64,
+    /// Absolute CLOCK_MONOTONIC deadline (ns) after which the pump marks the job
+    /// `abandoned`. Set once when teardown is first enqueued.
+    pub teardown_hard_deadline_ns: u64,
+
+    /// Carry-over CPU runtime from auxiliary threads that have already been
+    /// reaped. Accumulated incrementally as each aux thread exits or is
+    /// torn down during process teardown.
+    pub dead_thread_user_time_ns: u64,
+    pub dead_thread_system_time_ns: u64,
+
+    /// NUL-separated argv bytes as received from INIT_SPAWN / INIT_EXEC.
+    /// argv_len is the number of valid bytes in argv_buf (may be 0).
+    pub argv_buf: [u8; 512],
+    pub argv_len: u16,
 
     /// Auxiliary threads (libpthread / win32 thread shim spawned).
     /// Main thread (tid=0) is represented by Process itself, not by an entry.
@@ -352,7 +532,8 @@ impl Process {
             state: ProcessState::Free,
             pid: 0,
             ppid: 0,
-            exit_code: 0,
+            completion_observer_pid: 0,
+            exit: crate::base::exit_record::ExitRecord::zeroed(),
             badge: 0,
             tcb_cap: 0,
             vspace_cap: 0,
@@ -365,8 +546,14 @@ impl Process {
             lib_map: ProcLibMap::zeroed(),
             layout: VmLayoutPlan::zeroed(),
             mmsrv_registered: false,
+            launch_pending: false,
             has_service_ep: false,
             respawn: false,
+            respawn_policy: 0,
+            respawn_attempt_count: 0,
+            respawn_next_ready_tick: 0,
+            respawn_first_attempt_tick: 0,
+            stdio_mode: 0,
             respawn_binary: [0; MAX_NAME_LEN],
             name: [0; 32],
             timer_interval_ns: 0,
@@ -379,15 +566,29 @@ impl Process {
             ctty_pgrp: 0,
             signal_ntfn: 0,
             stop_status: 0,
-            waiter_reply: 0,
-            waiter_pid: 0,
-            any_waiter_reply: 0,
-            waiting_for_any: 0,
+            completion_event_kind: COMPLETION_EVENT_NONE,
+            completion_event_status: 0,
+            completion_event_cookie: 0,
+            completion_wait_reply: 0,
+            completion_wait_target_pid: 0,
+            completion_wait_options: 0,
+            completion_wait_deadline_ns: 0,
+            completion_wait_wake_retry_deadline_ns: 0,
+            observer_event_count: 0,
+            observer_events: [ObserverEventRecord::zeroed(); OBSERVER_EVENT_RECORDS],
             exe_path: [0; MAX_EXE_PATH_LEN],
             wait_ready_on_resume: false,
             ready_timeout_ns: 0,
             pending_ready_reply: 0,
             pending_ready_deadline_ns: 0,
+            teardown_steps_done: 0,
+            teardown_abandoned: false,
+            teardown_retry_deadline_ns: 0,
+            teardown_hard_deadline_ns: 0,
+            dead_thread_user_time_ns: 0,
+            dead_thread_system_time_ns: 0,
+            argv_buf: [0; 512],
+            argv_len: 0,
             threads: ThreadTable::zeroed(),
             personality: PersonalityState::None,
         }
@@ -434,9 +635,9 @@ impl Process {
 
 #[inline]
 pub fn monotonic_now_ns() -> u64 {
-    trona::syscall::syscall(
-        trona::consts::kernel::SYS_CLOCK_GETTIME,
-        trona::consts::kernel::CLOCK_MONOTONIC as u64,
+    trona_kernel::syscall::syscall(
+        uapi::SYS_CLOCK_GETTIME,
+        uapi::CLOCK_MONOTONIC as u64,
         0,
         0,
         0,
@@ -465,16 +666,17 @@ pub unsafe fn init_proctab() {
         let cap = INITIAL_CAPACITY;
         let size = cap * core::mem::size_of::<Process>();
         let pages = (size + 4095) / 4096;
-        let ptr = trona_posix::mm::posix_mmap(
+        let ptr = trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
             0x3,  // PROT_READ | PROT_WRITE
             0x22, // MAP_PRIVATE | MAP_ANONYMOUS
             -1,
             0,
-        );
+        )
+        .unwrap_or(usize::MAX as *mut u8);
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] FATAL: proctab mmap failed\n");
             });
             return;
@@ -515,16 +717,17 @@ unsafe fn grow_proctab() -> bool {
         let new_size = new_cap * core::mem::size_of::<Process>();
         let new_pages = (new_size + 4095) / 4096;
 
-        let new_raw = trona_posix::mm::posix_mmap(
+        let new_raw = trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
             0x3,  // PROT_READ | PROT_WRITE
             0x22, // MAP_PRIVATE | MAP_ANONYMOUS
             -1,
             0,
-        );
+        )
+        .unwrap_or(usize::MAX as *mut u8);
         if new_raw.is_null() || new_raw == usize::MAX as *mut u8 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] proctab grow failed\n");
             });
             return false;
@@ -546,12 +749,13 @@ unsafe fn grow_proctab() -> bool {
 
         // Unmap old region
         let old_pages = (old_size + 4095) / 4096;
-        trona_posix::mm::posix_munmap(PROCTAB_PTR as *mut u8, (old_pages * 4096) as u64);
+        let _ =
+            trona_runtime::client::mm::munmap(PROCTAB_PTR as *mut u8, (old_pages * 4096) as u64);
 
         PROCTAB_PTR = new_ptr;
         PROCTAB_CAP = new_cap;
 
-        trona::udebug!(|_lb| {
+        trona_runtime::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] proctab grown to ");
             _lb.hex(new_cap as u64);
             _lb.str(b" entries\n");
@@ -622,9 +826,9 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         if child_cn != 0 {
             let child_cnode_slots = 1024u64;
             for i in 0..child_cnode_slots {
-                let err = trona::invoke::cnode_revoke(child_cn, i);
+                let err = trona_kernel::invoke::cnode_revoke(child_cn, i);
                 if err != 0 {
-                    trona::invoke::cnode_delete(child_cn, i);
+                    trona_kernel::invoke::cnode_delete(child_cn, i);
                 }
             }
         }
@@ -637,14 +841,23 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
             // New allocator path: clean up only the allocated range
             for i in 0..count {
                 let slot = base + i;
-                let err = trona::invoke::cnode_revoke(cap_self_cspace, slot);
+                let err = trona_kernel::invoke::cnode_revoke(cap_self_cspace, slot);
                 if err != 0 {
-                    trona::invoke::cnode_delete(cap_self_cspace, slot);
+                    trona_kernel::invoke::cnode_delete(cap_self_cspace, slot);
                 }
             }
         }
 
-        // Reset process entry
+        // Drain observer-owned lifecycle records before the slot is zeroed.
+        // Exit completions are finalized immediately; non-terminal and recovery
+        // records are simply discarded.
+        let event_count = (*PROCTAB_PTR.add(idx)).observer_event_count as usize;
+        for event_idx in 0..event_count {
+            let record = (*PROCTAB_PTR.add(idx)).observer_events[event_idx];
+            crate::lifecycle::wait::dismiss_observer_event_record(record);
+        }
+
+        // Reset process entry (also clears observer event state).
         core::ptr::write(PROCTAB_PTR.add(idx), Process::zeroed());
     }
 }

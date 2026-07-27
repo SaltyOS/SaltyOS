@@ -2,11 +2,21 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::kdebug;
-use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE, PHYS_MAP_OFFSET};
+use crate::mm::{
+    PAGE_SIZE, PHYS_MAP_OFFSET, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, pmm_alloc,
+};
 
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
+
+unsafe extern "C" {
+    fn x86_paging_read_cr3() -> u64;
+    fn x86_paging_write_cr3(value: u64);
+    fn x86_paging_invlpg(addr: u64);
+    fn x86_paging_read_cr0() -> u64;
+    fn x86_paging_write_cr0(value: u64);
+    fn x86_paging_wrmsr(msr: u32, value: u64);
+}
 
 /// Page table entry flags
 #[repr(u64)]
@@ -50,29 +60,41 @@ impl PageTable {
         // relative to subsequent TLB invalidation.
         unsafe { core::ptr::write_volatile(&mut self.entries[index], entry) }
     }
+
+    /// Atomically swap entry `index` to `value`, returning the previous
+    /// value. The hardware page walker sets the Accessed/Dirty bits with a
+    /// locked RMW; this atomic swap observes any such bit set up to the swap
+    /// point, so page eviction can detect a write that dirtied the page
+    /// concurrently with the unmap (which a plain read-then-write would lose).
+    pub fn swap_entry(&self, index: usize, value: u64) -> u64 {
+        // SAFETY: `entries` is `[u64; 512]` inside a 4K-aligned struct, so
+        // each element is 8-byte aligned — a valid `AtomicU64` view. The
+        // hardware A/D-bit RMW and this swap operate on the same location
+        // coherently.
+        let slot = unsafe {
+            &*(&self.entries[index] as *const u64 as *const core::sync::atomic::AtomicU64)
+        };
+        slot.swap(value, core::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 /// Get current CR3 value
 pub fn read_cr3() -> u64 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) value, options(nomem, nostack));
-    }
-    value
+    unsafe { x86_paging_read_cr3() }
 }
 
 /// Set CR3 value (switch page table)
 pub unsafe fn write_cr3(value: u64) {
     // SAFETY: Caller ensures value is a valid page table address
     unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) value, options(nostack));
+        x86_paging_write_cr3(value);
     }
 }
 
 /// Flush TLB for a single page
 pub fn invlpg(addr: u64) {
     unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack));
+        x86_paging_invlpg(addr);
     }
 }
 
@@ -98,11 +120,7 @@ pub fn flush_dcache_pou_page(_kva: u64) {}
 /// - `table` must point to a valid page table in the active kernel address space.
 /// - Must be called only when creating kernel-global mappings during boot or while
 ///   otherwise serialized against concurrent page-table modification.
-unsafe fn ensure_next_table(
-    table: &mut PageTable,
-    index: usize,
-    context: &'static str,
-) -> u64 {
+unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'static str) -> u64 {
     let entry = table.entry(index);
     if entry & PageFlags::Present as u64 != 0 {
         if entry & PageFlags::HugePage as u64 != 0 {
@@ -112,7 +130,10 @@ unsafe fn ensure_next_table(
         return entry & ENTRY_ADDR_MASK;
     }
 
-    let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
+    let frame = pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::PageTable,
+    })
+    .expect(context);
 
     // SAFETY: `frame` is a freshly allocated page-table frame reachable through
     // the existing direct map, and zeroing it initializes all entries to empty.
@@ -141,7 +162,10 @@ unsafe fn split_huge_page(
     huge_entry: u64,
     context: &'static str,
 ) -> u64 {
-    let pt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
+    let pt_frame = pmm_alloc(&FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::PageTable,
+    })
+    .expect(context);
 
     // SAFETY: pt_frame is freshly allocated and reachable via direct map.
     let pt = unsafe { &mut *(phys_to_virt(pt_frame) as *mut PageTable) };
@@ -266,7 +290,7 @@ unsafe fn init_direct_map(max_phys: u64) {
         return;
     }
 
-    crate::kdebug!(arch, |_g| {
+    crate::kernel::printk::kdebug!(arch, |_g| {
         _g.puts("[PAGING] Direct map size: ");
         _g.hex(direct_map_size as u64);
         _g.puts(" (max_phys=");
@@ -274,11 +298,10 @@ unsafe fn init_direct_map(max_phys: u64) {
         _g.puts(")\n");
     });
 
-    let cr0_orig: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr0", out(reg) cr0_orig, options(nomem, nostack));
-        if cr0_orig & (1 << 16) != 0 {
-            core::arch::asm!("mov cr0, {}", in(reg) (cr0_orig & !(1 << 16)), options(nomem, nostack));
+    let cr0_orig = unsafe { x86_paging_read_cr0() };
+    if cr0_orig & (1 << 16) != 0 {
+        unsafe {
+            x86_paging_write_cr0(cr0_orig & !(1 << 16));
         }
     }
 
@@ -295,7 +318,10 @@ unsafe fn init_direct_map(max_phys: u64) {
     let pml4e = pml4.entry(pml4_idx);
     let pdpt_phys = if pml4e & PageFlags::Present as u64 == 0 {
         // Allocate new PDPT
-        let pdpt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PDPT for direct map");
+        let pdpt_frame = pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::PageTable,
+        })
+        .expect("Failed to allocate PDPT for direct map");
         // Use identity mapping for access during init
         let pdpt_virt = pdpt_frame as *mut u8;
 
@@ -305,7 +331,10 @@ unsafe fn init_direct_map(max_phys: u64) {
         }
 
         // Set PML4 entry (Present | Writable)
-        pml4.set_entry(pml4_idx, pdpt_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64));
+        pml4.set_entry(
+            pml4_idx,
+            pdpt_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
+        );
 
         pdpt_frame
     } else {
@@ -326,7 +355,10 @@ unsafe fn init_direct_map(max_phys: u64) {
 
         let pd_phys = if pdpte & PageFlags::Present as u64 == 0 {
             // Allocate new PD
-            let pd_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PD for direct map");
+            let pd_frame = pmm_alloc(&FrameOwner::KernelPrivate {
+                subkind: KernelMetaKind::PageTable,
+            })
+            .expect("Failed to allocate PD for direct map");
             // Use identity mapping for access during init
             let pd_virt = pd_frame as *mut u8;
 
@@ -336,7 +368,10 @@ unsafe fn init_direct_map(max_phys: u64) {
             }
 
             // Set PDPT entry (Present | Writable)
-            pdpt.set_entry(pd_idx, pd_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64));
+            pdpt.set_entry(
+                pd_idx,
+                pd_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
+            );
 
             pd_frame
         } else {
@@ -376,7 +411,7 @@ unsafe fn init_direct_map(max_phys: u64) {
 
     unsafe {
         if cr0_orig & (1 << 16) != 0 {
-            core::arch::asm!("mov cr0, {}", in(reg) cr0_orig, options(nomem, nostack));
+            x86_paging_write_cr0(cr0_orig);
         }
     }
 }
@@ -396,17 +431,9 @@ unsafe fn init_direct_map(max_phys: u64) {
 unsafe fn init_pat() {
     const IA32_PAT: u32 = 0x277;
     let new_pat: u64 = 0x00070406_00070401; // PAT1 = WC (0x01)
-    let lo = new_pat as u32;
-    let hi = (new_pat >> 32) as u32;
     // SAFETY: IA32_PAT is a valid MSR; single-threaded boot context.
     unsafe {
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") IA32_PAT,
-            in("eax") lo,
-            in("edx") hi,
-            options(nomem, nostack),
-        );
+        x86_paging_wrmsr(IA32_PAT, new_pat);
     }
 }
 

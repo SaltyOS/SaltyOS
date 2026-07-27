@@ -4,24 +4,26 @@
 //! Manages two virtqueues: RX (queue 0) for receiving packets and TX (queue 1)
 //! for transmitting packets. DMA buffers are allocated via mmsrv.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::serial::LineBuf;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::mm::{MM_MMAP, MMAP_KIND_ANON};
+use trona_protocol::pci::{PCI_FIND_DEVICE, PCI_GET_CAPS};
+use trona_runtime::debug::serial::LineBuf;
 
 use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
 
-// Service-local role `Require=pcidrv:pcidrv_ep` via generated `svc_caps`
-// crate; system role `mmsrv` via substrate `trona::caps::*` getters.
+// Service-local role: `Require=pcidrv-ep.socket` resolved via
+// `trona_runtime::local_cap!` in `main.rs` (see `crate::pcidrv_ep`).
 
-/// Slot for dynamically received BAR cap from pcidrv (IoPort or device untyped)
-const CAP_RECEIVED_BAR: u64 = 80;
+/// Scratch range for the BAR cap plus the optional IRQ handler cap that
+/// pcidrv may attach as `extra_caps[1]`.
+static mut LEGACY_CAP_SCRATCH_BASE: u64 = 0;
+/// Persistent slot holding the MMIO BAR cap when BAR0 is memory-mapped.
+static mut LEGACY_MMIO_BAR_SLOT: u64 = 0;
 
 /// virtio-net PCI vendor/device IDs (legacy transitional)
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -47,15 +49,17 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 /// Feature bits
 const VIRTIO_F_ANY_LAYOUT: u32 = 1 << 27;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 /// Virtual address for BAR0 MMIO mapping
 const BAR0_VADDR: u64 = 0x0000_0000_4000_0000;
 
-/// Hint VA for virtqueue memory
-const RX_VQUEUE_HINT: u64 = 0x0000_0000_4100_0000;
-const TX_VQUEUE_HINT: u64 = 0x0000_0000_4180_0000;
-const DMA_BUF_HINT: u64 = 0x0000_0000_4200_0000;
+/// Ask mmsrv to place DMA-visible allocations inside the client's
+/// registered mmap window. These mappings are later resolved to
+/// physical addresses and handed to virtio, so they must use the
+/// mmsrv wire flags for eager anonymous mapping.
+const RX_VQUEUE_HINT: u64 = 0;
+const TX_VQUEUE_HINT: u64 = 0;
 
 /// VirtIO network header (10 bytes, prepended to every packet)
 #[repr(C)]
@@ -76,11 +80,13 @@ pub(crate) fn net_hdr_size() -> usize {
 }
 
 pub(crate) fn set_net_hdr_size(sz: usize) {
-    unsafe { *(&raw mut NET_HDR_SIZE_VAL) = sz; }
+    unsafe {
+        *(&raw mut NET_HDR_SIZE_VAL) = sz;
+    }
 }
 
 /// Legacy constant used only for non-flex descriptor split.
-const VIRTIO_NET_HDR_SIZE_LEGACY: usize = 10;
+const VIRTIO_NET_HDR_SIZE_LEGACY: usize = core::mem::size_of::<VirtioNetHdr>();
 
 /// Virtio descriptor table entry
 #[repr(C)]
@@ -103,6 +109,7 @@ const BUF_SIZE: usize = 2048;
 pub(crate) static mut MAC_ADDR: [u8; 6] = [0; 6];
 static mut BAR0_IS_IO: bool = false;
 static mut PCI_IOPORT_CAP: u64 = 0;
+static mut PCI_IOPORT_BASE: u64 = 0;
 pub(crate) static mut VIRTIO_INITIALIZED: bool = false;
 
 // RX queue state (queue 0)
@@ -133,7 +140,6 @@ pub(crate) static mut USE_FLEX_LAYOUT: bool = false;
 
 #[derive(Clone, Copy)]
 struct VirtqLayout {
-    desc_off: u64,
     avail_off: u64,
     used_off: u64,
     total_bytes: u64,
@@ -155,7 +161,11 @@ fn virtq_layout(qsz: u16) -> Option<VirtqLayout> {
     let used_off = align_up(avail_off + avail_bytes, 4096);
     let used_bytes = 4 + 8 * q;
     let total_bytes = used_off + used_bytes;
-    Some(VirtqLayout { desc_off, avail_off, used_off, total_bytes })
+    Some(VirtqLayout {
+        avail_off,
+        used_off,
+        total_bytes,
+    })
 }
 
 /// Format a byte as two hex digits (no "0x" prefix) into a LineBuf.
@@ -167,12 +177,36 @@ fn format_hex_byte(lb: &mut LineBuf, val: u8) {
 
 // --- BAR I/O ---
 
+#[cold]
+fn log_ioport_err(op: &[u8], port: u64, err: i32) {
+    trona_runtime::uerror!(|_lb| {
+        _lb.str(b"[netdrv] BAR ioport ");
+        _lb.bytes(op);
+        _lb.str(b" port=");
+        _lb.hex(port);
+        _lb.str(b" err=");
+        _lb.dec(err as u64);
+        _lb.putc(b'\n');
+    });
+}
+
+#[inline]
+fn bar_io_port(offset: u64) -> (trona_kernel::core_types::CapRef, u64) {
+    let cap = unsafe { *(&raw const PCI_IOPORT_CAP) };
+    let port = unsafe { *(&raw const PCI_IOPORT_BASE) } + offset;
+    (trona_runtime::core::slot_alloc::resolved_cap_ref(cap), port)
+}
+
 fn bar_read8(offset: u64) -> u8 {
-    // SAFETY: BAR0_IS_IO and PCI_IOPORT_CAP are set during init before any
+    // SAFETY: BAR0_IS_IO and PCI_IOPORT_CAP/BASE are set during init before any
     // bar_read/write calls. Single-threaded driver.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_in8(PCI_IOPORT_CAP, offset)
+            let (cap, port) = bar_io_port(offset);
+            invoke::ioport_in8(cap, port).unwrap_or_else(|err| {
+                log_ioport_err(b"read8", port, err);
+                0xFF
+            })
         } else {
             let ptr = (BAR0_VADDR + offset) as *const u8;
             ptr.read_volatile()
@@ -184,7 +218,11 @@ fn bar_read16(offset: u64) -> u16 {
     // SAFETY: See bar_read8.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_in16(PCI_IOPORT_CAP, offset)
+            let (cap, port) = bar_io_port(offset);
+            invoke::ioport_in16(cap, port).unwrap_or_else(|err| {
+                log_ioport_err(b"read16", port, err);
+                0xFFFF
+            })
         } else {
             let ptr = (BAR0_VADDR + offset) as *const u16;
             ptr.read_volatile()
@@ -196,7 +234,11 @@ fn bar_read32(offset: u64) -> u32 {
     // SAFETY: See bar_read8.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_in32(PCI_IOPORT_CAP, offset)
+            let (cap, port) = bar_io_port(offset);
+            invoke::ioport_in32(cap, port).unwrap_or_else(|err| {
+                log_ioport_err(b"read32", port, err);
+                0xFFFF_FFFF
+            })
         } else {
             let ptr = (BAR0_VADDR + offset) as *const u32;
             ptr.read_volatile()
@@ -208,7 +250,10 @@ fn bar_write8(offset: u64, val: u8) {
     // SAFETY: See bar_read8.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_out8(PCI_IOPORT_CAP, offset, val);
+            let (cap, port) = bar_io_port(offset);
+            if let Err(err) = invoke::ioport_out8(cap, port, val) {
+                log_ioport_err(b"write8", port, err);
+            }
         } else {
             let ptr = (BAR0_VADDR + offset) as *mut u8;
             ptr.write_volatile(val);
@@ -220,7 +265,10 @@ fn bar_write16(offset: u64, val: u16) {
     // SAFETY: See bar_read8.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_out16(PCI_IOPORT_CAP, offset, val);
+            let (cap, port) = bar_io_port(offset);
+            if let Err(err) = invoke::ioport_out16(cap, port, val) {
+                log_ioport_err(b"write16", port, err);
+            }
         } else {
             let ptr = (BAR0_VADDR + offset) as *mut u16;
             ptr.write_volatile(val);
@@ -232,7 +280,10 @@ fn bar_write32(offset: u64, val: u32) {
     // SAFETY: See bar_read8.
     unsafe {
         if *(&raw const BAR0_IS_IO) {
-            invoke::ioport_out32(PCI_IOPORT_CAP, offset, val);
+            let (cap, port) = bar_io_port(offset);
+            if let Err(err) = invoke::ioport_out32(cap, port, val) {
+                log_ioport_err(b"write32", port, err);
+            }
         } else {
             let ptr = (BAR0_VADDR + offset) as *mut u32;
             ptr.write_volatile(val);
@@ -240,21 +291,37 @@ fn bar_write32(offset: u64, val: u32) {
     }
 }
 
-/// Compute physical address via vspace_walk for a given virtual address.
+fn ensure_legacy_cap_scratch() -> Option<u64> {
+    unsafe {
+        let base = *(&raw const LEGACY_CAP_SCRATCH_BASE);
+        if base != 0 {
+            return Some(base);
+        }
+        let base = trona_runtime::core::slot_alloc::slot_alloc_consecutive(2)?;
+        *(&raw mut LEGACY_CAP_SCRATCH_BASE) = base;
+        Some(base)
+    }
+}
+
+fn legacy_mmio_bar_slot() -> u64 {
+    unsafe { *(&raw const LEGACY_MMIO_BAR_SLOT) }
+}
+
+/// Resolve exactly one present user mapping for DMA.
 pub(crate) fn vaddr_to_phys(vaddr: u64) -> u64 {
-    let err = invoke::vspace_walk(CAP_SELF_VSPACE, vaddr, 1);
+    let (err, phys) = invoke::vspace_resolve_page(
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_VSPACE),
+        vaddr,
+    );
     if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[netdrv] vspace_walk failed: ");
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] vspace_resolve_page failed: ");
             _lb.dec(err as u64);
             _lb.putc(b'\n');
         });
         return 0;
     }
-    match invoke::vspace_walk_result_entry(0) {
-        Some((_v, phys, _flags)) => phys + (vaddr & 0xFFF),
-        None => 0,
-    }
+    phys
 }
 
 // --- PCI discovery ---
@@ -270,8 +337,15 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer to our thread-local IPC context.
-    let err =
-        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::pcidrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -286,7 +360,11 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
 
 /// Get BAR/IRQ info from pcidrv.
 /// Returns (bar_base, bar_bits, bar_size, irq, bar_is_io, has_irq_handler).
-pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool, bool)> {
+pub(crate) fn get_device_caps(
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Option<(u64, u64, u32, u8, bool, bool)> {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_CAPS;
     msg.length = 3;
@@ -294,30 +372,74 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
     msg.regs[1] = dev as u64;
     msg.regs[2] = func as u64;
 
-    // SAFETY: Set up receive slot for BAR cap (IoPort or device untyped) transfer.
+    let recv_base = ensure_legacy_cap_scratch()?;
+
+    // SAFETY: Reserve two consecutive slots so pcidrv can place the BAR cap at
+    // `recv_base` and an optional IRQ handler cap at `recv_base + 1`.
     unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_BAR, 0);
+        trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+            ipc_ctx(),
+            CAP_SELF_CSPACE,
+            recv_base,
+            0,
+        );
     }
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer.
-    let err =
-        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ipc_ctx(),
+            crate::pcidrv_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
         return None;
     }
     let bar_is_io = reply.regs[4] != 0;
     let has_irq_handler = reply.regs[5] != 0;
 
-    if bar_is_io {
-        // Received an IoPort cap at slot 80
-        // SAFETY: Single-threaded init path; PCI_IOPORT_CAP written once.
-        unsafe { *(&raw mut PCI_IOPORT_CAP) = CAP_RECEIVED_BAR; }
-    }
-    // For MMIO BAR, the device untyped cap stays at slot 80 (CAP_RECEIVED_BAR).
-    // IRQ handler cap from pcidrv (extra cap #1) is at slot 81.
+    let has_bar_cap = if bar_is_io {
+        unsafe {
+            *(&raw mut PCI_IOPORT_CAP) = recv_base;
+            *(&raw mut PCI_IOPORT_BASE) = reply.regs[0];
+            *(&raw mut LEGACY_MMIO_BAR_SLOT) = 0;
+        }
+        true
+    } else if reply.regs[0] != 0 && reply.regs[2] != 0 {
+        unsafe {
+            *(&raw mut PCI_IOPORT_CAP) = 0;
+            *(&raw mut PCI_IOPORT_BASE) = 0;
+            *(&raw mut LEGACY_MMIO_BAR_SLOT) = recv_base;
+        }
+        true
+    } else {
+        unsafe {
+            *(&raw mut PCI_IOPORT_CAP) = 0;
+            *(&raw mut PCI_IOPORT_BASE) = 0;
+            *(&raw mut LEGACY_MMIO_BAR_SLOT) = 0;
+        }
+        false
+    };
 
-    Some((reply.regs[0], reply.regs[1], reply.regs[2] as u32, reply.regs[3] as u8, bar_is_io, has_irq_handler))
+    let irq_slot = if has_irq_handler {
+        recv_base + if has_bar_cap { 1 } else { 0 }
+    } else {
+        0
+    };
+    crate::set_irq_handler_cap(irq_slot);
+
+    Some((
+        reply.regs[0],
+        reply.regs[1],
+        reply.regs[2] as u32,
+        reply.regs[3] as u8,
+        bar_is_io,
+        has_irq_handler,
+    ))
 }
 
 // --- Virtio init ---
@@ -327,7 +449,9 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
     // SAFETY: Single-threaded init path.
     unsafe {
         if bar0_raw == 0 {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Invalid BAR0 (0)\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Invalid BAR0 (0)\n");
+            });
             return false;
         }
         *(&raw mut BAR0_IS_IO) = (bar0_raw & 1) != 0;
@@ -335,33 +459,60 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
         if *(&raw const BAR0_IS_IO) {
             let cap = *(&raw const PCI_IOPORT_CAP);
             if cap == 0 {
-                trona::uerror!(|_lb| { _lb.str(b"[netdrv] BAR0 is I/O space -- no IoPort cap\n"); });
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[netdrv] BAR0 is I/O space -- no IoPort cap\n");
+                });
                 return false;
             }
-            trona::uinfo!(|_lb| { _lb.str(b"[netdrv] BAR0 is I/O space -- using IoPort cap\n"); });
+            trona_runtime::uinfo!(|_lb| {
+                _lb.str(b"[netdrv] BAR0 is I/O space -- using IoPort cap\n");
+            });
             return virtio_negotiate();
         }
 
         // MMIO BAR: map device untyped into our VSpace
         let num_pages = ((bar_size as u64) + 4095) / 4096;
         if num_pages == 0 {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Invalid MMIO BAR size\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Invalid MMIO BAR size\n");
+            });
             return false;
         }
-        let (err, _mapped) = invoke::vspace_map_device_range(
-            CAP_SELF_VSPACE,
-            CAP_RECEIVED_BAR,
+        let mmio_cap = legacy_mmio_bar_slot();
+        if mmio_cap == 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Missing MMIO BAR cap\n");
+            });
+            return false;
+        }
+        // MMIO must be uncacheable.
+        let map_flags = (uapi::KERNITE_PAGE_FLAG_WRITABLE
+            | uapi::KERNITE_PAGE_FLAG_USER
+            | uapi::KERNITE_PAGE_FLAG_NOCACHE) as u64;
+        let (err, mapped) = invoke::vspace_map_device_range(
+            trona_kernel::core_types::CapRef::flat(CAP_SELF_VSPACE),
+            trona_runtime::core::slot_alloc::resolved_cap_ref(mmio_cap),
             0,
             BAR0_VADDR,
             num_pages,
-            0x3, // RW
+            map_flags,
         );
-        if err != 0 {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] MMIO BAR mapping failed\n"); });
+        if err != 0 || mapped != num_pages {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] MMIO BAR mapping failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b" mapped=");
+                _lb.hex(mapped);
+                _lb.putc(b'/');
+                _lb.hex(num_pages);
+                _lb.putc(b'\n');
+            });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
-        trona::uinfo!(|_lb| { _lb.str(b"[netdrv] BAR0 MMIO mapped\n"); });
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] BAR0 MMIO mapped\n");
+        });
         virtio_negotiate()
     }
 }
@@ -371,15 +522,41 @@ fn mmap_alloc(hint_vaddr: u64, num_pages: u64) -> Option<u64> {
     let ctx = ipc_ctx();
     let mut msg = TronaMsg::zeroed();
     msg.label = MM_MMAP;
-    msg.length = 4;
-    msg.regs[0] = hint_vaddr;
-    msg.regs[1] = num_pages * 4096;
-    msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
-    msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+    msg.length = 5;
+    msg.regs[0] = MMAP_KIND_ANON;
+    msg.regs[1] = hint_vaddr;
+    msg.regs[2] = num_pages * 4096;
+    msg.regs[3] = 0x3; // PROT_READ | PROT_WRITE
+    msg.regs[4] = 0; // mmsrv wire flags: auto-place, eager anon mapping
+    unsafe {
+        ipc::clear_send_caps_ctx(ctx);
+    }
+    let mmsrv_ep = trona_runtime::client::caps::mmsrv_ep().addr();
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() is valid.
-    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
+    let err = unsafe {
+        ipc::mp_call_ctx(
+            ctx,
+            mmsrv_ep,
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        )
+    };
     if err != 0 || reply.label != 0 {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] MM_MMAP failed err=");
+            _lb.dec(err as u64);
+            _lb.str(b" label=");
+            _lb.dec(reply.label);
+            _lb.str(b" hint=");
+            _lb.hex(hint_vaddr);
+            _lb.str(b" pages=");
+            _lb.dec(num_pages);
+            _lb.str(b" mmsrv_ep=");
+            _lb.hex(mmsrv_ep);
+            _lb.putc(b'\n');
+        });
         return None;
     }
     Some(reply.regs[0])
@@ -406,12 +583,22 @@ fn setup_queue(queue_idx: u16, hint_vaddr: u64) -> Option<(u64, u64, u64, u16)> 
     // Get physical address
     let vq_phys = vaddr_to_phys(vq_base);
     if vq_phys == 0 {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n");
+        });
         return None;
     }
 
     // Set queue address (legacy: PFN = phys / 4096)
     bar_write32(VIRTIO_QUEUE_ADDR, (vq_phys / 4096) as u32);
+
+    // netdrv's current wake model is timed RX polling plus explicit MP TX
+    // kicks from netsrv. Until the driver binds the IRQ handler to an
+    // EventQueue, queue interrupts only add shared-IRQ noise.
+    unsafe {
+        let avail_base = (vq_base + layout.avail_off) as *mut u16;
+        core::ptr::write_volatile(avail_base, VIRTQ_AVAIL_F_NO_INTERRUPT);
+    }
 
     Some((vq_base, layout.avail_off, layout.used_off, qsize))
 }
@@ -421,7 +608,10 @@ fn virtio_negotiate() -> bool {
     // Reset device
     bar_write8(VIRTIO_DEVICE_STATUS, 0);
     bar_write8(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACK);
-    bar_write8(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
+    bar_write8(
+        VIRTIO_DEVICE_STATUS,
+        VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER,
+    );
 
     // Transitional virtio-net requires ANY_LAYOUT to accept flexible
     // header+payload framing for both TX and RX buffers.
@@ -433,9 +623,13 @@ fn virtio_negotiate() -> bool {
     let flex_layout = (dev_features & VIRTIO_F_ANY_LAYOUT) != 0;
     if flex_layout {
         negotiated |= VIRTIO_F_ANY_LAYOUT;
-        trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Negotiated VIRTIO_F_ANY_LAYOUT\n"); });
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] Negotiated VIRTIO_F_ANY_LAYOUT\n");
+        });
     } else {
-        trona::uwarn!(|_lb| { _lb.str(b"[netdrv] WARN: device did not offer VIRTIO_F_ANY_LAYOUT\n"); });
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[netdrv] WARN: device did not offer VIRTIO_F_ANY_LAYOUT\n");
+        });
     }
     bar_write32(VIRTIO_GUEST_FEATURES, negotiated);
 
@@ -446,7 +640,7 @@ fn virtio_negotiate() -> bool {
         for i in 0..6 {
             mac[i] = bar_read8(VIRTIO_NET_MAC_OFFSET + i as u64);
         }
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[netdrv] MAC: ");
             for i in 0..6 {
                 if i > 0 {
@@ -462,12 +656,14 @@ fn virtio_negotiate() -> bool {
     let (rx_base, rx_avail, rx_used, rx_qsz) = match setup_queue(0, RX_VQUEUE_HINT) {
         Some(v) => v,
         None => {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to set up RX queue\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to set up RX queue\n");
+            });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netdrv] RX queue size: ");
         _lb.dec(rx_qsz as u64);
         _lb.putc(b'\n');
@@ -477,12 +673,14 @@ fn virtio_negotiate() -> bool {
     let (tx_base, tx_avail, tx_used, tx_qsz) = match setup_queue(1, TX_VQUEUE_HINT) {
         Some(v) => v,
         None => {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to set up TX queue\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to set up TX queue\n");
+            });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[netdrv] TX queue size: ");
         _lb.dec(tx_qsz as u64);
         _lb.putc(b'\n');
@@ -513,14 +711,20 @@ fn virtio_negotiate() -> bool {
     }
 
     if flex_layout {
-        trona::uinfo!(|_lb| { _lb.str(b"[netdrv] RX/TX using combined buffer layout\n"); });
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] RX/TX using combined buffer layout\n");
+        });
     } else {
-        trona::uinfo!(|_lb| { _lb.str(b"[netdrv] RX/TX using strict header+payload chain layout\n"); });
+        trona_runtime::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] RX/TX using strict header+payload chain layout\n");
+        });
     }
 
     // Allocate DMA buffer pools
     if !alloc_dma_buffers() {
-        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to allocate DMA buffers\n");
+        });
         bar_write8(VIRTIO_DEVICE_STATUS, 0);
         return false;
     }
@@ -535,8 +739,12 @@ fn virtio_negotiate() -> bool {
     prefill_rx_ring();
 
     // SAFETY: Single-threaded init.
-    unsafe { *(&raw mut VIRTIO_INITIALIZED) = true; }
-    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] virtio-net initialized OK\n"); });
+    unsafe {
+        *(&raw mut VIRTIO_INITIALIZED) = true;
+    }
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] virtio-net initialized OK\n");
+    });
     true
 }
 
@@ -547,17 +755,21 @@ pub(crate) fn alloc_dma_buffers() -> bool {
     let tx_total_bytes = (TX_BUF_COUNT * BUF_SIZE) as u64;
     let tx_pages = (tx_total_bytes + 4095) / 4096;
 
-    let rx_base = match mmap_alloc(DMA_BUF_HINT, rx_pages) {
+    let rx_base = match mmap_alloc(0, rx_pages) {
         Some(v) => v,
         None => {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to alloc RX DMA buffers\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to alloc RX DMA buffers\n");
+            });
             return false;
         }
     };
-    let tx_base = match mmap_alloc(DMA_BUF_HINT + rx_pages * 4096, tx_pages) {
+    let tx_base = match mmap_alloc(0, tx_pages) {
         Some(v) => v,
         None => {
-            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to alloc TX DMA buffers\n"); });
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Failed to alloc TX DMA buffers\n");
+            });
             return false;
         }
     };
@@ -580,7 +792,9 @@ pub(crate) fn alloc_dma_buffers() -> bool {
             let vaddr = rx_base + (i * BUF_SIZE) as u64;
             rx_phys[i] = vaddr_to_phys(vaddr);
             if rx_phys[i] == 0 {
-                trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get RX buf phys addr\n"); });
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[netdrv] Failed to get RX buf phys addr\n");
+                });
                 return false;
             }
         }
@@ -590,7 +804,9 @@ pub(crate) fn alloc_dma_buffers() -> bool {
             let vaddr = tx_base + (i * BUF_SIZE) as u64;
             tx_phys[i] = vaddr_to_phys(vaddr);
             if tx_phys[i] == 0 {
-                trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get TX buf phys addr\n"); });
+                trona_runtime::uerror!(|_lb| {
+                    _lb.str(b"[netdrv] Failed to get TX buf phys addr\n");
+                });
                 return false;
             }
         }
@@ -677,6 +893,27 @@ pub(crate) fn read_isr() -> u8 {
     }
 }
 
+/// Re-enable virtqueue interrupts on RX + TX by clearing the
+/// `AVAIL_F_NO_INTERRUPT` flag in each available ring. Queue setup leaves
+/// interrupts suppressed; the reactor calls this once *after* binding the IRQ
+/// handler to its EventQueue, so device interrupts begin delivering with no
+/// pre-bind lost-wakeup window. Transport-neutral — both legacy and modern
+/// setup record the queue bases in these globals.
+pub(crate) fn enable_queue_interrupts() {
+    unsafe {
+        let rx_base = *(&raw const RX_QUEUE_BASE);
+        if rx_base != 0 {
+            let avail = (rx_base + *(&raw const RX_AVAIL_OFF)) as *mut u16;
+            core::ptr::write_volatile(avail, 0);
+        }
+        let tx_base = *(&raw const TX_QUEUE_BASE);
+        if tx_base != 0 {
+            let avail = (tx_base + *(&raw const TX_AVAIL_OFF)) as *mut u16;
+            core::ptr::write_volatile(avail, 0);
+        }
+    }
+}
+
 /// Notify RX queue (transport-aware).
 pub(crate) fn transport_notify_rx() {
     if unsafe { *(&raw const crate::USING_MODERN_TRANSPORT) } {
@@ -730,7 +967,8 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         let inflight = avail_idx.wrapping_sub(*(&raw const TX_LAST_USED_IDX));
         if inflight as usize >= limit {
             tx_reclaim();
-            let inflight = (*(&raw const TX_AVAIL_IDX)).wrapping_sub(*(&raw const TX_LAST_USED_IDX));
+            let inflight =
+                (*(&raw const TX_AVAIL_IDX)).wrapping_sub(*(&raw const TX_LAST_USED_IDX));
             if inflight as usize >= limit {
                 return false;
             }
@@ -915,7 +1153,8 @@ pub(crate) fn rx_repost(buf_idx: usize) {
         }
 
         // Add to available ring
-        let ring_entry = (base + avail_off + 4 + ((avail_idx as usize % qsz) * 2) as u64) as *mut u16;
+        let ring_entry =
+            (base + avail_off + 4 + ((avail_idx as usize % qsz) * 2) as u64) as *mut u16;
         *ring_entry = desc_head as u16;
 
         // Memory barrier

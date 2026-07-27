@@ -1,81 +1,144 @@
-//! SaltyOS getty — terminal session setup program
+//! SaltyOS getty — boot console session bootstrap.
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Analogous to agetty(8). Opens a PTY slave, creates a new session,
-//! acquires the controlling terminal, then execs login (or bash as fallback).
-//!
-//! Lifecycle:
-//!   init spawns getty (SPAWN_FLAG_RESPAWN) →
-//!   getty: close fds → setsid → open /dev/pts/0 → dup → TIOCSCTTY → exec login →
-//!   login authenticates → exec shell → shell exits → procmgr respawns getty
+//! `posix_getty` runs the classic getty sequence for the boot console:
+//! become a session leader, open `/dev/console` (the pty0-backed console
+//! tty), claim it as the controlling terminal via `TIOCSCTTY`, install it
+//! as stdin/stdout/stderr, then `execve("/bin/login")` (falling back to an
+//! interactive shell). `TIOCSCTTY` also seeds the foreground process group
+//! from the caller's pgid, so login and its children take console signals.
 
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 use trona_posix::*;
+
+fn append_decimal(buf: &mut [u8], pos: &mut usize, mut value: u64) -> bool {
+    if *pos >= buf.len() {
+        return false;
+    }
+    if value == 0 {
+        if *pos >= buf.len() {
+            return false;
+        }
+        buf[*pos] = b'0';
+        *pos += 1;
+        return true;
+    }
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    while value != 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    if *pos + count > buf.len() {
+        return false;
+    }
+    while count != 0 {
+        count -= 1;
+        buf[*pos] = digits[count];
+        *pos += 1;
+    }
+    true
+}
+
+fn build_tty_env_var(buf: &mut [u8], tty_dev: u64) -> bool {
+    let mut pos = 0usize;
+    let prefix = b"TTY=";
+    if prefix.len() >= buf.len() {
+        return false;
+    }
+    while pos < prefix.len() {
+        buf[pos] = prefix[pos];
+        pos += 1;
+    }
+
+    if tty_dev == trona_posix::consts::TTY_DEV_CONSOLE {
+        let suffix = b"/dev/console";
+        if pos + suffix.len() + 1 > buf.len() {
+            return false;
+        }
+        for &b in suffix {
+            buf[pos] = b;
+            pos += 1;
+        }
+    } else if tty_dev >= trona_posix::consts::TTY_DEV_PTS_BASE {
+        let prefix = b"/dev/pts/";
+        if pos + prefix.len() + 1 > buf.len() {
+            return false;
+        }
+        for &b in prefix {
+            buf[pos] = b;
+            pos += 1;
+        }
+        if !append_decimal(
+            buf,
+            &mut pos,
+            tty_dev - trona_posix::consts::TTY_DEV_PTS_BASE,
+        ) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if pos >= buf.len() {
+        return false;
+    }
+    buf[pos] = 0;
+    true
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     unsafe {
-        trona::serial::serial_puts(b"[posix_getty] starting session setup\n");
+        trona_runtime::debug::serial::serial_puts(b"[posix_getty] bootstrapping console session\n");
 
-        // 1. Close CRT-opened /dev/console fds
-        posix_close(0);
-        posix_close(1);
-        posix_close(2);
+        // Become a session leader (init already spawns getty as one, so
+        // this is idempotent) ahead of claiming a controlling terminal.
+        posix_setsid();
 
-        // 2. Create new session (sid=pid, pgid=pid)
-        let sid = posix_setsid();
-        if sid < 0 {
-            trona::serial::serial_puts(b"[posix_getty] setsid failed\n");
+        // Open the boot console tty (pty0-backed) and make it this
+        // session's controlling terminal. TIOCSCTTY records the session as
+        // pty0's ctty owner and seeds the foreground pgrp from our pgid.
+        let console_fd = posix_open(b"/dev/console\0".as_ptr(), O_RDWR as i32, 0);
+        if console_fd < 0 {
+            trona_runtime::debug::serial::serial_puts(
+                b"[posix_getty] FATAL: cannot open /dev/console\n",
+            );
+            posix_exit(1);
         }
-
-        // 3. Open PTY slave as fd 0 — retry with backoff if TTYD/VFS not ready
-        let mut fd0 = -1i32;
-        let mut delay_ns: u64 = 100_000_000; // 100ms
-        for _attempt in 0..5u32 {
-            fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
-            if fd0 >= 0 { break; }
-            trona::serial::serial_puts(b"[posix_getty] /dev/pts/0 open failed, retrying\n");
-            trona::syscall::syscall(trona::SYS_NANOSLEEP, 0, delay_ns, 0, 0, 0, 0);
-            delay_ns *= 2;
-        }
-        if fd0 < 0 {
-            trona::serial::serial_puts(b"[posix_getty] /dev/pts/0 open failed after retries\n");
+        if posix_ioctl(console_fd, TIOCSCTTY, 0) < 0 {
+            trona_runtime::debug::serial::serial_puts(b"[posix_getty] FATAL: TIOCSCTTY failed\n");
             posix_exit(1);
         }
 
-        // 4. Dup to stdout/stderr
-        posix_dup(fd0); // fd 1
-        posix_dup(fd0); // fd 2
+        // Wire stdin/stdout/stderr to the controlling console tty.
+        posix_dup2(console_fd, 0);
+        posix_dup2(console_fd, 1);
+        posix_dup2(console_fd, 2);
 
-        // 5. Acquire controlling terminal
-        let tio = posix_ioctl(fd0, 0x540E, 0); // TIOCSCTTY
-        if tio < 0 {
-            trona::serial::serial_puts(b"[posix_getty] TIOCSCTTY failed\n");
+        let mut tty_env_buf = [0u8; 40];
+        if !build_tty_env_var(&mut tty_env_buf, TTY_DEV_CONSOLE) {
+            trona_runtime::debug::serial::serial_puts(
+                b"[posix_getty] FATAL: tty env build failed\n",
+            );
+            posix_exit(1);
         }
 
-        // 5b. Set foreground process group for the controlling tty.
-        // Some shells defer prompt/input until tcgetpgrp() matches getpgrp().
-        let fg_pgid: u64 = if sid > 0 {
-            sid as u64
-        } else {
-            let pid = posix_getpid();
-            if pid > 0 { pid as u64 } else { 0 }
-        };
-        if fg_pgid != 0 {
-            let pgrp = posix_ioctl(fd0, 0x5410, fg_pgid); // TIOCSPGRP
-            if pgrp < 0 {
-                trona::serial::serial_puts(b"[posix_getty] TIOCSPGRP failed\n");
-            }
-        }
+        // Type=notify readiness — init resolves the caller's manifest
+        // entry from the per-client MP context.
+        trona_runtime::init_notify_ready();
 
-        // 6. Build minimal environment for login/bash
         let mut path_buf = [0u8; 48];
         let prefix = b"PATH=";
-        let path_val = trona::consts::posix::DEFAULT_PATH;
+        let path_val = trona_posix::consts::DEFAULT_PATH;
         let mut i = 0usize;
         while i < prefix.len() {
             path_buf[i] = prefix[i];
@@ -93,49 +156,43 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             path_buf.as_ptr(),
             b"HOME=/\0".as_ptr(),
             b"TERM=vt100\0".as_ptr(),
-            b"TTY=/dev/pts/0\0".as_ptr(),
+            tty_env_buf.as_ptr(),
             core::ptr::null(),
         ];
 
-        // 7. Try exec login first — handles authentication and credential setup
-        trona::serial::serial_puts(b"[posix_getty] session ready, exec login\n");
+        trona_runtime::debug::serial::serial_puts(b"[posix_getty] tty ready, exec login\n");
 
-        let login_argv: [*const u8; 2] = [
-            b"login\0".as_ptr(),
-            core::ptr::null(),
-        ];
+        let login_argv: [*const u8; 2] = [b"login\0".as_ptr(), core::ptr::null()];
         posix_execve(
             b"/bin/login\0".as_ptr(),
             login_argv.as_ptr(),
             new_envp.as_ptr(),
         );
 
-        // 8. Login not available — fall back to bash (early boot / no rootfs)
-        trona::serial::serial_puts(b"[posix_getty] login exec failed, falling back to bash\n");
+        trona_runtime::debug::serial::serial_puts(
+            b"[posix_getty] login exec failed, falling back to bash\n",
+        );
 
         let bash_envp: [*const u8; 7] = [
             path_buf.as_ptr(),
             b"HOME=/\0".as_ptr(),
             b"TERM=vt100\0".as_ptr(),
-            b"SHELL=/bin/bash\0".as_ptr(),
+            b"SHELL=/usr/bin/bash\0".as_ptr(),
             b"PS1=$ \0".as_ptr(),
-            b"TTY=/dev/pts/0\0".as_ptr(),
+            tty_env_buf.as_ptr(),
             core::ptr::null(),
         ];
 
-        let bash_argv: [*const u8; 3] = [
-            b"bash\0".as_ptr(),
-            b"-i\0".as_ptr(),
-            core::ptr::null(),
-        ];
+        let bash_argv: [*const u8; 3] = [b"bash\0".as_ptr(), b"-i\0".as_ptr(), core::ptr::null()];
         posix_execve(
-            b"/bin/bash\0".as_ptr(),
+            b"/usr/bin/bash\0".as_ptr(),
             bash_argv.as_ptr(),
             bash_envp.as_ptr(),
         );
 
-        // Both failed
-        trona::serial::serial_puts(b"[posix_getty] all exec attempts failed\n");
+        trona_runtime::debug::serial::serial_puts(
+            b"[posix_getty] FATAL: all exec attempts failed\n",
+        );
         posix_exit(1);
     }
 }

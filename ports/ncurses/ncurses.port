@@ -105,5 +105,17 @@ ac_cv_type_ssize_t = yes
 cf_cv_wchar_t = yes
 cf_cv_wint_t = yes
 
-[install]
-libncursesw.a = lib/libncursesw.a
+[stage]
+mode = make-install
+# ncurses's install target creates usr/include/ncursesw/, the ncurses.h and
+# curses.h symlinks downstream ports look for, and the pkg-config metadata.
+# --disable-database already suppresses terminfo install.
+
+[stage.exclude]
+usr/share/man
+usr/share/doc
+# termcap.h is owned by basaltc (FreeBSD-style single-owner model: base
+# exports the canonical termcap API declarations, ncurses supplies the
+# actual implementation via -lncursesw at link time). Dropping ncurses's
+# copy avoids a sysroot-overlay collision with basaltc's header.
+usr/include/termcap.h

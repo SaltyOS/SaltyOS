@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! VFS IPC module — dispatch, event loop, and timer management.
+//
+//! Owner-reactor IPC plumbing. Cookie encoding, label namespaces,
+//! and the dispatcher that fan-outs over the four cookie kinds.
 
-pub(crate) mod loop_;
-pub(crate) mod mount_ipc;
-pub(crate) mod timer_wheel;
+pub(crate) mod cookie;
+pub(crate) mod dispatch;
+pub(crate) mod protocol;

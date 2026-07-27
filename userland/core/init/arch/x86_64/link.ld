@@ -21,14 +21,20 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    .data ALIGN(4K) : {
-        *(.data .data.*)
+    .data.rel.ro ALIGN(8) : {
+        *(.data.rel.ro .data.rel.ro.*)
         *(.got)
         *(.got.plt)
     }
 
     .dynamic : { *(.dynamic) }
     .rela.dyn : { *(.rela.dyn) *(.rela.plt) }
+
+    . = ALIGN(4K);
+
+    .data : {
+        *(.data .data.*)
+    }
 
     .bss ALIGN(4K) : {
         *(.bss .bss.*)

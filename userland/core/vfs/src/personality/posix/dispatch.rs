@@ -1,564 +1,160 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! POSIX personality dispatch — routes POSIX-specific VFS IPC labels.
+//
+//! POSIX label-range dispatch entry — `0x500..=0x53F`.
+//!
+//! Owner-reactor's frontend `kind=0` branch delegates here when
+//! the client's [`Personality`] is `Posix`. This module routes
+//! the inbound label onto the matching POSIX entry under
+//! `personality::posix::*`. Each entry decodes the POSIX wire
+//! shape and emits the reply through `personality::reply::*`.
+//!
+//! No request-decoding logic lives here — that's the entry's
+//! job. The dispatcher is a single fan-out match so a malformed
+//! label is rejected at one place rather than once per entry.
+//!
+//! [`Personality`]: super::super::Personality
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::consts::server::*;
-use trona::protocol::posix::*;
-use trona::protocol::vfs::*;
-use trona::types::core::*;
-use trona::types::posix::*;
+use trona_kernel::core_types::TronaMsg;
+use trona_server::ReplyLease;
 
-use super::{at_ops, fd_ops, inet, misc, poll, socket, tty};
-use crate::fileops::pipe;
+use crate::core::error::VfsError;
 use crate::owner::VfsState;
-use crate::personality::posix::consts::*;
-use crate::server::consts::*;
-use crate::server::types::*;
+use crate::personality::wire::send_error_reply;
+use crate::server::types::ClientHandle;
+use trona_protocol::vfs::public::{
+    VFS_ACCEPT, VFS_ACCESS, VFS_BIND, VFS_CANON_PATH, VFS_CHDIR, VFS_CHMOD, VFS_CHOWN,
+    VFS_CLIENT_EXIT, VFS_CLOSE, VFS_CONNECT, VFS_DUP, VFS_DUP2, VFS_DUP3, VFS_EPOLL_CREATE,
+    VFS_EPOLL_CTL, VFS_EPOLL_WAIT, VFS_FACCESSAT, VFS_FCHMOD, VFS_FCHOWN, VFS_FCNTL, VFS_FDATASYNC,
+    VFS_FGETXATTR, VFS_FIFO_OPEN, VFS_FLISTXATTR, VFS_FREMOVEXATTR, VFS_FSETXATTR, VFS_FSTAT,
+    VFS_FSTATAT, VFS_FSYNC, VFS_FTRUNCATE, VFS_FUTIMES, VFS_GET_BACKING_MO, VFS_GET_CTTY_DEV,
+    VFS_GETCWD, VFS_GETDENTS, VFS_GETPEERNAME, VFS_GETSOCKNAME, VFS_GETSOCKOPT, VFS_IOCTL,
+    VFS_ISATTY, VFS_LINK, VFS_LISTEN, VFS_LSTAT, VFS_MKDIR, VFS_MKFIFO, VFS_MKNOD, VFS_MOUNT,
+    VFS_MOUNT_LIST, VFS_OPEN, VFS_OPEN_FOR_EXEC, VFS_OPENAT, VFS_PIPE, VFS_PIPE2, VFS_POLL,
+    VFS_PTY_READY, VFS_READ, VFS_READLINK, VFS_RECV, VFS_REGISTER_BULK_SHM, VFS_RELEASE_BULK_SHM,
+    VFS_REMOUNT, VFS_RENAME, VFS_RMDIR, VFS_SEEK, VFS_SEND, VFS_SETSOCKOPT, VFS_SHM_OPEN,
+    VFS_SHM_UNLINK, VFS_SHUTDOWN, VFS_SOCKET, VFS_SOCKETPAIR, VFS_STAT, VFS_STAT_FOR_EXEC,
+    VFS_STATVFS, VFS_SYMLINK, VFS_TCGETATTR, VFS_TCSETATTR, VFS_TRUNCATE, VFS_UMOUNT, VFS_UNLINK,
+    VFS_UTIMES, VFS_WRITE,
+};
 
-/// Dispatch a POSIX-specific VFS label.
-///
-/// Returns `Some(skip_reply)` if the label was handled, `None` if unrecognised.
+/// Dispatch a frontend RPC whose label landed in the POSIX
+/// range. Caller (the owner-reactor frontend handler) has
+/// already resolved `client` from the inbound badge and parked
+/// the saved reply lease into a `ReplyLease`.
 pub(crate) unsafe fn dispatch(
     state: &mut VfsState,
-    cli_handle: ClientHandle,
-    msg: *const TronaMsg,
-    reply: *mut TronaMsg,
-) -> Option<bool> {
-    unsafe {
-        let mut skip_reply = false;
-        match (*msg).label {
-            // File operations — redirect to _owned versions
-            VFS_POSIX_OPEN => {
-                crate::fileops::open::handle_open_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_STAT => {
-                crate::fileops::stat::handle_stat_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_STAT_FOR_EXEC => {
-                crate::fileops::stat::handle_stat_for_exec_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_CANON_PATH => {
-                crate::fileops::stat::handle_canon_path_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FSTAT => {
-                crate::fileops::stat::handle_fstat_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_UNLINK => {
-                crate::fileops::mutate::handle_unlink_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_RENAME => {
-                crate::fileops::mutate::handle_rename_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_MKDIR => {
-                crate::fileops::mutate::handle_mkdir_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_RMDIR => {
-                crate::fileops::mutate::handle_rmdir_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_OPENDIR => {
-                crate::fileops::dir::handle_opendir_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_READDIR => {
-                crate::fileops::dir::handle_readdir_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_MKFIFO => {
-                crate::fileops::mutate::handle_mkfifo_owned(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_ACCESS => {
-                crate::fileops::stat::handle_access_owned(state, cli_handle, msg, reply);
-            }
-            // POSIX pipe and fd duplication
-            VFS_POSIX_PIPE => {
-                pipe::handle_pipe(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_DUP => {
-                fd_ops::handle_dup(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_DUP2 => {
-                fd_ops::handle_dup2(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_DUP3 => {
-                fd_ops::handle_dup3(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_CLONE_FDS => {
-                fd_ops::handle_clone_fds(state, cli_handle, msg, reply);
-            }
-            // Stat variants
-            VFS_POSIX_LSTAT => {
-                at_ops::handle_lstat(state, cli_handle, msg, reply);
-            }
-            // Poll / epoll
-            VFS_POSIX_POLL => {
-                skip_reply = poll::handle_poll(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_EPOLL_CREATE => {
-                poll::handle_epoll_create(state, cli_handle, reply);
-            }
-            VFS_POSIX_EPOLL_CTL => {
-                poll::handle_epoll_ctl(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_EPOLL_WAIT => {
-                skip_reply = poll::handle_epoll_wait(state, cli_handle, msg, reply);
-            }
-            // SHM
-            VFS_POSIX_SHM_OPEN => {
-                skip_reply = misc::handle_shm_open(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_SHM_UNLINK => {
-                skip_reply = misc::handle_shm_unlink(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FTRUNCATE => {
-                skip_reply = misc::handle_ftruncate(state, cli_handle, msg, reply);
-            }
-            // Sockets
-            VFS_POSIX_SOCKET => {
-                skip_reply = socket::handle_socket(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_BIND => {
-                if (*msg).regs[1] == AF_INET as u64 {
-                    skip_reply = inet::handle_inet_bind(state, cli_handle, msg, reply);
-                } else {
-                    skip_reply = socket::handle_bind(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_LISTEN => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    skip_reply = inet::handle_inet_listen(state, cli_handle, msg, reply);
-                } else {
-                    skip_reply = socket::handle_listen(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_ACCEPT => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    skip_reply = inet::handle_inet_accept(state, cli_handle, msg, reply);
-                } else {
-                    skip_reply = socket::handle_accept(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_CONNECT => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    skip_reply = inet::handle_inet_connect(state, cli_handle, msg, reply);
-                } else {
-                    skip_reply = socket::handle_connect(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_SENDMSG => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    if (*msg).regs[3] != 0 || (*msg).regs[4] != 0 {
-                        skip_reply = inet::handle_inet_sendto(state, cli_handle, msg, reply);
-                    } else {
-                        skip_reply = inet::handle_inet_write(state, cli_handle, fd, msg, reply);
-                    }
-                } else {
-                    skip_reply = socket::handle_sendmsg(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_RECVMSG => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    let inet_flags = (*msg).regs[2] as u32;
-                    if (inet_flags & INET_RECV_FLAG_WANT_ADDR) != 0 {
-                        skip_reply = inet::handle_inet_recvfrom(state, cli_handle, msg, reply);
-                    } else {
-                        skip_reply = inet::handle_inet_read(state, cli_handle, fd, msg, reply);
-                    }
-                } else {
-                    skip_reply = socket::handle_recvmsg(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_SOCKPAIR => {
-                skip_reply = socket::handle_sockpair(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_SHUTDOWN => {
-                let fd = (*msg).regs[0] as i32;
-                let is_inet = is_fd_type(state, cli_handle, fd, ObjectKind::InetSocket);
-                if is_inet {
-                    skip_reply = inet::handle_inet_shutdown(state, cli_handle, msg, reply);
-                } else {
-                    skip_reply = socket::handle_shutdown(state, cli_handle, msg, reply);
-                }
-            }
-            VFS_POSIX_GETSOCKNAME => {
-                skip_reply = inet::handle_inet_getsockname(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_GETPEERNAME => {
-                skip_reply = inet::handle_inet_getpeername(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_SETSOCKOPT => {
-                skip_reply = inet::handle_inet_setsockopt(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_GETSOCKOPT => {
-                skip_reply = inet::handle_inet_getsockopt(state, cli_handle, msg, reply);
-            }
-            // Misc POSIX
-            VFS_POSIX_ISATTY => {
-                tty::handle_isatty(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_IOCTL => {
-                misc::handle_ioctl(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FCNTL => {
-                misc::handle_fcntl(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_CHDIR => {
-                misc::handle_chdir(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_GETCWD => {
-                misc::handle_getcwd(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_TCGETATTR => {
-                tty::handle_tcgetattr(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_TCSETATTR => {
-                tty::handle_tcsetattr(state, cli_handle, msg, reply);
-            }
-            // *at() family
-            VFS_POSIX_OPENAT => {
-                at_ops::handle_openat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FSTATAT => {
-                at_ops::handle_fstatat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_UNLINKAT => {
-                at_ops::handle_unlinkat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_RENAMEAT => {
-                at_ops::handle_renameat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_MKDIRAT => {
-                at_ops::handle_mkdirat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FACCESSAT => {
-                at_ops::handle_faccessat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FCHMODAT => {
-                at_ops::handle_fchmodat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FCHOWNAT => {
-                at_ops::handle_fchownat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_LINKAT => {
-                at_ops::handle_linkat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_SYMLINKAT => {
-                at_ops::handle_symlinkat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_READLINKAT => {
-                at_ops::handle_readlinkat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_UTIMENSAT => {
-                at_ops::handle_utimensat(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FCHMOD => {
-                at_ops::handle_fchmod(state, cli_handle, msg, reply);
-            }
-            VFS_POSIX_FCHOWN => {
-                at_ops::handle_fchown(state, cli_handle, msg, reply);
-            }
-            // Mount namespace
-            VFS_POSIX_UNSHARE => {
-                handle_unshare(state, cli_handle, msg, reply);
-            }
-            _ => return None,
-        }
-        Some(skip_reply)
-    }
-}
-
-/// Check if a client's fd has a specific neutral backing kind.
-fn is_fd_type(state: &VfsState, cli_handle: ClientHandle, fd: i32, kind: ObjectKind) -> bool {
-    if fd < 0 || fd as usize >= MAX_CLIENT_OBJECTS {
-        return false;
-    }
-    if let Some(cli) = state.clients.get(cli_handle) {
-        let slot = &cli.objects[fd as usize];
-        slot.is_live() && slot.kind() == kind
-    } else {
-        false
-    }
-}
-
-/// POSIX `unshare(CLONE_NEWNS)` — create a private mount namespace.
-unsafe fn handle_unshare(
-    state: &mut VfsState,
-    cli_handle: ClientHandle,
-    msg: *const TronaMsg,
-    reply: *mut TronaMsg,
+    client: ClientHandle,
+    msg: &TronaMsg,
+    reply_lease: ReplyLease,
 ) {
-    const CLONE_NEWNS: u64 = 0x0002_0000;
-
     unsafe {
-        let flags = (*msg).regs[0];
-        if (flags & CLONE_NEWNS) == 0 {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return;
-        }
-
-        // Clone the current mount namespace.
-        let parent_nsh = {
-            let cli = match state.clients.get(cli_handle) {
-                Some(c) => c,
-                None => {
-                    (*reply).label = TRONA_INVALID_ARGUMENT;
-                    return;
-                }
-            };
-            if cli.mount_ns.is_valid() {
-                cli.mount_ns
-            } else {
-                state.global_ns
+        match msg.label {
+            // -------- File / fd lifecycle --------
+            VFS_OPEN | VFS_OPENAT => super::open::handle(state, client, msg, reply_lease),
+            VFS_CLOSE => super::close::handle(state, client, msg, reply_lease),
+            VFS_CLIENT_EXIT => {
+                crate::personality::wire::send_ok_reply(reply_lease, &[]);
+                crate::owner::clients::remove_client(state, client);
             }
-        };
+            VFS_DUP => super::dup::handle_dup(state, client, msg, reply_lease),
+            VFS_DUP2 => super::dup::handle_dup2(state, client, msg, reply_lease),
+            VFS_DUP3 => super::dup::handle_dup3(state, client, msg, reply_lease),
+            VFS_FCNTL => super::fcntl::handle(state, client, msg, reply_lease),
+            VFS_IOCTL => super::ioctl::handle(state, client, msg, reply_lease),
+            VFS_GET_CTTY_DEV => super::device::handle_get_ctty_dev(state, client, msg, reply_lease),
 
-        if !parent_nsh.is_valid() {
-            (*reply).label = TRONA_OUT_OF_MEMORY;
-            return;
-        }
+            // -------- I/O --------
+            VFS_READ => super::io::handle_read(state, client, msg, reply_lease),
+            VFS_WRITE => super::io::handle_write(state, client, msg, reply_lease),
+            VFS_SEEK => super::io::handle_seek(state, client, msg, reply_lease),
+            VFS_FSYNC | VFS_FDATASYNC => super::io::handle_fsync(state, client, msg, reply_lease),
+            VFS_FTRUNCATE => super::io::handle_ftruncate(state, client, msg, reply_lease),
+            VFS_TRUNCATE => super::setattr::handle_truncate(state, client, msg, reply_lease),
 
-        // Allocate new namespace and copy from parent.
-        let new_nsh = match state.mount_ns.alloc() {
-            Some(h) => h,
-            None => {
-                (*reply).label = TRONA_OUT_OF_MEMORY;
-                return;
+            // -------- Metadata --------
+            VFS_STAT | VFS_LSTAT | VFS_FSTAT | VFS_FSTATAT => {
+                super::stat::handle(state, client, msg, reply_lease)
             }
-        };
+            VFS_STATVFS => super::mount::handle_statvfs(state, client, msg, reply_lease),
+            VFS_ACCESS | VFS_FACCESSAT => super::access::handle(state, client, msg, reply_lease),
+            VFS_CHMOD => super::setattr::handle_chmod(state, client, msg, reply_lease),
+            VFS_FCHMOD => super::setattr::handle_fchmod(state, client, msg, reply_lease),
+            VFS_CHOWN => super::setattr::handle_chown(state, client, msg, reply_lease),
+            VFS_FCHOWN => super::setattr::handle_fchown(state, client, msg, reply_lease),
+            VFS_UTIMES => super::setattr::handle_utimes(state, client, msg, reply_lease),
+            VFS_FUTIMES => super::setattr::handle_futimes(state, client, msg, reply_lease),
+            VFS_READLINK => super::readlink::handle(state, client, msg, reply_lease),
+            VFS_GETDENTS => super::dir::handle(state, client, msg, reply_lease),
+            VFS_FGETXATTR => super::xattr::handle_fgetxattr(state, client, msg, reply_lease),
+            VFS_FLISTXATTR => super::xattr::handle_flistxattr(state, client, msg, reply_lease),
+            VFS_FSETXATTR => super::xattr::handle_fsetxattr(state, client, msg, reply_lease),
+            VFS_FREMOVEXATTR => super::xattr::handle_fremovexattr(state, client, msg, reply_lease),
 
-        {
-            let parent = match state.mount_ns.get(parent_nsh) {
-                Some(ns) => ns,
-                None => {
-                    (*reply).label = TRONA_OUT_OF_MEMORY;
-                    return;
-                }
-            };
-            let mounts_copy = parent.mounts;
-            let count = parent.mount_count;
-            let root = parent.root_mount;
+            // -------- Directory mutations --------
+            VFS_UNLINK => super::unlink::handle_unlink(state, client, msg, reply_lease),
+            VFS_RMDIR => super::unlink::handle_rmdir(state, client, msg, reply_lease),
+            VFS_LINK => super::link::handle(state, client, msg, reply_lease),
+            VFS_RENAME => super::rename::handle(state, client, msg, reply_lease),
+            VFS_MKDIR => super::mkdir::handle(state, client, msg, reply_lease),
+            VFS_SYMLINK => super::symlink::handle(state, client, msg, reply_lease),
 
-            let new_ns = match state.mount_ns.get_mut(new_nsh) {
-                Some(ns) => ns,
-                None => {
-                    (*reply).label = TRONA_OUT_OF_MEMORY;
-                    return;
-                }
-            };
-            *new_ns = crate::vfs_core::mount_ns::MountNamespace::zeroed();
-            new_ns.refcount = 1;
-            new_ns.root_mount = root;
-            new_ns.mounts = mounts_copy;
-            new_ns.mount_count = count;
-        }
+            // -------- Mount table --------
+            VFS_MOUNT => super::mount::handle_mount(state, client, msg, reply_lease),
+            VFS_UMOUNT => super::mount::handle_umount(state, client, msg, reply_lease),
+            VFS_REMOUNT => super::mount::handle_remount(state, client, msg, reply_lease),
+            VFS_MOUNT_LIST => super::mountlist::handle(state, client, msg, reply_lease),
 
-        // Update client's mount namespace.
-        let old_nsh = {
-            let cli = match state.clients.get_mut(cli_handle) {
-                Some(c) => c,
-                None => {
-                    (*reply).label = TRONA_INVALID_ARGUMENT;
-                    return;
-                }
-            };
-            let old = cli.mount_ns;
-            cli.mount_ns = new_nsh;
-            old
-        };
-
-        // Release old namespace if refcount drops to zero.
-        if old_nsh.is_valid() {
-            if let Some(old_ns) = state.mount_ns.get_mut(old_nsh) {
-                if old_ns.refcount > 0 {
-                    old_ns.refcount -= 1;
-                }
-                if old_ns.refcount == 0 {
-                    state.mount_ns.release(old_nsh);
-                }
+            // -------- POSIX-only extensions (0x5C0-0x5DF) --------
+            VFS_CHDIR => super::cwd::handle_chdir(state, client, msg, reply_lease),
+            VFS_GETCWD => super::cwd::handle_getcwd(state, client, msg, reply_lease),
+            VFS_STAT_FOR_EXEC => {
+                super::exec_helpers::handle_stat_for_exec(state, client, msg, reply_lease)
             }
-        }
-
-        (*reply).label = TRONA_OK;
-    }
-}
-
-// =========================================================================
-// Object-type-aware I/O dispatch — called from owner dispatch for
-// VFS_READ/VFS_WRITE/VFS_CLOSE
-// =========================================================================
-
-/// POSIX read dispatch: routes by object type to the appropriate backend.
-/// Returns `true` if reply should be skipped (deferred).
-pub(crate) unsafe fn dispatch_read(
-    state: &mut VfsState,
-    cli_handle: ClientHandle,
-    fd: i32,
-    msg: *const TronaMsg,
-    reply: *mut TronaMsg,
-) -> bool {
-    unsafe {
-        if fd < 0 || fd as usize >= MAX_CLIENT_OBJECTS {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return false;
-        }
-
-        let kind = match state.clients.get(cli_handle) {
-            Some(cli) => {
-                let slot = &cli.objects[fd as usize];
-                if !slot.is_live() {
-                    ObjectKind::None
-                } else {
-                    slot.kind()
-                }
+            VFS_OPEN_FOR_EXEC => {
+                super::exec_helpers::handle_open_for_exec(state, client, msg, reply_lease)
             }
-            None => ObjectKind::None,
-        };
-
-        match kind {
-            ObjectKind::InetSocket => inet::handle_inet_read(state, cli_handle, fd, msg, reply),
-            ObjectKind::UnixSocket => socket::handle_socket_read(state, cli_handle, fd, reply),
-            ObjectKind::Pipe => pipe::handle_pipe_read(state, cli_handle, fd, msg, reply),
-            ObjectKind::Device => misc::handle_device_read(state, cli_handle, fd, msg, reply),
-            _ => crate::fileops::rw::handle_read_owned(state, cli_handle, msg, reply),
-        }
-    }
-}
-
-/// POSIX write dispatch: routes by object type.
-pub(crate) unsafe fn dispatch_write(
-    state: &mut VfsState,
-    cli_handle: ClientHandle,
-    fd: i32,
-    msg: *const TronaMsg,
-    reply: *mut TronaMsg,
-) -> bool {
-    unsafe {
-        if fd < 0 || fd as usize >= MAX_CLIENT_OBJECTS {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return false;
-        }
-
-        let kind = match state.clients.get(cli_handle) {
-            Some(cli) => {
-                let slot = &cli.objects[fd as usize];
-                if !slot.is_live() {
-                    ObjectKind::None
-                } else {
-                    slot.kind()
-                }
+            VFS_CANON_PATH => {
+                super::exec_helpers::handle_canon_path(state, client, msg, reply_lease)
             }
-            None => ObjectKind::None,
-        };
+            VFS_MKFIFO => super::mkfifo::handle(state, client, msg, reply_lease),
+            VFS_MKNOD => super::mknod::handle(state, client, msg, reply_lease),
+            VFS_ISATTY => super::tty::handle_isatty(state, client, msg, reply_lease),
+            VFS_TCGETATTR => super::tty::handle_tcgetattr(state, client, msg, reply_lease),
+            VFS_TCSETATTR => super::tty::handle_tcsetattr(state, client, msg, reply_lease),
+            VFS_PTY_READY => super::tty::handle_pty_ready(state, client, msg, reply_lease),
 
-        match kind {
-            ObjectKind::InetSocket => inet::handle_inet_write(state, cli_handle, fd, msg, reply),
-            ObjectKind::UnixSocket => {
-                socket::handle_socket_write(state, cli_handle, fd, msg, reply)
+            // -------- mmap / SHM --------
+            VFS_GET_BACKING_MO => super::mmap::handle(state, client, msg, reply_lease),
+            VFS_SHM_OPEN | VFS_SHM_UNLINK => super::shm::handle(state, client, msg, reply_lease),
+            VFS_REGISTER_BULK_SHM => {
+                super::bulk_shm::handle_register(state, client, msg, reply_lease)
             }
-            ObjectKind::Pipe => pipe::handle_pipe_write(state, cli_handle, fd, msg, reply),
-            ObjectKind::Device => misc::handle_device_write(state, cli_handle, fd, msg, reply),
-            _ => crate::fileops::rw::handle_write_owned(state, cli_handle, msg, reply),
-        }
-    }
-}
+            VFS_RELEASE_BULK_SHM => {
+                super::bulk_shm::handle_release(state, client, msg, reply_lease)
+            }
 
-/// POSIX close pre-cleanup: releases personality-specific resources before
-/// the neutral `handle_close_owned` releases the object slot.
-pub(crate) unsafe fn pre_close(state: &mut VfsState, cli_handle: ClientHandle, fd: i32) {
-    unsafe {
-        if fd < 0 || fd as usize >= MAX_CLIENT_OBJECTS {
-            return;
-        }
+            // -------- Poll / epoll --------
+            VFS_POLL => super::poll::handle(state, client, msg, reply_lease),
+            VFS_EPOLL_CREATE | VFS_EPOLL_CTL | VFS_EPOLL_WAIT => {
+                super::epoll::handle(state, client, msg, reply_lease)
+            }
 
-        let kind = match state.clients.get(cli_handle) {
-            Some(cli) => {
-                let slot = &cli.objects[fd as usize];
-                if !slot.is_live() {
-                    return;
-                }
-                slot.kind()
-            }
-            None => return,
-        };
+            // -------- Pipes / FIFOs --------
+            VFS_PIPE | VFS_PIPE2 => super::pipe::handle(state, client, msg, reply_lease),
+            VFS_FIFO_OPEN => super::fifo::handle(state, client, msg, reply_lease),
 
-        match kind {
-            ObjectKind::InetSocket => {
-                inet::close_inet_socket(state, cli_handle, fd);
+            // -------- Sockets --------
+            //
+            // `super::socket::handle` owns the entire POSIX family
+            // and routes to the per-AF backing path internally.
+            VFS_SOCKET | VFS_SOCKETPAIR | VFS_BIND | VFS_LISTEN | VFS_ACCEPT | VFS_CONNECT
+            | VFS_SHUTDOWN | VFS_SEND | VFS_RECV | VFS_GETSOCKNAME | VFS_GETPEERNAME
+            | VFS_SETSOCKOPT | VFS_GETSOCKOPT => {
+                super::socket::handle(state, client, msg, reply_lease)
             }
-            ObjectKind::UnixSocket => {
-                socket::close_socket(state, cli_handle, fd);
-            }
-            ObjectKind::Pipe => {
-                pipe::close_pipe(state, cli_handle, fd);
-            }
-            ObjectKind::Device => {
-                misc::pre_close_device(state, cli_handle, fd);
-            }
-            ObjectKind::Epoll => {
-                let epoll_handle = match state.clients.get(cli_handle) {
-                    Some(cli) => cli.objects[fd as usize].epoll_handle(),
-                    None => return,
-                };
-                if epoll_handle.is_valid() {
-                    let _ = state.epolls.release(epoll_handle);
-                }
-            }
-            _ => {}
-        }
-    }
-}
 
-/// POSIX client exit cleanup: release personality-specific resources for
-/// all objects held by the exiting client.
-pub(crate) unsafe fn cleanup_client_objects(state: &mut VfsState, cli_handle: ClientHandle) {
-    unsafe {
-        let mut work = [(ObjectKind::None, 0i32); MAX_CLIENT_OBJECTS];
-        let mut work_count = 0usize;
-        let cli = match state.clients.get(cli_handle) {
-            Some(c) => c,
-            None => return,
-        };
-
-        for i in 0..MAX_CLIENT_OBJECTS {
-            if !cli.objects[i].is_live() {
-                continue;
-            }
-            work[work_count] = (cli.objects[i].kind(), i as i32);
-            work_count += 1;
-        }
-
-        for (kind, fd) in work[..work_count].iter().copied() {
-            match kind {
-                ObjectKind::InetSocket => {
-                    inet::close_inet_socket(state, cli_handle, fd);
-                }
-                ObjectKind::UnixSocket => {
-                    socket::close_socket(state, cli_handle, fd);
-                }
-                ObjectKind::Pipe => {
-                    pipe::close_pipe(state, cli_handle, fd);
-                }
-                ObjectKind::Device => {
-                    misc::pre_close_device(state, cli_handle, fd);
-                }
-                ObjectKind::Epoll => {
-                    if let Some(cli) = state.clients.get(cli_handle) {
-                        let epoll_handle = cli.objects[fd as usize].epoll_handle();
-                        if epoll_handle.is_valid() {
-                            let _ = state.epolls.release(epoll_handle);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            // -------- Unknown POSIX label --------
+            _ => send_error_reply(reply_lease, VfsError::NotSup),
         }
     }
 }

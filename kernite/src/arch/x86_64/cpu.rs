@@ -2,14 +2,24 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::kdebug;
-
 /// IA32_FS_BASE MSR address
 const IA32_FS_BASE_MSR: u32 = 0xC000_0100;
 /// IA32_GS_BASE MSR address
 const IA32_GS_BASE_MSR: u32 = 0xC000_0101;
 /// IA32_KERNEL_GS_BASE MSR address
 const IA32_KERNEL_GS_BASE_MSR: u32 = 0xC000_0102;
+
+unsafe extern "C" {
+    fn x86_cpu_rdtsc() -> u64;
+    fn x86_cpu_rdmsr(msr: u32) -> u64;
+    fn x86_cpu_wrmsr(msr: u32, value: u64);
+    fn x86_cpu_set_per_cpu_canary(canary: u64);
+    fn x86_cpu_current_cpu() -> u32;
+    fn x86_cpu_next_invoke_seq() -> u64;
+    fn x86_cpu_current_invoke_seq() -> u64;
+    fn x86_cpu_set_kernel_stack(stack_top: u64);
+    fn x86_cpu_get_kernel_stack() -> u64;
+}
 
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 16;
@@ -21,11 +31,11 @@ pub const MAX_CPUS: usize = 16;
 /// Offset 4:  padding (u32)  [implicit]
 /// Offset 8:  kernel_stack (u64)
 /// Offset 16: saved_rsp (u64)
-/// Offset 24: fpu_owner (u64) — pointer to TCB that owns FPU state in hardware
-/// Offset 32: invoke_seq (u64) — per-CPU monotonic invoke counter for diagnostics
-/// Offset 40: stack_canary (u64) — per-CPU canary for syscall stack corruption detection
+/// Offset 24: invoke_seq (u64) — per-CPU monotonic invoke counter for diagnostics
+/// Offset 32: stack_canary (u64) — per-CPU canary for syscall stack corruption detection
 ///
-/// Assembly accesses GS:0, GS:8, GS:16, GS:40 — offset 24+ is safe for Rust.
+/// Assembly accesses GS:0, GS:8, GS:16, GS:32. Keep the layout in sync
+/// with `kernite/src/arch/x86_64/syscall.S`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PerCpuData {
@@ -35,8 +45,6 @@ pub struct PerCpuData {
     pub kernel_stack: u64,
     /// Saved user RSP during syscall
     pub saved_rsp: u64,
-    /// Pointer to TCB that owns the current FPU/SSE state in hardware registers
-    pub fpu_owner: u64,
     /// Per-CPU monotonic sequence number incremented at every capability invocation.
     /// Used as a diagnostic correlation ID in kernel trace logs.
     pub invoke_seq: u64,
@@ -44,7 +52,7 @@ pub struct PerCpuData {
     /// Seeded from RDSEED/RDRAND during BSP/AP init.
     pub stack_canary: u64,
     /// Reserved for future use
-    _reserved: [u64; 10],
+    _reserved: [u64; 11],
 }
 
 /// Per-CPU data for each CPU
@@ -53,10 +61,9 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
         cpu_id: 0,
         kernel_stack: 0,
         saved_rsp: 0,
-        fpu_owner: 0,
         invoke_seq: 0,
         stack_canary: 0,
-        _reserved: [0; 10],
+        _reserved: [0; 11],
     };
     [INIT; MAX_CPUS]
 };
@@ -70,14 +77,16 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 /// Initialize per-CPU data for the BSP (Boot Processor)
 pub fn init_bsp() {
     unsafe {
-        crate::kdebug!(arch, |_g| { _g.puts("\n[CPU] init_bsp() called\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("\n[CPU] init_bsp() called\n");
+        });
 
         PER_CPU_DATA[0].cpu_id = 0;
 
         // Seed per-CPU stack canary from hardware RNG (RDSEED/RDRAND)
         PER_CPU_DATA[0].stack_canary = generate_stack_canary();
 
-        crate::kdebug!(arch, |_g| {
+        crate::kernel::printk::kdebug!(arch, |_g| {
             _g.puts("[CPU] PER_CPU_DATA addr: ");
             _g.hex((&raw const PER_CPU_DATA) as u64);
             _g.puts("\n[CPU] Setting GS base\n");
@@ -89,7 +98,9 @@ pub fn init_bsp() {
         write_gs_base_msr(per_cpu_base);
         write_kernel_gs_base_msr(0);
 
-        crate::kdebug!(arch, |_g| { _g.puts("[CPU] GS base set successfully\n"); });
+        crate::kernel::printk::kdebug!(arch, |_g| {
+            _g.puts("[CPU] GS base set successfully\n");
+        });
     }
 }
 
@@ -106,87 +117,78 @@ pub fn init_ap_canary(cpu_id: usize) {
 /// Generate a random stack canary value.
 /// Uses RDSEED (best), falls back to RDRAND, then TSC.
 pub fn generate_stack_canary() -> u64 {
-    if let Some(val) = crate::rng::rdseed64() {
+    if let Some(val) = crate::kernel::random::rdseed64() {
         return val;
     }
     // Fallback: read TSC and mix with a constant
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack));
-    }
-    (((hi as u64) << 32) | (lo as u64)) ^ 0xDEAD_BEEF_CAFE_BABE
+    unsafe { x86_cpu_rdtsc() ^ 0xDEAD_BEEF_CAFE_BABE }
 }
 
-/// Update the per-CPU canary cache at %gs:40 to the given thread's canary.
+/// Update the per-CPU canary cache at %gs:32 to the given thread's canary.
 ///
 /// Called during context switch so that the assembly canary check at
 /// syscall exit matches even if the thread migrated from a different CPU.
 #[inline(always)]
 pub fn set_per_cpu_canary(canary: u64) {
     unsafe {
-        // SAFETY: GS:40 corresponds to stack_canary field in PerCpuData.
-        core::arch::asm!(
-            "mov gs:[40], {}",
-            in(reg) canary,
-            options(nostack)
-        );
+        // SAFETY: GS:32 corresponds to stack_canary field in PerCpuData.
+        x86_cpu_set_per_cpu_canary(canary);
     }
 }
 
 /// Get the current CPU ID
 #[inline(always)]
 pub fn current_cpu() -> u32 {
-    let cpu_id: u32;
     unsafe {
         // Read value directly from GS:[0], not as a pointer
-        core::arch::asm!(
-            "mov {0:e}, gs:[0]",
-            out(reg) cpu_id,
-            options(nostack, pure, readonly)
-        );
+        x86_cpu_current_cpu()
     }
-    cpu_id
+}
+
+#[inline(always)]
+pub fn per_cpu_ready() -> bool {
+    let gs_base = read_gs_base_msr();
+    let start = (&raw const PER_CPU_DATA) as *const PerCpuData as u64;
+    let stride = core::mem::size_of::<PerCpuData>() as u64;
+    let end = start + stride * MAX_CPUS as u64;
+
+    gs_base >= start && gs_base < end && (gs_base - start) % stride == 0
+}
+
+#[inline(always)]
+pub fn diagnostic_current_cpu() -> usize {
+    if per_cpu_ready() {
+        (current_cpu() as usize).min(MAX_CPUS - 1)
+    } else {
+        0
+    }
 }
 
 /// Set GS base for a specific CPU by index
 ///
 /// Used during AP init before GS is functional.
 pub fn write_gs_base_for_cpu(cpu_id: usize) {
-    let base = unsafe { &PER_CPU_DATA[cpu_id] as *const _ as u64 };
+    let base = unsafe { (&raw const PER_CPU_DATA[cpu_id]) as u64 };
     write_gs_base_msr(base);
     write_kernel_gs_base_msr(0);
+}
+
+/// Read the current GS base using MSR.
+fn read_gs_base_msr() -> u64 {
+    unsafe { x86_cpu_rdmsr(IA32_GS_BASE_MSR) }
 }
 
 /// Write to GS base using MSR
 fn write_gs_base_msr(base: u64) {
     unsafe {
-        let low = base as u32;
-        let high = (base >> 32) as u32;
-
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") IA32_GS_BASE_MSR,
-            in("eax") low,
-            in("edx") high,
-            options(nostack)
-        );
+        x86_cpu_wrmsr(IA32_GS_BASE_MSR, base);
     }
 }
 
 /// Write to KERNEL_GS_BASE using MSR
 fn write_kernel_gs_base_msr(base: u64) {
     unsafe {
-        let low = base as u32;
-        let high = (base >> 32) as u32;
-
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") IA32_KERNEL_GS_BASE_MSR,
-            in("eax") low,
-            in("edx") high,
-            options(nostack)
-        );
+        x86_cpu_wrmsr(IA32_KERNEL_GS_BASE_MSR, base);
     }
 }
 
@@ -200,7 +202,9 @@ pub unsafe fn per_cpu_mut(cpu_id: u32) -> &'static mut PerCpuData {
 /// # Safety
 /// Must be called during boot before IPIs are sent.
 pub unsafe fn set_cpu_apic_id(cpu_id: usize, apic_id: u32) {
-    unsafe { CPU_APIC_IDS[cpu_id] = apic_id; }
+    unsafe {
+        CPU_APIC_IDS[cpu_id] = apic_id;
+    }
 }
 
 /// Get the hardware APIC ID for a logical CPU index
@@ -214,33 +218,20 @@ pub fn get_apic_id_for_cpu(cpu_id: usize) -> u32 {
 /// for diagnostic trace logs. Not visible to userspace.
 #[inline]
 pub fn next_invoke_seq() -> u64 {
-    let seq: u64;
     unsafe {
-        // SAFETY: GS:32 corresponds to invoke_seq field in PerCpuData.
+        // SAFETY: GS:24 corresponds to invoke_seq field in PerCpuData.
         // This is a simple RMW on a per-CPU field; no other CPU touches it.
-        core::arch::asm!(
-            "add qword ptr gs:[32], 1",
-            "mov {}, gs:[32]",
-            out(reg) seq,
-            options(nostack)
-        );
+        x86_cpu_next_invoke_seq()
     }
-    seq
 }
 
 /// Read the current per-CPU invoke sequence counter (without incrementing).
 #[inline]
 pub fn current_invoke_seq() -> u64 {
-    let seq: u64;
     unsafe {
-        // SAFETY: GS:32 corresponds to invoke_seq field in PerCpuData.
-        core::arch::asm!(
-            "mov {}, gs:[32]",
-            out(reg) seq,
-            options(nostack, pure, readonly)
-        );
+        // SAFETY: GS:24 corresponds to invoke_seq field in PerCpuData.
+        x86_cpu_current_invoke_seq()
     }
-    seq
 }
 
 /// Set kernel stack for the current CPU
@@ -251,78 +242,23 @@ pub unsafe fn set_kernel_stack(stack_top: u64) {
     // SAFETY: We access GS:[8] which corresponds to `kernel_stack` field.
     // Offset calculation: cpu_id(4) + padding(4) = 8
     unsafe {
-        core::arch::asm!(
-            "mov gs:[8], {}",
-            in(reg) stack_top,
-            options(nostack)
-        );
+        x86_cpu_set_kernel_stack(stack_top);
     }
 }
 
 /// Get kernel stack pointer for the current CPU
 pub fn get_kernel_stack() -> u64 {
-    let stack_top: u64;
     unsafe {
         // Read value directly from GS:[8]
-        core::arch::asm!(
-            "mov {}, gs:[8]",
-            out(reg) stack_top,
-            options(nostack, pure, readonly)
-        );
-    }
-    stack_top
-}
-
-/// Get the FPU owner pointer for the current CPU
-///
-/// Returns the raw TCB pointer (as *mut u8) of the thread whose FPU state
-/// is currently in the hardware registers. Null if no thread owns FPU.
-#[inline]
-pub fn get_fpu_owner() -> *mut u8 {
-    let owner: u64;
-    unsafe {
-        // SAFETY: GS:24 corresponds to fpu_owner field in PerCpuData
-        core::arch::asm!(
-            "mov {}, gs:[24]",
-            out(reg) owner,
-            options(nostack, pure, readonly)
-        );
-    }
-    owner as *mut u8
-}
-
-/// Set the FPU owner pointer for the current CPU
-///
-/// # Safety
-/// Must be called with interrupts disabled or from interrupt context.
-#[inline]
-pub unsafe fn set_fpu_owner(ptr: *mut u8) {
-    // SAFETY: GS:24 corresponds to fpu_owner field in PerCpuData
-    unsafe {
-        core::arch::asm!(
-            "mov gs:[24], {}",
-            in(reg) ptr as u64,
-            options(nostack)
-        );
+        x86_cpu_get_kernel_stack()
     }
 }
 
 /// Read the current FS_BASE MSR value (user TLS base pointer).
 #[inline]
 pub fn read_fs_base() -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe {
-        // SAFETY: Reading IA32_FS_BASE is a non-destructive MSR read.
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") IA32_FS_BASE_MSR,
-            out("eax") low,
-            out("edx") high,
-            options(nostack)
-        );
-    }
-    (high as u64) << 32 | (low as u64)
+    // SAFETY: Reading IA32_FS_BASE is a non-destructive MSR read.
+    unsafe { x86_cpu_rdmsr(IA32_FS_BASE_MSR) }
 }
 
 /// Write the FS_BASE MSR (user TLS base pointer).
@@ -332,16 +268,16 @@ pub fn read_fs_base() -> u64 {
 /// valid user-mode TLS pointer (or 0 to clear).
 #[inline]
 pub unsafe fn write_fs_base(base: u64) {
-    let low = base as u32;
-    let high = (base >> 32) as u32;
     unsafe {
         // SAFETY: Writing IA32_FS_BASE sets the user-visible FS segment base.
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") IA32_FS_BASE_MSR,
-            in("eax") low,
-            in("edx") high,
-            options(nostack)
-        );
+        x86_cpu_wrmsr(IA32_FS_BASE_MSR, base);
     }
+}
+
+/// Write the architecture ABI thread pointer restored by `swapgs` on user
+/// return. This is the user GS base while kernel GS continues to point at
+/// `PerCpuData`.
+#[inline]
+pub fn write_abi_tp_base(base: u64) {
+    write_kernel_gs_base_msr(base);
 }

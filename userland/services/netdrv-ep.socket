@@ -1,0 +1,6 @@
+[Unit]
+Name=netdrv-ep.socket
+
+[Socket]
+Provider=netdrv
+Alias=netdrv_ep

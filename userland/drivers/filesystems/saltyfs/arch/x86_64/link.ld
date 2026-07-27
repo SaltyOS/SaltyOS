@@ -27,12 +27,18 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    .data ALIGN(4K) : {
+    .data.rel.ro ALIGN(8) : {
+        *(.data.rel.ro .data.rel.ro.*)
+    }
+    .got      : { *(.got) }
+    .dynamic  : { *(.dynamic) }
+
+    . = ALIGN(4K);
+
+    .data : {
         *(.data .data.*)
     }
 
-    .got      : { *(.got) }
-    .dynamic  : { *(.dynamic) }
     .got.plt  : { *(.got.plt) }
 
     .bss ALIGN(4K) : {

@@ -74,29 +74,47 @@ Key properties:
 
 ### IPC Model
 
-Dual IPC primitive design:
+Three-plane IPC design (Fuchsia-style edge):
 
-1. **Synchronous Endpoints** (message passing)
-   - Rendezvous-style: sender blocks until receiver ready
-   - Zero-copy for large transfers (page donation)
-   - Badge identifies sender
+1. **Transport plane** — `MessagePipe` (record + cap-carrier
+   transfer) and `DataPipe` (byte stream). Each has a Core+Side
+   split: a shared `*Core` carries cross-side state, two side
+   handles each take a refcount on the core. Closing one side
+   asserts `STATE_PEER_CLOSED` on the other; reaping the last
+   side reaps the core.
 
-2. **Notifications** (signaling)
-   - Lightweight async signals (bitmap or counter)
-   - Used for IRQ delivery
-   - Combined with shared memory for async queues
+2. **RPC plane** — `MP_CALL` / reply-marked `MP_WRITE` over `MessagePipe`.
+   The caller writes a request and waits on its inbound side; the
+   server responds with a reply record. Services use one connection
+   per client or carry a transaction id in the payload when they
+   multiplex.
+
+3. **Event plane** — `EventQueue` (bounded record ring +
+   dropped-event counter) + `Watch` (one-shot state-mask
+   registration on a watchable kernel object) + `Timer`
+   (ns-precision deadline). Watchable state lives on every
+   transport object (`READABLE` / `WRITABLE` / `PEER_CLOSED` /
+   `CLOSED` etc.) so a thread can multiplex over multiple pipes
+   by arming watches against them.
+
+Plus `Futex` on a `VSpace` cap (userspace synchronisation
+primitive) and a per-task fault `MessagePipe` with **reply-to-resume**
+semantics — the kernel sends a fault record with `MP_FLAG_FAULT` and
+parks the faulter until the handler replies `KERNITE_OK` to retry the
+faulting instruction or sends a non-OK reply / calls `TCB_KILL` to
+tear the thread down.
 
 ```
-┌──────────┐                              ┌──────────┐
-│  Client  │                              │  Server  │
-└────┬─────┘                              └────┬─────┘
-     │                                         │
-     │  call(endpoint, msg)                    │
-     ├────────────────────────────────────────►│
-     │                     recv(endpoint)      │
-     │◄────────────────────────────────────────┤
-     │                     reply(msg)          │
-     │                                         │
+┌──────────┐                 MP_CALL(req)              ┌──────────┐
+│  Client  │──────────────────────────────────────────►│  Server  │
+└────┬─────┘                                            └────┬─────┘
+     │                                      MP_READ(req)      │
+     │  ──── caller waits on its inbound MessagePipe side ─── │
+     │                                                       │
+     │                    reply-marked MP_WRITE(reply)                    │
+     │◄──────────────────────────────────────────────────────┤
+     │  reply arrives as an ordinary MessagePipe record       │
+     │                                                       │
 ```
 
 ### Memory Model
@@ -144,12 +162,14 @@ without IPC to mmsrv. See [Memory Management](memory.md) for full details.
 
 | Component | Responsibility |
 |-----------|---------------|
-| `cap/` | Capability management, CNode operations, MemoryObject, untyped retype |
-| `ipc/` | Endpoints, Notifications, Futex, IRQ routing, message transfer |
-| `sched/` | EDF scheduler, thread management, priority inheritance, sleep queue |
+| `cap/` | Capability management, CNode operations, MemoryObject, untyped retype, IoPort cap |
+| `event/` | EventQueue, Watch (lost-wakeup-free), Timer, IRQ handler, watcher list, state flag publication |
+| `ipc/` | MessagePipe, DataPipe, fault pipe, Futex, transfer helpers |
+| `sched/` | 4-class scheduler (Deadline / RT FIFO / Fair-EEVDF / Idle), priority inheritance, deadline queue (ns-precision Sleep / FutexTimed / IpcTimeout / TimerFire) |
+| `task/` | Task control (`begin_destroy`, flat ThreadState transitions, blocked-reason management) |
 | `mm/` | PMM (bitmap frame allocator), VSpace (page tables + Maple tree), radix tree, node allocator |
-| `syscall/` | 28 syscalls, capability invocation dispatch, IPC fastpath |
-| `arch/x86_64/` | GDT, IDT, APIC, ACPI, paging, SMP, CPUID, FPU, PIT, SMAP/SMEP, uaccess |
+| `syscall/` | Single `KERNITE_SYS_INVOKE` syscall + capability invocation dispatch (per-object handlers) |
+| `arch/x86_64/` | GDT, IDT, APIC, ACPI, paging, SMP, CPUID, FPU, PIT, SMAP/SMEP, uaccess, port I/O (8/16/32-bit) |
 | `arch/aarch64/` | GICv3, PSCI, PL011 UART, paging (TTBR0/TTBR1), generic timer, FPU/NEON, SMP |
 
 ### Userspace Components
@@ -177,7 +197,7 @@ Organized in a domain-based layout under `userland/`:
 | `test_runner` | `tests/test_runner/` | Automated test suite (14 modules) | Implemented |
 | `hello_pe` | `tests/hello_pe/` | Win32 PE test program | Implemented |
 
-Runtime dynamic linker (`rtld`) lives in `lib/trona/rtld/` — supports both ELF (`ld-trona.so`) and PE (`ld-trona-pe.so`) formats.
+Runtime dynamic linker (`rtld`) lives in `lib/trona/rtld/` — supports both ELF (`ldtrona-elf.so`) and PE (`ldtrona-pe.so`) formats.
 
 ## Boot Sequence
 
@@ -243,30 +263,30 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 
 ### Implemented
 - Capability system with fat capabilities (32 bytes), CDT, copy/mint/move/mutate/revoke/delete
-- 12 kernel object types (including MemoryObject)
-- 28 syscalls with x86_64 (`syscall`) and aarch64 (`svc #0`) support
-- Synchronous IPC (endpoints) with send/recv/call/reply_recv/NBSend + RecvAny/ReplyRecvAny
-- Asynchronous notifications (signal/wait/poll) with combined endpoint wait + NotifReturn
-- Bound notification wake: signal wakes RecvBlocked thread on endpoint (bidirectional tcb↔notification link)
-- IPC buffer with message overflow (MR4-MR19) and capability transfer
-- IPC assembly fastpath for Call + ReplyRecv (short messages, no cap transfer)
-- Timed IPC (SendTimed/RecvTimed/RecvAnyTimed/ReplyRecvAnyTimed)
-- Futex (wait/wake/requeue) for userspace synchronization
-- Fault handling via fault endpoints with reply-to-resume
-- EDF scheduler with budget enforcement and priority inheritance
+- 24 kernel object types (Untyped, TCB, CNode, VSpace, Frame, IrqHandler, IoPort, SchedContext, MemoryObject, EventQueue, Watch, MessagePipe, MessagePipeCore, DataPipe, DataPipeCore, Timer, KernelRng, SystemControl, Clock, SystemInfo, KernelDebug, Pager, DeviceControl, VmHierarchyState)
+- Single syscall (`KERNITE_SYS_INVOKE`); every operation is a capability invocation, no ambient kernel authority
+- `MessagePipe` IPC: bounded record ring with hidden cap-carrier transfer (`CapRef` move semantics, CDT-stable global slots) and an `MpFastMailbox` cross-CPU fastpath
+- `MP_CALL` / reply-marked `MP_WRITE` over `MessagePipe`: caller writes a request and waits on the same connection for a reply record
+- `DataPipe` byte stream: lock-protected per-direction byte ring, peek-then-commit consume protocol so userspace EFAULT does not lose ring data
+- IPC buffer with message overflow (MR4-MR19) and `KERNITE_MP_FLAG_*` wire flags (CALL / REPLY / fault hint)
+- `EventQueue` + `Watch`: bounded event-record queue with dropped-event counter; `Watch` arms a (state-mask, EventQueue) registration on a watchable kernel object (lost-wakeup-free batched fire)
+- `Timer` object: ns-precision arm via `KERNITE_INV_TIMER_SET` (one-shot or periodic with missed-period coalescing), bound `EventQueue` receives `EVENT_TYPE_TIMER` records
+- IRQ handling via `IrqHandler` cap: `IRQ_BIND_EQ` pins a refcount on the bound `EventQueue` so dispatch in IRQ context can publish without locking; `IRQ_ACK` clears `STATE_SIGNALED` for the next fire
+- Per-task fault `MessagePipe` (`TCB_SET_FAULT_PIPE`): the kernel emits page-fault / OOM / illegal-instruction / breakpoint / user-exception fault records into the bound pipe; reply-to-resume is the recovery path
+- Unified ns-precision `deadline_queue` (intrusive treap): backs `Sleep` / `FutexTimed` / `IpcTimeout` / `TimerFire`; per-syscall `IpcTimeout` knob lives in `IpcBuffer.timeout_ns`
+- Futex (wait/wake/requeue) on a VSpace cap, with optional `IpcTimeout` deadline arm
+- 4-class scheduler (Deadline / RT FIFO / Fair-EEVDF / Idle) with budget enforcement and priority inheritance over `MP_CALL` chains
 - MemoryObject-based memory management: 4-level radix tree, COW clone, reverse maps, dual-source commit (untyped + PMM fallback)
 - VSpace with Maple tree region tracking, COW fast-path (kernel-internal, no IPC)
 - PMM with per-frame FrameOwner tracking and emergency reserve
-- IRQ handling via notifications with IRQHandler capabilities
-- I/O port capabilities (IoPort_In8/Out8/In16/Out16/In32/Out32/Configure/Create)
-- POSIX signals via notification-based delivery
-- Debug syscalls (DebugPutChar, DebugDumpState, DebugPutStr, DebugPutBuf, DebugConsoleControl)
+- I/O port capabilities (`KERNITE_INV_IOPORT_READ_8/16/32` / `WRITE_8/16/32` against an `IoPortRange` cap)
+- Kernel-debug surface as a capability (`KernelDebug` cap with `KDEBUG_PUTCHAR` / `PUTSTR` / `PUTBUF` / `DUMP_STATE` / `CONSOLE_CONTROL`); RNG / shutdown / clock / sysinfo all reached through their own dedicated cap objects
 - Multi-architecture: x86_64 (BIOS + UEFI) and aarch64 (UEFI-only) fully supported
 - 3-stage bootloader for both architectures
 - SMP support: x86_64 (ACPI MADT + AP trampoline), aarch64 (PSCI CPU_ON + GICv3 IPI)
 - Init process with service-based multi-phase bootstrap
 - Console server (serial I/O via IoPort caps)
-- Runtime dynamic linker: ELF (`ld-trona.so`) and PE (`ld-trona-pe.so`)
+- Runtime dynamic linker: ELF (`ldtrona-elf.so`) and PE (`ldtrona-pe.so`)
 - Process manager (spawn, exit, waitpid, fork, exec) with personality tracking (POSIX/Win32)
 - VFS server (ramfs + devfs + initrd + Unix domain sockets + shared memory + poll + procfs + pipes + inet)
 - Name service (endpoint lookup)
@@ -279,6 +299,39 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - C standard library (basaltc/libc.so) with 40 Rust modules
 - Ports system: 16 ports including bash, FreeBSD utilities, nano, ncurses, nasm
 - Self-hosting toolchain: patched LLVM/Clang/LLD and rustc for x86_64-unknown-saltyos and aarch64-unknown-saltyos
+
+## Service Lifecycle and Name Brokering
+
+The init process owns system lifecycle as a systemd-style supervisor.
+Service activation flows through four unit types under `/services/`
+in the initrd:
+
+- `*.service` — runnable service unit (lifecycle + capabilities + dependencies).
+- `*.cap` — policy/hardware capability source (`SourceSlot=N` names a slot init received from the bootloader).
+- `*.socket` — provider's namesrv publish endpoint declaration.
+- `*.target` — milestone unit aggregating dependencies (e.g., `rootfs.target`).
+
+`init` parses every unit at boot, validates cross-references
+(`UnitRef::{Cap, Socket, Target, Service, LocalAlias}`), runs a Kahn
+topological sort over `After=`/`Before=` ordering edges, and feeds
+the result to a readiness graph (`UnitGraph`). Each service node is
+"ready" once its `NAMESRV_REGISTER` arrives; readiness propagates
+along the dependency edges so consumers wake up the moment their
+producers publish.
+
+`namesrv` is a kernel-cap broker (D-Bus role): every service publishes
+its master service-EP send via `NAMESRV_REGISTER` with
+`ENTRY_FLAG_BADGE_AS_CALLER`, and consumers do lazy lookup through
+substrate's `caps::*_ep()` getters. The bootstrap cap-table only
+delivers a small handle set (init control, namespace root, reply
+token, signal pipe, system caps, plus manifest-declared policy caps);
+all other service endpoints are resolved on first use.
+
+When a publisher's REGISTER succeeds, namesrv pushes a
+`NAMESRV_REGISTER_EVENT` onto a subscribed MP that init's owner loop
+watches. The supervisor calls `unit_mgr::on_namesrv_register(prefix)`,
+re-runs `dispatch_ready`, and spawns every service whose dependencies
+just became satisfied.
 
 ## Future Directions
 

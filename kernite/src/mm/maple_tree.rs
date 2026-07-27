@@ -10,8 +10,81 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::node_alloc::NodeAllocator;
+use super::node_alloc::{NodeAllocator, OwnedMapleNode};
 use core::marker::PhantomData;
+
+// ---------------------------------------------------------------------------
+// Transactional insert reservation
+// ---------------------------------------------------------------------------
+
+/// Worst-case nodes a single insert can consume.
+///
+/// `leaf split (1) + propagate split per internal level (current_depth) + new
+/// root (1)`. With `VmArea` values the SLOTS count is 127 and the maximum
+/// tree depth for any realistic VA space (2^48 / 4KB = 2^36 entries) is ≤ 5,
+/// so `current_depth() + 2 ≤ 7`. We pad to 8 for headroom; `reserve_for_insert`
+/// asserts that the actual need never exceeds this bound.
+pub const MAPLE_INSERT_MAX_NODES: usize = 8;
+
+/// Empty / exhausted reservation marker returned from `reserve_for_insert`
+/// when the allocator cannot satisfy the pre-allocation.
+pub struct OutOfMemory;
+
+/// Pre-allocated node pool for a transactional `insert_reserved`.
+///
+/// Created by [`MapleTree::reserve_for_insert`]; consumed by
+/// [`MapleTree::insert_reserved`]. Any nodes not consumed by the commit
+/// must be handed back to the allocator via [`InsertReservation::release`].
+#[must_use = "insert reservation must be released or consumed"]
+pub struct InsertReservation {
+    nodes: [Option<OwnedMapleNode>; MAPLE_INSERT_MAX_NODES],
+    len: u8,
+}
+
+impl InsertReservation {
+    fn new() -> Self {
+        Self {
+            nodes: [const { None }; MAPLE_INSERT_MAX_NODES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, node: OwnedMapleNode) {
+        crate::kernel::bug::kassert!((self.len as usize) < MAPLE_INSERT_MAX_NODES);
+        self.nodes[self.len as usize] = Some(node);
+        self.len += 1;
+    }
+
+    /// Pop a raw zeroed page. Panics in debug if the reservation is exhausted.
+    fn take_raw(&mut self) -> *mut u8 {
+        crate::kernel::bug::kassert!(self.len > 0, "InsertReservation exhausted");
+        self.len -= 1;
+        let node = self.nodes[self.len as usize]
+            .take()
+            .expect("InsertReservation slot unexpectedly empty");
+        node.into_raw().as_ptr()
+    }
+
+    /// Return the remaining pre-allocated nodes to `alloc`, consuming `self`.
+    pub fn release<A: NodeAllocator>(mut self, alloc: &mut A) {
+        while self.len > 0 {
+            self.len -= 1;
+            if let Some(node) = self.nodes[self.len as usize].take() {
+                alloc.free_owned_node(node);
+            }
+        }
+        // All slots drained; Drop sees len==0 and is a no-op.
+    }
+}
+
+impl Drop for InsertReservation {
+    fn drop(&mut self) {
+        crate::kernel::bug::kassert!(
+            self.len == 0,
+            "InsertReservation dropped with unreleased nodes"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Node layout computations
@@ -22,7 +95,9 @@ const HEADER: usize = 16; // NodeTag(1) + pad(1) + count(2) + pad(4) + parent(8)
 
 /// Compute leaf slot count for a given value size.
 const fn leaf_slots(val_size: usize) -> usize {
-    if val_size == 0 { return 0; }
+    if val_size == 0 {
+        return 0;
+    }
     (PAGE - HEADER) / (8 + val_size) // pivot(8) + V
 }
 
@@ -58,10 +133,14 @@ const INT_PIVOTS_OFF: usize = HEADER;
 const INT_CHILDREN_OFF: usize = INT_PIVOTS_OFF + INTERNAL_PIVOTS * 8;
 
 #[inline]
-fn leaf_pivots_off() -> usize { HEADER }
+fn leaf_pivots_off() -> usize {
+    HEADER
+}
 
 #[inline]
-fn leaf_values_off(slots: usize) -> usize { HEADER + slots * 8 }
+fn leaf_values_off(slots: usize) -> usize {
+    HEADER + slots * 8
+}
 
 // ---------------------------------------------------------------------------
 // Raw accessors
@@ -82,7 +161,9 @@ unsafe fn leaf_pivot(node: *mut u8, i: usize) -> u64 {
 }
 #[inline]
 unsafe fn leaf_pivot_set(node: *mut u8, i: usize, v: u64) {
-    unsafe { *(node.add(leaf_pivots_off()) as *mut u64).add(i) = v; }
+    unsafe {
+        *(node.add(leaf_pivots_off()) as *mut u64).add(i) = v;
+    }
 }
 
 #[inline]
@@ -91,7 +172,9 @@ unsafe fn leaf_val<V: Copy>(node: *mut u8, i: usize, slots: usize) -> V {
 }
 #[inline]
 unsafe fn leaf_val_set<V: Copy>(node: *mut u8, i: usize, slots: usize, v: V) {
-    unsafe { *(node.add(leaf_values_off(slots)) as *mut V).add(i) = v; }
+    unsafe {
+        *(node.add(leaf_values_off(slots)) as *mut V).add(i) = v;
+    }
 }
 #[inline]
 unsafe fn leaf_val_ref<V: Copy>(node: *mut u8, i: usize, slots: usize) -> &'static V {
@@ -104,7 +187,9 @@ unsafe fn int_pivot(node: *mut u8, i: usize) -> u64 {
 }
 #[inline]
 unsafe fn int_pivot_set(node: *mut u8, i: usize, v: u64) {
-    unsafe { *(node.add(INT_PIVOTS_OFF) as *mut u64).add(i) = v; }
+    unsafe {
+        *(node.add(INT_PIVOTS_OFF) as *mut u64).add(i) = v;
+    }
 }
 #[inline]
 unsafe fn int_child(node: *mut u8, i: usize) -> *mut u8 {
@@ -112,30 +197,34 @@ unsafe fn int_child(node: *mut u8, i: usize) -> *mut u8 {
 }
 #[inline]
 unsafe fn int_child_set(node: *mut u8, i: usize, c: *mut u8) {
-    unsafe { *(node.add(INT_CHILDREN_OFF) as *mut *mut u8).add(i) = c; }
+    unsafe {
+        *(node.add(INT_CHILDREN_OFF) as *mut *mut u8).add(i) = c;
+    }
 }
 
 #[inline]
 unsafe fn set_parent(node: *mut u8, p: *mut u8) {
-    unsafe { hdr_mut(node).parent = p; }
+    unsafe {
+        hdr_mut(node).parent = p;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Node allocation helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn alloc_leaf<A: NodeAllocator>(alloc: &mut A) -> *mut u8 {
-    let n = alloc.alloc_node();
-    if !n.is_null() {
-        unsafe { hdr_mut(n).tag = NodeTag::Leaf; }
+unsafe fn take_leaf(resv: &mut InsertReservation) -> *mut u8 {
+    let n = resv.take_raw();
+    unsafe {
+        hdr_mut(n).tag = NodeTag::Leaf;
     }
     n
 }
 
-unsafe fn alloc_internal<A: NodeAllocator>(alloc: &mut A) -> *mut u8 {
-    let n = alloc.alloc_node();
-    if !n.is_null() {
-        unsafe { hdr_mut(n).tag = NodeTag::Internal; }
+unsafe fn take_internal(resv: &mut InsertReservation) -> *mut u8 {
+    let n = resv.take_raw();
+    unsafe {
+        hdr_mut(n).tag = NodeTag::Internal;
     }
     n
 }
@@ -167,17 +256,19 @@ unsafe fn leaf_remove_at<V: Copy>(node: *mut u8, pos: usize, slots: usize) {
         leaf_pivot_set(node, count - 1, 0);
         core::ptr::write_bytes(
             (node.add(leaf_values_off(slots)) as *mut V).add(count - 1),
-            0, 1,
+            0,
+            1,
         );
         hdr_mut(node).count -= 1;
     }
 }
 
-unsafe fn leaf_split<V: Copy, A: NodeAllocator>(
-    left: *mut u8, slots: usize, alloc: &mut A,
-) -> Option<(*mut u8, u64)> {
-    let right = unsafe { alloc_leaf(alloc) };
-    if right.is_null() { return None; }
+unsafe fn leaf_split<V: Copy>(
+    left: *mut u8,
+    slots: usize,
+    resv: &mut InsertReservation,
+) -> (*mut u8, u64) {
+    let right = unsafe { take_leaf(resv) };
     unsafe {
         let count = hdr(left).count as usize;
         let mid = count / 2;
@@ -189,12 +280,10 @@ unsafe fn leaf_split<V: Copy, A: NodeAllocator>(
         hdr_mut(right).count = rc as u16;
         for i in mid..count {
             leaf_pivot_set(left, i, 0);
-            core::ptr::write_bytes(
-                (left.add(leaf_values_off(slots)) as *mut V).add(i), 0, 1,
-            );
+            core::ptr::write_bytes((left.add(leaf_values_off(slots)) as *mut V).add(i), 0, 1);
         }
         hdr_mut(left).count = mid as u16;
-        Some((right, leaf_pivot(right, 0)))
+        (right, leaf_pivot(right, 0))
     }
 }
 
@@ -217,11 +306,8 @@ unsafe fn int_insert_at(node: *mut u8, pos: usize, pivot: u64, right_child: *mut
     }
 }
 
-unsafe fn int_split<A: NodeAllocator>(
-    left: *mut u8, alloc: &mut A,
-) -> Option<(*mut u8, u64)> {
-    let right = unsafe { alloc_internal(alloc) };
-    if right.is_null() { return None; }
+unsafe fn int_split(left: *mut u8, resv: &mut InsertReservation) -> (*mut u8, u64) {
+    let right = unsafe { take_internal(resv) };
     unsafe {
         let count = hdr(left).count as usize;
         let mid = count / 2;
@@ -233,13 +319,19 @@ unsafe fn int_split<A: NodeAllocator>(
         for i in 0..=rc {
             let c = int_child(left, mid + 1 + i);
             int_child_set(right, i, c);
-            if !c.is_null() { set_parent(c, right); }
+            if !c.is_null() {
+                set_parent(c, right);
+            }
         }
         hdr_mut(right).count = rc as u16;
-        for i in mid..count { int_pivot_set(left, i, 0); }
-        for i in mid + 1..=count { int_child_set(left, i, core::ptr::null_mut()); }
+        for i in mid..count {
+            int_pivot_set(left, i, 0);
+        }
+        for i in mid + 1..=count {
+            int_child_set(left, i, core::ptr::null_mut());
+        }
         hdr_mut(left).count = mid as u16;
-        Some((right, promoted))
+        (right, promoted)
     }
 }
 
@@ -258,29 +350,98 @@ impl<V: Copy + 'static> MapleTree<V> {
     const LEAF_MIN: usize = Self::SLOTS / 3;
 
     pub const fn empty() -> Self {
-        Self { root: core::ptr::null_mut(), entry_count: 0, _phantom: PhantomData }
+        Self {
+            root: core::ptr::null_mut(),
+            entry_count: 0,
+            _phantom: PhantomData,
+        }
     }
 
-    pub fn count(&self) -> usize { self.entry_count }
-    pub fn is_empty(&self) -> bool { self.root.is_null() }
+    pub fn count(&self) -> usize {
+        self.entry_count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.root.is_null()
+    }
 
     // --- Lookup ---
 
     pub fn lookup(&self, addr: u64) -> Option<(u64, &V)> {
-        if self.root.is_null() { return None; }
+        if self.root.is_null() {
+            return None;
+        }
         unsafe { self.lookup_inner(self.root, addr) }
+    }
+
+    /// Return the first entry whose pivot (start key) lies in `[lo, hi)`, or
+    /// `None` if no such entry exists. O(log n). Walks at most one leaf per
+    /// level thanks to internal-node pivot pruning.
+    pub fn first_in_range(&self, lo: u64, hi: u64) -> Option<(u64, &V)> {
+        if hi <= lo || self.root.is_null() {
+            return None;
+        }
+        unsafe { self.first_in_range_inner(self.root, lo, hi) }
+    }
+
+    unsafe fn first_in_range_inner(&self, node: *mut u8, lo: u64, hi: u64) -> Option<(u64, &V)> {
+        if node.is_null() {
+            return None;
+        }
+        unsafe {
+            match hdr(node).tag {
+                NodeTag::Leaf => {
+                    let c = hdr(node).count as usize;
+                    for i in 0..c {
+                        let start = leaf_pivot(node, i);
+                        if start >= hi {
+                            return None;
+                        }
+                        if start >= lo {
+                            return Some((start, leaf_val_ref::<V>(node, i, Self::SLOTS)));
+                        }
+                    }
+                    None
+                }
+                NodeTag::Internal => {
+                    // Child i covers keys in [P(i-1), P(i)), with P(-1) = 0 and
+                    // P(c) = u64::MAX. Skip children whose range is entirely
+                    // below `lo`; stop once a child's range is at/after `hi`.
+                    let c = hdr(node).count as usize;
+                    for i in 0..=c {
+                        let child_lo = if i == 0 { 0 } else { int_pivot(node, i - 1) };
+                        let child_hi = if i == c { u64::MAX } else { int_pivot(node, i) };
+                        if child_hi <= lo {
+                            continue;
+                        }
+                        if child_lo >= hi {
+                            break;
+                        }
+                        let child = int_child(node, i);
+                        if let Some(r) = self.first_in_range_inner(child, lo, hi) {
+                            return Some(r);
+                        }
+                    }
+                    None
+                }
+            }
+        }
     }
 
     unsafe fn lookup_inner(&self, mut node: *mut u8, addr: u64) -> Option<(u64, &V)> {
         loop {
-            if node.is_null() { return None; }
+            if node.is_null() {
+                return None;
+            }
             unsafe {
                 match hdr(node).tag {
                     NodeTag::Internal => {
                         let c = hdr(node).count as usize;
                         let mut ci = c;
                         for i in 0..c {
-                            if addr < int_pivot(node, i) { ci = i; break; }
+                            if addr < int_pivot(node, i) {
+                                ci = i;
+                                break;
+                            }
                         }
                         node = int_child(node, ci);
                     }
@@ -312,7 +473,9 @@ impl<V: Copy + 'static> MapleTree<V> {
     unsafe fn find_leaf(&self, key: u64) -> *mut u8 {
         let mut node = self.root;
         loop {
-            if node.is_null() { return core::ptr::null_mut(); }
+            if node.is_null() {
+                return core::ptr::null_mut();
+            }
             unsafe {
                 match hdr(node).tag {
                     NodeTag::Leaf => return node,
@@ -320,7 +483,10 @@ impl<V: Copy + 'static> MapleTree<V> {
                         let c = hdr(node).count as usize;
                         let mut ci = c;
                         for i in 0..c {
-                            if key < int_pivot(node, i) { ci = i; break; }
+                            if key < int_pivot(node, i) {
+                                ci = i;
+                                break;
+                            }
                         }
                         node = int_child(node, ci);
                     }
@@ -329,56 +495,147 @@ impl<V: Copy + 'static> MapleTree<V> {
         }
     }
 
-    // --- Insert ---
+    // --- Insert (transactional: reserve → commit) ---
 
-    pub unsafe fn insert<A: NodeAllocator>(
-        &mut self, start: u64, value: V, alloc: &mut A,
-    ) -> bool {
+    /// Number of internal levels above the leaf row. Empty tree → 0,
+    /// leaf-only tree → 0, root becomes internal → ≥ 1.
+    pub fn current_depth(&self) -> usize {
         if self.root.is_null() {
-            let leaf = unsafe { alloc_leaf(alloc) };
-            if leaf.is_null() { return false; }
-            unsafe { leaf_insert_at(leaf, 0, start, value, Self::SLOTS); }
+            return 0;
+        }
+        let mut depth = 0;
+        let mut node = self.root;
+        loop {
+            unsafe {
+                if hdr(node).tag == NodeTag::Leaf {
+                    return depth;
+                }
+                depth += 1;
+                node = int_child(node, 0);
+                if node.is_null() {
+                    return depth;
+                }
+            }
+        }
+    }
+
+    /// Pre-allocate nodes for a single `insert_reserved` call.
+    ///
+    /// Returns a reservation sized for the current tree's worst-case need
+    /// (`current_depth() + 2`). On PMM exhaustion any partially acquired
+    /// nodes are returned to `alloc` before `Err` is propagated — caller
+    /// observes no side effects.
+    pub fn reserve_for_insert<A: NodeAllocator>(
+        &self,
+        alloc: &mut A,
+    ) -> Result<InsertReservation, OutOfMemory> {
+        let need = self.current_depth() + 2;
+        crate::kernel::bug::kassert!(
+            need <= MAPLE_INSERT_MAX_NODES,
+            "tree depth exceeded MAPLE_INSERT_MAX_NODES bound"
+        );
+
+        let mut resv = InsertReservation::new();
+        for _ in 0..need {
+            match alloc.alloc_node_owned() {
+                Some(node) => resv.push(node),
+                None => {
+                    resv.release(alloc);
+                    return Err(OutOfMemory);
+                }
+            }
+        }
+        Ok(resv)
+    }
+
+    /// Insert `(start, value)` using nodes drawn from `reservation`.
+    ///
+    /// Infallible given a reservation produced by [`reserve_for_insert`] on
+    /// this same tree with no intervening inserts. Unused nodes remain in
+    /// `reservation`; caller is responsible for [`InsertReservation::release`].
+    ///
+    /// # Safety
+    /// Same invariants as the caller-visible insert contract (caller must
+    /// own exclusive access to the tree).
+    pub unsafe fn insert_reserved(
+        &mut self,
+        start: u64,
+        value: V,
+        reservation: &mut InsertReservation,
+    ) {
+        if self.root.is_null() {
+            let leaf = unsafe { take_leaf(reservation) };
+            unsafe {
+                leaf_insert_at(leaf, 0, start, value, Self::SLOTS);
+            }
             self.root = leaf;
             self.entry_count = 1;
-            return true;
+            return;
         }
 
         let leaf = unsafe { self.find_leaf(start) };
-        if leaf.is_null() { return false; }
+        crate::kernel::bug::kassert!(!leaf.is_null(), "find_leaf returned null on non-empty tree");
 
         unsafe {
             let count = hdr(leaf).count as usize;
             let mut pos = count;
             for i in 0..count {
-                if start < leaf_pivot(leaf, i) { pos = i; break; }
+                if start < leaf_pivot(leaf, i) {
+                    pos = i;
+                    break;
+                }
             }
 
             if count < Self::SLOTS {
                 leaf_insert_at(leaf, pos, start, value, Self::SLOTS);
                 self.entry_count += 1;
-                return true;
+                return;
             }
 
             // Split
-            let (right, split_pivot) = match leaf_split::<V, A>(leaf, Self::SLOTS, alloc) {
-                Some(r) => r,
-                None => return false,
-            };
+            let (right, split_pivot) = leaf_split::<V>(leaf, Self::SLOTS, reservation);
 
             if start < split_pivot {
                 let lc = hdr(leaf).count as usize;
                 let mut lp = lc;
-                for i in 0..lc { if start < leaf_pivot(leaf, i) { lp = i; break; } }
+                for i in 0..lc {
+                    if start < leaf_pivot(leaf, i) {
+                        lp = i;
+                        break;
+                    }
+                }
                 leaf_insert_at(leaf, lp, start, value, Self::SLOTS);
             } else {
                 let rc = hdr(right).count as usize;
                 let mut rp = rc;
-                for i in 0..rc { if start < leaf_pivot(right, i) { rp = i; break; } }
+                for i in 0..rc {
+                    if start < leaf_pivot(right, i) {
+                        rp = i;
+                        break;
+                    }
+                }
                 leaf_insert_at(right, rp, start, value, Self::SLOTS);
             }
 
             self.entry_count += 1;
-            self.propagate_split(leaf, split_pivot, right, alloc)
+            self.propagate_split(leaf, split_pivot, right, reservation);
+        }
+    }
+
+    /// Convenience wrapper: reserve → commit → release unused.
+    ///
+    /// Returns `false` only on allocation failure during the reserve phase;
+    /// `true` on a successful infallible commit.
+    pub unsafe fn insert<A: NodeAllocator>(&mut self, start: u64, value: V, alloc: &mut A) -> bool {
+        match self.reserve_for_insert(alloc) {
+            Ok(mut resv) => {
+                unsafe {
+                    self.insert_reserved(start, value, &mut resv);
+                }
+                resv.release(alloc);
+                true
+            }
+            Err(OutOfMemory) => false,
         }
     }
 
@@ -404,15 +661,18 @@ impl<V: Copy + 'static> MapleTree<V> {
         false
     }
 
-    unsafe fn propagate_split<A: NodeAllocator>(
-        &mut self, left: *mut u8, pivot: u64, right: *mut u8, alloc: &mut A,
-    ) -> bool {
+    unsafe fn propagate_split(
+        &mut self,
+        left: *mut u8,
+        pivot: u64,
+        right: *mut u8,
+        resv: &mut InsertReservation,
+    ) {
         unsafe {
             let parent = hdr(left).parent;
 
             if parent.is_null() {
-                let new_root = alloc_internal(alloc);
-                if new_root.is_null() { return false; }
+                let new_root = take_internal(resv);
                 int_pivot_set(new_root, 0, pivot);
                 int_child_set(new_root, 0, left);
                 int_child_set(new_root, 1, right);
@@ -420,50 +680,64 @@ impl<V: Copy + 'static> MapleTree<V> {
                 set_parent(left, new_root);
                 set_parent(right, new_root);
                 self.root = new_root;
-                return true;
+                return;
             }
 
             let pc = hdr(parent).count as usize;
             let mut pos = 0;
-            for i in 0..=pc { if int_child(parent, i) == left { pos = i; break; } }
+            for i in 0..=pc {
+                if int_child(parent, i) == left {
+                    pos = i;
+                    break;
+                }
+            }
 
             if pc < INTERNAL_PIVOTS {
                 int_insert_at(parent, pos, pivot, right);
                 set_parent(right, parent);
-                return true;
+                return;
             }
 
-            let (rp, promoted) = match int_split(parent, alloc) {
-                Some(r) => r,
-                None => return false,
-            };
+            let (rp, promoted) = int_split(parent, resv);
 
             if pivot < promoted {
                 let c2 = hdr(parent).count as usize;
                 let mut ip = 0;
-                for i in 0..=c2 { if int_child(parent, i) == left { ip = i; break; } }
+                for i in 0..=c2 {
+                    if int_child(parent, i) == left {
+                        ip = i;
+                        break;
+                    }
+                }
                 int_insert_at(parent, ip, pivot, right);
                 set_parent(right, parent);
             } else {
                 let c2 = hdr(rp).count as usize;
                 let mut ip = c2;
-                for i in 0..c2 { if pivot < int_pivot(rp, i) { ip = i; break; } }
+                for i in 0..c2 {
+                    if pivot < int_pivot(rp, i) {
+                        ip = i;
+                        break;
+                    }
+                }
                 int_insert_at(rp, ip, pivot, right);
                 set_parent(right, rp);
             }
 
-            self.propagate_split(parent, promoted, rp, alloc)
+            self.propagate_split(parent, promoted, rp, resv)
         }
     }
 
     // --- Remove ---
 
-    pub unsafe fn remove<A: NodeAllocator>(
-        &mut self, start: u64, alloc: &mut A,
-    ) -> bool {
-        if self.root.is_null() { return false; }
+    pub unsafe fn remove<A: NodeAllocator>(&mut self, start: u64, alloc: &mut A) -> bool {
+        if self.root.is_null() {
+            return false;
+        }
         let leaf = unsafe { self.find_leaf(start) };
-        if leaf.is_null() { return false; }
+        if leaf.is_null() {
+            return false;
+        }
 
         unsafe {
             let count = hdr(leaf).count as usize;
@@ -476,7 +750,9 @@ impl<V: Copy + 'static> MapleTree<V> {
                     break;
                 }
             }
-            if !found { return false; }
+            if !found {
+                return false;
+            }
             self.rebalance_leaf(leaf, alloc);
             true
         }
@@ -493,17 +769,29 @@ impl<V: Copy + 'static> MapleTree<V> {
         unsafe {
             let count = hdr(leaf).count as usize;
             let parent = hdr(leaf).parent;
-            if parent.is_null() { return; }
-            if count >= Self::LEAF_MIN { return; }
+            if parent.is_null() {
+                return;
+            }
+            if count >= Self::LEAF_MIN {
+                return;
+            }
 
             let pc = hdr(parent).count as usize;
             let mut ci = 0;
-            for i in 0..=pc { if int_child(parent, i) == leaf { ci = i; break; } }
+            for i in 0..=pc {
+                if int_child(parent, i) == leaf {
+                    ci = i;
+                    break;
+                }
+            }
 
             // Steal from right
             if ci < pc {
                 let rs = int_child(parent, ci + 1);
-                if !rs.is_null() && hdr(rs).tag == NodeTag::Leaf && hdr(rs).count as usize > Self::LEAF_MIN {
+                if !rs.is_null()
+                    && hdr(rs).tag == NodeTag::Leaf
+                    && hdr(rs).count as usize > Self::LEAF_MIN
+                {
                     let sp = leaf_pivot(rs, 0);
                     let sv: V = leaf_val(rs, 0, Self::SLOTS);
                     leaf_remove_at::<V>(rs, 0, Self::SLOTS);
@@ -517,7 +805,10 @@ impl<V: Copy + 'static> MapleTree<V> {
             // Steal from left
             if ci > 0 {
                 let ls = int_child(parent, ci - 1);
-                if !ls.is_null() && hdr(ls).tag == NodeTag::Leaf && hdr(ls).count as usize > Self::LEAF_MIN {
+                if !ls.is_null()
+                    && hdr(ls).tag == NodeTag::Leaf
+                    && hdr(ls).count as usize > Self::LEAF_MIN
+                {
                     let lsc = hdr(ls).count as usize;
                     let sp = leaf_pivot(ls, lsc - 1);
                     let sv: V = leaf_val(ls, lsc - 1, Self::SLOTS);
@@ -535,8 +826,13 @@ impl<V: Copy + 'static> MapleTree<V> {
                     let rc = hdr(rs).count as usize;
                     let lc = hdr(leaf).count as usize;
                     for i in 0..rc {
-                        leaf_insert_at(leaf, lc + i, leaf_pivot(rs, i),
-                            leaf_val::<V>(rs, i, Self::SLOTS), Self::SLOTS);
+                        leaf_insert_at(
+                            leaf,
+                            lc + i,
+                            leaf_pivot(rs, i),
+                            leaf_val::<V>(rs, i, Self::SLOTS),
+                            Self::SLOTS,
+                        );
                     }
                     alloc.free_node(rs);
                     self.remove_from_internal(parent, ci, alloc);
@@ -551,8 +847,13 @@ impl<V: Copy + 'static> MapleTree<V> {
                     let lsc = hdr(ls).count as usize;
                     let mc = hdr(leaf).count as usize;
                     for i in 0..mc {
-                        leaf_insert_at(ls, lsc + i, leaf_pivot(leaf, i),
-                            leaf_val::<V>(leaf, i, Self::SLOTS), Self::SLOTS);
+                        leaf_insert_at(
+                            ls,
+                            lsc + i,
+                            leaf_pivot(leaf, i),
+                            leaf_val::<V>(leaf, i, Self::SLOTS),
+                            Self::SLOTS,
+                        );
                     }
                     alloc.free_node(leaf);
                     self.remove_from_internal(parent, ci - 1, alloc);
@@ -562,13 +863,20 @@ impl<V: Copy + 'static> MapleTree<V> {
     }
 
     unsafe fn remove_from_internal<A: NodeAllocator>(
-        &mut self, node: *mut u8, pivot_idx: usize, alloc: &mut A,
+        &mut self,
+        node: *mut u8,
+        pivot_idx: usize,
+        alloc: &mut A,
     ) {
         unsafe {
             let count = hdr(node).count as usize;
-            for i in pivot_idx..count - 1 { int_pivot_set(node, i, int_pivot(node, i + 1)); }
+            for i in pivot_idx..count - 1 {
+                int_pivot_set(node, i, int_pivot(node, i + 1));
+            }
             int_pivot_set(node, count - 1, 0);
-            for i in pivot_idx + 1..count { int_child_set(node, i, int_child(node, i + 1)); }
+            for i in pivot_idx + 1..count {
+                int_child_set(node, i, int_child(node, i + 1));
+            }
             int_child_set(node, count, core::ptr::null_mut());
             hdr_mut(node).count -= 1;
             let nc = hdr(node).count as usize;
@@ -577,13 +885,19 @@ impl<V: Copy + 'static> MapleTree<V> {
             if parent.is_null() {
                 if nc == 0 {
                     let only = int_child(node, 0);
-                    if !only.is_null() { set_parent(only, core::ptr::null_mut()); self.root = only; }
-                    else { self.root = core::ptr::null_mut(); }
+                    if !only.is_null() {
+                        set_parent(only, core::ptr::null_mut());
+                        self.root = only;
+                    } else {
+                        self.root = core::ptr::null_mut();
+                    }
                     alloc.free_node(node);
                 }
                 return;
             }
-            if nc >= INTERNAL_MIN { return; }
+            if nc >= INTERNAL_MIN {
+                return;
+            }
             self.rebalance_internal(node, alloc);
         }
     }
@@ -591,26 +905,42 @@ impl<V: Copy + 'static> MapleTree<V> {
     unsafe fn rebalance_internal<A: NodeAllocator>(&mut self, node: *mut u8, alloc: &mut A) {
         unsafe {
             let parent = hdr(node).parent;
-            if parent.is_null() { return; }
+            if parent.is_null() {
+                return;
+            }
             let pc = hdr(parent).count as usize;
             let mut ci = 0;
-            for i in 0..=pc { if int_child(parent, i) == node { ci = i; break; } }
+            for i in 0..=pc {
+                if int_child(parent, i) == node {
+                    ci = i;
+                    break;
+                }
+            }
 
             // Steal from right sibling
             if ci < pc {
                 let rs = int_child(parent, ci + 1);
-                if !rs.is_null() && hdr(rs).tag == NodeTag::Internal && hdr(rs).count as usize > INTERNAL_MIN {
+                if !rs.is_null()
+                    && hdr(rs).tag == NodeTag::Internal
+                    && hdr(rs).count as usize > INTERNAL_MIN
+                {
                     let mc = hdr(node).count as usize;
                     int_pivot_set(node, mc, int_pivot(parent, ci));
                     let fc = int_child(rs, 0);
                     int_child_set(node, mc + 1, fc);
-                    if !fc.is_null() { set_parent(fc, node); }
+                    if !fc.is_null() {
+                        set_parent(fc, node);
+                    }
                     hdr_mut(node).count += 1;
                     int_pivot_set(parent, ci, int_pivot(rs, 0));
                     let rc = hdr(rs).count as usize;
-                    for i in 0..rc - 1 { int_pivot_set(rs, i, int_pivot(rs, i + 1)); }
+                    for i in 0..rc - 1 {
+                        int_pivot_set(rs, i, int_pivot(rs, i + 1));
+                    }
                     int_pivot_set(rs, rc - 1, 0);
-                    for i in 0..rc { int_child_set(rs, i, int_child(rs, i + 1)); }
+                    for i in 0..rc {
+                        int_child_set(rs, i, int_child(rs, i + 1));
+                    }
                     int_child_set(rs, rc, core::ptr::null_mut());
                     hdr_mut(rs).count -= 1;
                     return;
@@ -620,15 +950,24 @@ impl<V: Copy + 'static> MapleTree<V> {
             // Steal from left sibling
             if ci > 0 {
                 let ls = int_child(parent, ci - 1);
-                if !ls.is_null() && hdr(ls).tag == NodeTag::Internal && hdr(ls).count as usize > INTERNAL_MIN {
+                if !ls.is_null()
+                    && hdr(ls).tag == NodeTag::Internal
+                    && hdr(ls).count as usize > INTERNAL_MIN
+                {
                     let mc = hdr(node).count as usize;
-                    for i in (0..mc).rev() { int_pivot_set(node, i + 1, int_pivot(node, i)); }
-                    for i in (0..=mc).rev() { int_child_set(node, i + 1, int_child(node, i)); }
+                    for i in (0..mc).rev() {
+                        int_pivot_set(node, i + 1, int_pivot(node, i));
+                    }
+                    for i in (0..=mc).rev() {
+                        int_child_set(node, i + 1, int_child(node, i));
+                    }
                     int_pivot_set(node, 0, int_pivot(parent, ci - 1));
                     let lc = hdr(ls).count as usize;
                     let lch = int_child(ls, lc);
                     int_child_set(node, 0, lch);
-                    if !lch.is_null() { set_parent(lch, node); }
+                    if !lch.is_null() {
+                        set_parent(lch, node);
+                    }
                     hdr_mut(node).count += 1;
                     int_pivot_set(parent, ci - 1, int_pivot(ls, lc - 1));
                     int_pivot_set(ls, lc - 1, 0);
@@ -645,11 +984,15 @@ impl<V: Copy + 'static> MapleTree<V> {
                     let mc = hdr(node).count as usize;
                     let rc = hdr(rs).count as usize;
                     int_pivot_set(node, mc, int_pivot(parent, ci));
-                    for i in 0..rc { int_pivot_set(node, mc + 1 + i, int_pivot(rs, i)); }
+                    for i in 0..rc {
+                        int_pivot_set(node, mc + 1 + i, int_pivot(rs, i));
+                    }
                     for i in 0..=rc {
                         let c = int_child(rs, i);
                         int_child_set(node, mc + 1 + i, c);
-                        if !c.is_null() { set_parent(c, node); }
+                        if !c.is_null() {
+                            set_parent(c, node);
+                        }
                     }
                     hdr_mut(node).count = (mc + 1 + rc) as u16;
                     alloc.free_node(rs);
@@ -665,11 +1008,15 @@ impl<V: Copy + 'static> MapleTree<V> {
                     let lc = hdr(ls).count as usize;
                     let mc = hdr(node).count as usize;
                     int_pivot_set(ls, lc, int_pivot(parent, ci - 1));
-                    for i in 0..mc { int_pivot_set(ls, lc + 1 + i, int_pivot(node, i)); }
+                    for i in 0..mc {
+                        int_pivot_set(ls, lc + 1 + i, int_pivot(node, i));
+                    }
                     for i in 0..=mc {
                         let c = int_child(node, i);
                         int_child_set(ls, lc + 1 + i, c);
-                        if !c.is_null() { set_parent(c, ls); }
+                        if !c.is_null() {
+                            set_parent(c, ls);
+                        }
                     }
                     hdr_mut(ls).count = (lc + 1 + mc) as u16;
                     alloc.free_node(node);
@@ -682,21 +1029,31 @@ impl<V: Copy + 'static> MapleTree<V> {
     // --- Iteration ---
 
     pub fn for_each<F: FnMut(u64, &V)>(&self, f: &mut F) {
-        if self.root.is_null() { return; }
-        unsafe { self.iter_inner(self.root, f); }
+        if self.root.is_null() {
+            return;
+        }
+        unsafe {
+            self.iter_inner(self.root, f);
+        }
     }
 
     unsafe fn iter_inner<F: FnMut(u64, &V)>(&self, node: *mut u8, f: &mut F) {
-        if node.is_null() { return; }
+        if node.is_null() {
+            return;
+        }
         unsafe {
             match hdr(node).tag {
                 NodeTag::Leaf => {
                     let c = hdr(node).count as usize;
-                    for i in 0..c { f(leaf_pivot(node, i), leaf_val_ref::<V>(node, i, Self::SLOTS)); }
+                    for i in 0..c {
+                        f(leaf_pivot(node, i), leaf_val_ref::<V>(node, i, Self::SLOTS));
+                    }
                 }
                 NodeTag::Internal => {
                     let c = hdr(node).count as usize;
-                    for i in 0..=c { self.iter_inner(int_child(node, i), f); }
+                    for i in 0..=c {
+                        self.iter_inner(int_child(node, i), f);
+                    }
                 }
             }
         }
@@ -706,18 +1063,24 @@ impl<V: Copy + 'static> MapleTree<V> {
 
     pub unsafe fn destroy<A: NodeAllocator>(&mut self, alloc: &mut A) {
         if !self.root.is_null() {
-            unsafe { self.destroy_inner(self.root, alloc); }
+            unsafe {
+                self.destroy_inner(self.root, alloc);
+            }
             self.root = core::ptr::null_mut();
             self.entry_count = 0;
         }
     }
 
     unsafe fn destroy_inner<A: NodeAllocator>(&self, node: *mut u8, alloc: &mut A) {
-        if node.is_null() { return; }
+        if node.is_null() {
+            return;
+        }
         unsafe {
             if hdr(node).tag == NodeTag::Internal {
                 let c = hdr(node).count as usize;
-                for i in 0..=c { self.destroy_inner(int_child(node, i), alloc); }
+                for i in 0..=c {
+                    self.destroy_inner(int_child(node, i), alloc);
+                }
             }
             alloc.free_node(node);
         }

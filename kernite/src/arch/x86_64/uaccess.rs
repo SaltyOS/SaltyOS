@@ -10,7 +10,14 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::mem::MaybeUninit;
+use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+unsafe extern "C" {
+    fn x86_uaccess_stac();
+    fn x86_uaccess_clac();
+}
 
 /// Maximum valid user-space address (canonical lower half).
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
@@ -35,7 +42,7 @@ pub unsafe fn stac() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) {
         // SAFETY: SMAP is confirmed active; stac sets EFLAGS.AC.
         unsafe {
-            core::arch::asm!("stac", options(nomem, nostack));
+            x86_uaccess_stac();
         }
     }
 }
@@ -51,7 +58,7 @@ pub unsafe fn clac() {
     if SMAP_ACTIVE.load(Ordering::Relaxed) {
         // SAFETY: SMAP is confirmed active; clac clears EFLAGS.AC.
         unsafe {
-            core::arch::asm!("clac", options(nomem, nostack));
+            x86_uaccess_clac();
         }
     }
 }
@@ -71,7 +78,9 @@ impl UserAccessGuard {
     #[inline(always)]
     pub fn new() -> Self {
         // SAFETY: We pair this stac with clac in Drop.
-        unsafe { stac(); }
+        unsafe {
+            stac();
+        }
         Self
     }
 }
@@ -80,7 +89,9 @@ impl Drop for UserAccessGuard {
     #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: Restoring SMAP protection that was relaxed in new().
-        unsafe { clac(); }
+        unsafe {
+            clac();
+        }
     }
 }
 
@@ -96,38 +107,121 @@ fn validate_user_range(addr: u64, size: usize) -> bool {
     }
 }
 
-/// Copy a value of type `T` from user-space address `addr`.
-///
-/// Returns `None` if the address is not in the valid user range.
-///
-/// # Safety
-/// The user address must point to a mapped, readable page. If the page
-/// is not mapped, this will #PF. Caller is responsible for ensuring the
-/// page exists (e.g., via VSpace resolve_page check).
-pub unsafe fn copy_from_user<T: Copy>(addr: u64) -> Option<T> {
-    if !validate_user_range(addr, core::mem::size_of::<T>()) {
+#[inline]
+fn current_vspace_root() -> Option<*mut crate::mm::VSpace> {
+    let current = crate::sched::scheduler::scheduler().current();
+    if current.is_null() {
         return None;
     }
-    let _guard = UserAccessGuard::new();
-    // SAFETY: Address validated above; SMAP relaxed by guard; caller
-    // ensures page is mapped.
-    let val = unsafe { core::ptr::read_volatile(addr as *const T) };
-    Some(val)
+    let vspace = unsafe { (*current).vspace_root };
+    if vspace.is_null() {
+        return None;
+    }
+    Some(vspace)
+}
+
+/// Copy raw bytes from the current thread's user address space into kernel memory.
+///
+/// Returns `false` when the range is out of user space or any covered page is not
+/// currently mapped in the active thread's VSpace.
+pub unsafe fn copy_from_user_bytes(addr: u64, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !validate_user_range(addr, len) {
+        return false;
+    }
+
+    let Some(vspace) = current_vspace_root() else {
+        return false;
+    };
+
+    let mut copied = 0usize;
+    while copied < len {
+        let cur = addr + copied as u64;
+        let page_off = cur as usize & (crate::mm::PAGE_SIZE - 1);
+        let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, len - copied);
+        let phys = match unsafe { (&*vspace).resolve_page(cur) } {
+            Some(phys) => phys,
+            None => return false,
+        };
+        let src = (crate::mm::phys_to_virt(phys) as *const u8).wrapping_add(page_off);
+        unsafe {
+            ptr::copy_nonoverlapping(src, dst.add(copied), chunk);
+        }
+        copied += chunk;
+    }
+
+    true
+}
+
+/// Copy raw bytes from kernel memory into the current thread's user address space.
+///
+/// Returns `false` when the range is out of user space or any covered page cannot
+/// be made writable in the active thread's VSpace.
+pub unsafe fn copy_to_user_bytes(addr: u64, src: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !validate_user_range(addr, len) {
+        return false;
+    }
+
+    let Some(vspace) = current_vspace_root() else {
+        return false;
+    };
+
+    let mut copied = 0usize;
+    while copied < len {
+        let cur = addr + copied as u64;
+        let page_off = cur as usize & (crate::mm::PAGE_SIZE - 1);
+        let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, len - copied);
+        let vspace_ref = unsafe { &mut *vspace };
+        if !vspace_ref.ensure_writable(cur) {
+            return false;
+        }
+        let phys = match vspace_ref.resolve_page(cur) {
+            Some(phys) => phys,
+            None => return false,
+        };
+        let dst = (crate::mm::phys_to_virt(phys) as *mut u8).wrapping_add(page_off);
+        unsafe {
+            ptr::copy_nonoverlapping(src.add(copied), dst, chunk);
+        }
+        copied += chunk;
+    }
+
+    true
+}
+
+/// Copy a value of type `T` from user-space address `addr`.
+///
+/// Returns `None` if the address is not in the valid user range or is not
+/// fully readable in the current thread's VSpace.
+pub unsafe fn copy_from_user<T: Copy>(addr: u64) -> Option<T> {
+    let mut value = MaybeUninit::<T>::uninit();
+    if !unsafe {
+        copy_from_user_bytes(
+            addr,
+            value.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    } {
+        return None;
+    }
+    Some(unsafe { value.assume_init() })
 }
 
 /// Write a value of type `T` to user-space address `addr`.
 ///
-/// Returns `false` if the address is not in the valid user range.
-///
-/// # Safety
-/// The user address must point to a mapped, writable page.
+/// Returns `false` if the address is not in the valid user range or is not
+/// fully writable in the current thread's VSpace.
 pub unsafe fn copy_to_user<T: Copy>(addr: u64, val: &T) -> bool {
-    if !validate_user_range(addr, core::mem::size_of::<T>()) {
-        return false;
+    unsafe {
+        copy_to_user_bytes(
+            addr,
+            (val as *const T).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
     }
-    let _guard = UserAccessGuard::new();
-    // SAFETY: Address validated above; SMAP relaxed by guard; caller
-    // ensures page is mapped and writable.
-    unsafe { core::ptr::write_volatile(addr as *mut T, *val); }
-    true
 }

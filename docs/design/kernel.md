@@ -6,8 +6,8 @@ This document describes the SaltyOS microkernel architecture and implementation.
 
 The SaltyOS kernel is a capability-based microkernel written in Rust. It provides only the essential mechanisms required for a secure, multi-tasking system:
 
-- Thread scheduling (EDF)
-- Inter-process communication
+- Thread scheduling (4-class: Deadline, RT FIFO, Fair-EEVDF, Idle)
+- Inter-process communication (MessagePipe, DataPipe, EventQueue, Watch)
 - Memory management
 - Capability-based access control
 - Interrupt routing
@@ -23,7 +23,7 @@ The kernel should be as small as possible while still providing necessary mechan
 
 | In Kernel | In Userspace |
 |-----------|--------------|
-| Thread/Scheduler | Process Manager |
+| Thread/Scheduler | Service manager (init owns spawn/lifecycle) |
 | IPC | Protocols/APIs |
 | Memory mapping | Memory allocators |
 | Capabilities | Access policies |
@@ -52,12 +52,27 @@ All system calls should have bounded worst-case execution time (WCET):
 
 ```
 kernite/src/
-├── lib.rs              # Entry (kmain), serial I/O, panic handler
-├── bootinfo.rs         # Boot info TLV parsing from bootloader
-├── cpio.rs             # CPIO archive parser for initrd
-├── elf.rs              # ELF binary loader for init task
-├── init.rs             # Init task bootstrap (CSpace setup, capability grants)
-├── rng.rs              # RDRAND-based random number generator
+├── lib.rs              # Crate root only: top-level module wiring
+├── kernel/
+│   ├── mod.rs          # Kernel-internal infrastructure plane
+│   ├── printk.rs       # Serial / framebuffer printk and log macros
+│   ├── panic.rs        # Unified panic, fatal exception, and state dump path
+│   ├── bug.rs          # Always-on kernel BUG / assert macros
+│   ├── build_info.rs   # Linked build identity and config hash
+│   ├── kallsyms.rs     # In-kernel symbol lookup for text/data addresses
+│   ├── stacktrace.rs   # Arch panic context capture and traceback printer
+│   ├── unwind.rs       # Bounded DWARF CFI unwind helper with FP fallback
+│   ├── time.rs         # Boot-time anchor and kernel time globals
+│   └── random.rs       # Architecture-backed kernel random source
+├── init/
+│   ├── mod.rs          # Boot/init plane module entry
+│   ├── main.rs         # kmain and init task bootstrap
+│   ├── bootinfo.rs     # Boot info TLV parsing from bootloader
+│   ├── cpio.rs         # CPIO archive parser for initrd
+│   └── elf.rs          # ELF binary loader for init task
+├── firmware/
+│   ├── mod.rs          # Firmware table plumbing plane
+│   └── acpi.rs         # ACPI table parsing shared above arch code
 ├── arch/
 │   ├── mod.rs
 │   ├── x86_64/
@@ -99,21 +114,35 @@ kernite/src/
 │   ├── cnode.rs        # CNode (capability table, 4-16 bit slots)
 │   ├── ioport.rs       # I/O port range capabilities
 │   ├── memory_object.rs # MemoryObject (radix tree pages, COW, reverse maps)
-│   ├── object.rs       # ObjectType enum (12 types), KernelObject header
+│   ├── object.rs       # ObjectType enum (25 types, gap at 22), KernelObject header
 │   ├── refcount.rs     # Object reference counting
 │   ├── slot.rs         # Slot allocation/access helpers
-│   └── untyped.rs      # Untyped memory retype
+│   └── untyped.rs      # Untyped memory: per-object multi-class freelist
+                        #   + watermark allocator + object-level children
+                        #   registry (`child_head` on UntypedMemory plus
+                        #   `parent_ut` + `hlist` sibling links on every
+                        #   KernelObject). carve_block / release_block
+                        #   primitives shared by cap retype and MO_COMMIT.
 ├── console/
 │   ├── mod.rs          # Kernel console output multiplexer
 │   ├── fb.rs           # Framebuffer console driver
 │   └── font.rs         # Built-in 8x16 bitmap font
 ├── ipc/
-│   ├── mod.rs          # IPC types (Message, IpcBuffer), fault types
-│   ├── endpoint.rs     # Synchronous rendezvous endpoints
-│   ├── futex.rs        # Userspace futex (wait/wake/requeue)
-│   ├── irq.rs          # Hardware IRQ routing to notifications
-│   ├── notification.rs # Asynchronous notification (bitmap signaling)
-│   └── queue.rs        # IPC wait queue management
+│   ├── mod.rs          # IpcBuffer layout (shared user/kernel page)
+│   ├── message_pipe.rs # MessagePipe Core+Side (records, cap carriers, MpFastMailbox)
+│   ├── data_pipe.rs    # DataPipe Core+Side (byte ring, peek-then-commit)
+│   ├── fault.rs        # Per-task fault MessagePipe (reply-to-resume: OK reply → retry, non-OK / close → destroy)
+│   ├── transfer.rs     # Cap-transfer helpers (CapRef move semantics)
+│   └── futex.rs        # Userspace futex (wait/wake/requeue, optional IpcTimeout)
+├── event/
+│   ├── mod.rs          # Event plane module entry
+│   ├── event_queue.rs  # Bounded EventQueue with dropped counter
+│   ├── watch.rs        # Watch object — one-shot state-mask registration
+│   ├── watcher_list.rs # Per-watchable-object watcher list (lost-wakeup-free publish)
+│   ├── timer.rs        # ns-precision Timer (one-shot or periodic)
+│   ├── irq.rs          # IrqHandler, dispatch_irq → SIGNALED + EVENT_TYPE_IRQ
+│   ├── record.rs       # EventRecord wire layout
+│   └── state.rs        # State-flag publication helpers
 ├── mm/
 │   ├── mod.rs          # Memory management globals, lock ordering, helpers
 │   ├── frame.rs        # Bitmap-based physical frame allocator (PMM), FrameOwner
@@ -122,14 +151,29 @@ kernite/src/
 │   ├── radix_tree.rs   # 4-level radix tree (page storage for MemoryObject)
 │   └── vspace.rs       # VSpace (page tables, COW, demand paging, MapleTree<VmArea>)
 ├── sched/
-│   ├── mod.rs          # Scheduler module entry
-│   ├── pip.rs          # Priority Inheritance Protocol
-│   ├── scheduler.rs    # EDF scheduler (global ready queue)
-│   ├── sleep_queue.rs  # Timed sleep queue (NanoSleep, timed IPC)
-│   └── thread.rs       # TCB, SchedContext, ThreadState, BlockedReason
+│   ├── mod.rs              # Scheduler module entry
+│   ├── control.rs          # Wake plans, task-control follow-ups
+│   ├── deadline_queue.rs   # ns-precision deadline queue (Sleep / FutexTimed / IpcTimeout / TimerFire)
+│   ├── pip.rs              # Priority Inheritance Protocol
+│   ├── scheduler.rs        # 4-class scheduler (Deadline / RT FIFO / Fair-EEVDF / Idle)
+│   └── thread.rs           # TCB, SchedContext, ThreadState, BlockedReason
+├── task/
+│   ├── mod.rs              # Task control surface
+│   ├── control.rs          # begin_destroy, prepare_blocked_reason_locked, ...
+│   ├── quiesce.rs          # Quiesce helpers (drain in-flight IPC before destroy)
+│   ├── state.rs            # Flat ThreadState transitions
+│   ├── stop.rs             # SIGSTOP / SIGCONT analog (task suspension)
+│   └── wait.rs             # Wait-list primitives used by blocked-reason teardown
+├── object/
+│   ├── mod.rs              # Object lifetime plane entry
+│   └── reaper.rs           # Deferred-destruction reaper (drains after every syscall)
 └── syscall/
-    ├── mod.rs          # 28 syscalls, capability invocation dispatch
-    └── fastpath.rs     # IPC fastpath (Call/ReplyRecv optimization)
+    ├── mod.rs              # KERNITE_SYS_INVOKE (single syscall) — capability invocation dispatch
+    ├── dispatch.rs         # Top-level Syscall::Invoke trampoline
+    ├── invoke.rs           # InvokeTarget lookup
+    ├── cspace.rs           # (ObjectType, label) match → handler
+    └── pipe.rs / event.rs / mo.rs / vspace.rs / tcb.rs / cap.rs / sc.rs / ioport.rs / system.rs / misc.rs
+                            # Per-object handlers
 ```
 
 ## Kernel Entry
@@ -150,6 +194,11 @@ graph TD
 
 ### Entry Point
 
+`lib.rs` is intentionally not a dumping ground. It declares the crate-wide
+planes only; entry, printk, panic, random, and firmware parsing live in their
+own Linux-style source-tree responsibility boundaries. This is organization,
+not Linux process semantics.
+
 ```rust
 // kernite/src/lib.rs
 
@@ -157,56 +206,97 @@ graph TD
 #![no_main]
 
 mod arch;
-mod bootinfo;
 mod cap;
-mod cpio;
-mod elf;
+mod console;
+mod event;
+mod firmware;
 mod init;
 mod ipc;
+mod kernel;
 mod mm;
-mod rng;
+mod object;
 mod sched;
 mod syscall;
+mod task;
+```
 
-use core::panic::PanicInfo;
+```rust
+// kernite/src/init/main.rs
 
-/// Kernel entry point (called from bootloader with BootInfo pointer in RDI/x0)
+// Abridged: actual boot code includes early printk, framebuffer setup,
+// AP bring-up, and boot-fatal handling.
+//
+/// Kernel entry point (called from bootloader with a BootInfo pointer).
 #[unsafe(no_mangle)]
-pub extern "C" fn kmain(boot_info_addr: u64) -> ! {
-    // Parse TLV-encoded boot info from bootloader
-    let boot_info = bootinfo::parse(boot_info_addr);
-
-    // Initialize serial for early debug output
-    serial_init();
-    kprintln!("SaltyOS kernel starting...");
-
-    // Architecture-specific initialization (GDT, IDT, paging, APIC, SMP)
-    arch::init(&boot_info);
-
-    // Initialize physical frame allocator and memory management
-    mm::init(&boot_info);
-
-    // Initialize capability system
-    cap::init();
-
-    // Initialize scheduler
-    sched::init();
-
-    // Create init task: parse CPIO initrd, load ELF, set up CSpace
-    init::create_init_task(&boot_info);
-
-    // Start the scheduler (never returns)
-    sched::start();
+pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
+    let boot_info = unsafe { bootinfo::parse(raw_boot_info) };
+    crate::arch::init(boot_info);
+    crate::kernel::time::BOOT_TIME_NS.store(crate::arch::now_ns(), Ordering::Relaxed);
+    crate::cap::init();
+    crate::sched::init();
+    crate::arch::start_timer();
+    crate::arch::init_smp(boot_info);
+    crate::arch::clear_boot_identity_map();
+    bootstrap(boot_info);
+    crate::sched::scheduler::scheduler().reschedule();
 }
+```
+
+```rust
+// kernite/src/kernel/panic.rs
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    kprintln!("KERNEL PANIC: {}", info);
-    loop {
-        arch::halt();
-    }
+    let location = info
+        .location()
+        .map(|loc| PanicLocation::new(loc.file(), loc.line(), loc.column()));
+    panic_now(format_args!("{}", info.message()), location)
 }
 ```
+
+`kernel::panic` is the only fatal-report path. Rust panics, assembly
+`kernel_panic`, x86 fatal exceptions, aarch64 EL1 exceptions, aarch64 SError,
+always-on `kassert*`/`kbug*`, and spinlock hard timeouts all enter the same
+reporter. The report deliberately combines Linux's `CPU/PID/RIP/Call Trace`
+shape, FreeBSD-style trapframe fields, BSD traceback culture, and a
+Windows-bugcheck-like structured reason code. This is a diagnostic style, not a
+Linux task/process semantic model.
+
+Canonical panic order:
+
+```text
+============================================================
+KERNEL PANIC [#N]  SMP
+============================================================
+CPU: ...
+PID: ...
+panic_cpu: ...
+panic_task: ...
+uptime_ns: ...
+invoke_seq: ...
+source: ...
+kernel: kernite git=<rev12><-dirty> config=<hash12> arch=<arch> rustc=<rustc> profile=<debug|release>
+reason:
+  code: ...
+  kind: ...
+  expr: ...
+  message: ...
+  location: ...
+-- fault context -------------------------------------------
+-- Call Trace ----------------------------------------------
+-- current task --------------------------------------------
+-- lock diagnostics ----------------------------------------
+-- scheduler -----------------------------------------------
+-- memory --------------------------------------------------
+-- secondary CPUs ------------------------------------------
+-- arch detail ---------------------------------------------
+============================================================
+```
+
+Only the CPU that wins `PANIC_CPU` prints the full report. Other CPUs record a
+bounded secondary event and halt, which prevents serial interleaving during SMP
+panic storms. `KDEBUG_DUMP_STATE` reuses the same snapshot printers without
+halting or claiming the panic CPU.
 
 ## Architecture Layer
 
@@ -363,10 +453,10 @@ pub fn init_bsp() {
             limit: (size_of::<Gdt>() - 1) as u16,
             base: gdt as *const _ as u64,
         };
-        core::arch::asm!("lgdt [{}]", in(reg) &gdt_ptr, options(nostack));
+        unsafe { x86_gdt_lgdt(&gdt_ptr) };
 
         // Load TSS selector
-        core::arch::asm!("ltr ax", in("ax") TSS_SELECTOR, options(nostack));
+        unsafe { x86_gdt_ltr(TSS_SELECTOR) };
     }
 }
 ```
@@ -418,21 +508,44 @@ pub fn init() {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: idt as *const _ as u64,
         };
-        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
+        unsafe { x86_idt_lidt(&idt_ptr) };
     }
 }
 
 /// Page fault handler (called from exceptions.S after register save).
-/// For user-mode faults, delivers fault info via IPC to the thread's
-/// fault handler endpoint. For kernel faults, panics.
+/// For user-mode faults: try kernel-internal recoveries (CoW
+/// resolve, demand-page from a mapped MO) inline; on miss,
+/// `deliver_fault` parks the thread on its bound fault MessagePipe
+/// (reply-to-resume — see `docs/design/ipc.md`). For kernel faults,
+/// panic.
 ///
 /// IMPORTANT: EOI must be sent before any code that might trigger a
 /// context switch.
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_page_fault(error_code: u64, fault_addr: u64) {
     if error_code & 0x4 != 0 {
-        // User mode fault — deliver via fault IPC or demand-page
-        handle_user_page_fault(fault_addr, error_code);
+        // User-mode fault. Try inline recovery first.
+        if try_inline_recover(fault_addr, error_code) {
+            return; // CoW or demand-page satisfied — retry the
+                    // faulting instruction by returning to userspace.
+        }
+        // Inline recovery missed. Build a fault record + ask the
+        // task's fault handler to either rescue (reply-marked MP_WRITE KERNITE_OK
+        // → instruction retries) or kill us (non-OK / closed pipe /
+        // call TCB_KILL).
+        let record = ipc::fault::page_fault_record(
+            fault_addr,
+            ipc_error_code(error_code),
+            faulting_rip(),
+            error_code & 0x10 != 0, // I/D bit
+        );
+        if !ipc::fault::deliver_fault(current_tcb(), record) {
+            // No live fault pipe; escalate.
+            task::control::begin_destroy(current_tcb());
+        }
+        // `deliver_fault` parked us waiting for a fault reply; the
+        // arch return path either retries the instruction on OK or
+        // hands off to `begin_destroy`.
     } else {
         panic!("KERNEL PAGE FAULT at {:#x}, error={:#x}", fault_addr, error_code);
     }
@@ -449,34 +562,38 @@ All references to other kernel objects are raw pointers, not smart pointers.
 ```rust
 // kernite/src/sched/thread.rs
 
-/// Thread state — determines schedulability
+/// Thread state — flat enum, drives schedulability and destroy
+/// transitions through `task::control` helpers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-    Inactive,   // Not yet started or permanently stopped
-    Ready,      // In ready queue, waiting for CPU
-    Running,    // Currently executing on a CPU
-    Blocked,    // Blocked (reason stored in BlockedReason)
-    Waiting,    // Waiting on notification
+    Created,                       // Retyped, not yet configured
+    Configured,                    // VSpace + CSpace + entry installed
+    Runnable,                      // In ready queue or running
+    Blocked(BlockedReason),        // Blocked on the named primitive
+    Stopped,                       // Halted (TCB_STOP); resumable
+    Dying,                         // Destroy in flight
 }
 
-/// Reason why a thread is in ThreadState::Blocked
+/// Reason a thread is `Blocked(...)`. Each variant maps to one
+/// waiter queue + one wake plan in `sched/control.rs::WakeTransition`.
 #[derive(Clone, Copy)]
 pub enum BlockedReason {
-    SendBlocked { msg, badge },         // Blocked on synchronous send
-    RecvBlocked,                        // Blocked on synchronous receive
-    NotificationWait,                   // Blocked waiting on notification
-    VSpaceWait,                         // Blocked on VSpace teardown
-    ReplyWait { msg, badge },           // Blocked waiting for reply (after call())
-    FaultBlocked { msg, badge },        // Blocked on fault delivery
-    CallSendBlocked { msg, badge },     // Blocked on call() send phase
-    TimerBlocked,                       // Blocked on nanosleep timer
-    FutexBlocked,                       // Blocked on futex wait
-    FutexTimedBlocked,                  // Blocked on futex wait with timeout
-    SendTimedBlocked { msg, badge },    // Blocked on send with timeout
-    RecvTimedBlocked,                   // Blocked on receive with timeout
+    PipeRead,           // MessagePipe inbound
+    PipeWrite,          // MessagePipe outbound ring full
+    CallReply,          // MP_CALL parked waiting for reply
+    PagerFaultBlocked,  // Pager-backed fault path parked on pager response
+    DataPipeRead,       // DataPipe inbound ring empty
+    DataPipeWrite,      // DataPipe outbound ring full
+    EventQueueWait,     // EQ_WAIT on EventQueue
+    VSpaceWait,         // VSpace teardown drain
+    TimerBlocked,       // Sleep deadline (clock_nanosleep-style)
+    FutexBlocked,       // Futex wait, untimed
+    FutexTimedBlocked,  // Futex wait with deadline arm
 }
 
-/// Thread Control Block (kernel object, allocated from untyped memory)
+/// Thread Control Block — kernel object retyped from untyped.
+/// All cross-object references are raw pointers; refcount + sched_ref
+/// pin discipline keeps them dangling-free.
 #[repr(C)]
 pub struct Tcb {
     pub header: KernelObject,            // Must be first field
@@ -484,26 +601,26 @@ pub struct Tcb {
     pub state: ThreadState,
     pub context: Context,                // Saved CPU registers
 
-    // Capability space and address space (raw pointers to kernel objects)
-    pub cspace: *mut CNode,              // Thread's CNode root
-    pub vspace: *mut VSpace,             // Thread's page table root
+    // Capability space + address space + scheduling context (raw
+    // refcount-pinned pointers).
+    pub cspace_root: *mut CNode,
+    pub vspace_root: *mut VSpace,
+    pub sched_context: *mut SchedContext,
 
-    // IPC state
-    pub ipc_buffer: u64,                 // Virtual address of IPC buffer page
-    pub blocking_object: *mut KernelObject, // Endpoint/Notification we're blocked on
-    pub fault_handler_ep: *mut Endpoint, // Null if no fault handler
+    // IPC inline storage.
+    pub ipc_buffer: u64,                  // Virtual address of IPC buffer page
+    pub mp_fast_mailbox: MpFastMailbox,   // 5-state CAS deposit slot
+    pub fault_pipe: *mut MessagePipe,     // Bound fault MessagePipe (null if unbound)
 
-    // Scheduling
-    pub sched_context: *mut SchedContext, // EDF parameters (period, deadline, budget)
-    pub priority: u8,                    // Tiebreaker for equal-deadline threads
-    pub cpu_affinity: u8,                // Preferred CPU (0xFF = any)
+    // Wait-state bookkeeping (read by `detach_thread_wait_queues`).
+    pub blocked_reason: Option<BlockedReason>,
+    pub wait_object: *mut core::ffi::c_void,  // pipe core / EQ / etc.
+    pub wait_side: u8,                         // SIDE_A / SIDE_B for pipes
+    pub wait_seq: u64,                         // bumped on every park
 
-    // Bound notification (bidirectional TCB <-> Notification link)
-    pub bound_notification: *mut Notification, // Null if unbound
-
-    // Linked list pointers for wait queues and ready queues
-    pub queue_next: *mut Tcb,
-    pub queue_prev: *mut Tcb,
+    // Deadline-queue node (Sleep / FutexTimed / IpcTimeout).
+    pub deadline_node: DeadlineNode,
+    pub futex_wakeup_result: u64,         // SyscallError::* set by deadline dispatch
 
     // Stack canary for kernel stack overflow detection
     pub stack_canary: u64,
@@ -565,45 +682,13 @@ impl Context {
     }
 }
 
-/// Switch from one context to another
-/// 
+/// Switch from one context to another. The register save/restore sequence
+/// lives in `kernite/src/arch/<arch>/context.S`; Rust only declares the ABI.
+///
 /// # Safety
 /// Both contexts must be valid and properly initialized.
-#[naked]
-pub unsafe extern "C" fn switch_context(
-    old: *mut Context,
-    new: *const Context,
-) {
-    core::arch::asm!(
-        // Save callee-saved registers to old context
-        "mov [rdi + 0x00], rbx",
-        "mov [rdi + 0x08], rbp",
-        "mov [rdi + 0x10], r12",
-        "mov [rdi + 0x18], r13",
-        "mov [rdi + 0x20], r14",
-        "mov [rdi + 0x28], r15",
-        "mov [rdi + 0x30], rsp",
-        
-        // Save return address
-        "lea rax, [rip + 1f]",
-        "mov [rdi + 0x38], rax",
-        
-        // Load new context
-        "mov rbx, [rsi + 0x00]",
-        "mov rbp, [rsi + 0x08]",
-        "mov r12, [rsi + 0x10]",
-        "mov r13, [rsi + 0x18]",
-        "mov r14, [rsi + 0x20]",
-        "mov r15, [rsi + 0x28]",
-        "mov rsp, [rsi + 0x30]",
-        
-        // Jump to new instruction pointer
-        "jmp [rsi + 0x38]",
-        
-        "1:",
-        "ret",
-        options(noreturn)
-    );
+unsafe extern "C" {
+    fn context_switch(old: *mut Context, new: *const Context);
 }
 ```
 
@@ -611,142 +696,90 @@ pub unsafe extern "C" fn switch_context(
 
 ### Syscall Entry
 
-Syscall entry is via the `syscall` instruction. The assembly stub in
-`syscall.S` saves user RSP on the per-thread kernel stack (not per-CPU
-`%gs:16`), checks for IPC fastpath (RAX==2 for Call, RAX==3 for ReplyRecv),
-and falls through to the Rust slowpath handler for all other syscalls.
+Syscall entry is via the `syscall` instruction (x86_64) or `svc #0`
+(aarch64). kernite exposes **a single syscall** —
+`KERNITE_SYS_INVOKE`. There is no ambient kernel authority: every
+operation routes through capability invocation against an explicit
+cap target. Randomness, shutdown, clock reads, system accounting,
+and debug output are reached through dedicated capability objects
+(`KernelRng`, `SystemControl`, `Clock`, `SystemInfo`,
+`KernelDebug`).
 
 ```rust
-// kernite/src/syscall/mod.rs
+// kernite/src/syscall/types.rs
 
-mod fastpath;
-
-/// System call numbers (28 total)
 #[repr(u64)]
 pub enum Syscall {
-    Send = 0,
-    Recv = 1,
-    Call = 2,
-    ReplyRecv = 3,
-    NBSend = 4,
-    Signal = 5,
-    Wait = 6,
-    Poll = 7,
-    Yield = 8,
-    Invoke = 9,
-    DebugPutChar = 10,
-    DebugDumpState = 11,
-    ClockGetTime = 12,
-    NanoSleep = 13,
-    DebugPutStr = 14,
-    DebugPutBuf = 15,
-    DebugConsoleControl = 16,
-    SetInvokeDepths = 17,
-    Futex = 18,
-    GetRandom = 19,
-    Shutdown = 20,
-    SendTimed = 21,
-    RecvTimed = 22,
-    RecvAny = 23,          // Multi-endpoint receive (any of N endpoints)
-    ReplyRecvAny = 24,     // Reply + multi-endpoint receive
-    RecvAnyTimed = 25,     // Multi-endpoint receive with timeout
-    ReplyRecvAnyTimed = 26, // Reply + multi-endpoint receive with timeout
-    NotifReturn = 27,      // Return from notification dispatch
+    Invoke = 0,
 }
 
-/// Slowpath syscall handler (called from syscall.S assembly stub).
-/// Returns error in RAX, value in RDX.
-///
-/// The assembly entry point saves user RSP on the per-thread kernel stack
-/// and dispatches Call/ReplyRecv to the fastpath before reaching here.
-#[unsafe(no_mangle)]
-pub extern "C" fn syscall_handle_rust(
-    syscall_nr: u64,
-    arg1: u64,  // rdi
-    arg2: u64,  // rsi
-    arg3: u64,  // rdx
-    arg4: u64,  // r10
-    arg5: u64,  // r8
-    arg6: u64,  // r9
-) -> u64 {
-    let nr = match Syscall::try_from(syscall_nr) {
-        Ok(s) => s,
-        Err(_) => return SyscallError::InvalidSyscall as u64,
-    };
+// kernite/src/syscall/dispatch.rs
 
-    match nr {
-        Syscall::Send => handle_send(arg1, arg2, arg3),
-        Syscall::Recv => handle_recv(arg1, arg2),
-        Syscall::Call => handle_call(arg1, arg2, arg3),
-        Syscall::ReplyRecv => handle_reply_recv(arg1, arg2, arg3),
-        Syscall::Invoke => handle_invoke(arg1, arg2, arg3, arg4, arg5, arg6),
-        Syscall::Yield => { sched::yield_current(); 0 }
-        Syscall::Futex => handle_futex(arg1, arg2, arg3, arg4),
-        Syscall::NanoSleep => handle_nanosleep(arg1, arg2),
-        Syscall::ClockGetTime => handle_clock_gettime(arg1),
-        Syscall::Shutdown => handle_shutdown(),
-        // ... remaining syscalls dispatched similarly
-        _ => SyscallError::InvalidSyscall as u64,
-    }
-}
-```
-
-### Capability Invocation
-
-The Invoke syscall (number 9) dispatches to object-type-specific handlers
-based on the capability's `obj_type` field. The invoke label (passed in the
-message info) determines the specific operation within each type.
-
-```rust
-// kernite/src/syscall/mod.rs (handle_invoke function)
-
-/// Invoke a capability. The cap slot is looked up in the thread's CSpace,
-/// then dispatched based on ObjectType and invoke label.
-fn handle_invoke(
-    cap_slot: u64,
+pub(crate) fn handle(
+    syscall: u64,
+    cap_ptr: u64,
     msg_info: u64,
     mr0: u64,
     mr1: u64,
     mr2: u64,
     mr3: u64,
-) -> u64 {
+) -> SyscallResult {
+    match Syscall::try_from(syscall) {
+        Ok(Syscall::Invoke) => invoke::syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Err(e) => SyscallResult::err(e),
+    }
+}
+```
+
+The arch-specific entry stub saves user state, optionally hits the
+v1 IPC fastpath (`MP_WRITE` against a `MessagePipe` whose peer is
+already parked on `PipeRead` — see `try_mp_write_fastpath` in
+`syscall/cspace.rs`), and otherwise falls through to
+`syscall_invoke`. Every label / error code lives in
+`kernite/include/uapi/{invoke,error}.h` and is consumed via bindgen
+from Rust.
+
+### Capability Invocation
+
+`syscall_invoke` looks up the cap target via
+`lookup_invoke_target_locked(cap_ptr)` and dispatches on
+`(cap.obj_type, label)` to the per-object handler in
+`syscall/{pipe, event, mo, vspace, tcb, cap, sc, ioport, system, misc}.rs`.
+The invoke label (passed as the `msg_info` argument) identifies the
+specific operation within each object type.
+
+```rust
+// kernite/src/syscall/dispatch.rs (top-level Syscall::Invoke trampoline)
+
+/// Single kernel entry: KERNITE_SYS_INVOKE.
+/// Resolves the capability, then routes to the per-object handler in
+/// syscall/{pipe,event,mo,vspace,tcb,cap,sc,ioport,pager,system,misc}.rs
+/// based on (ObjectType, invoke_label).
+pub fn syscall_handle_rust(regs: &mut SyscallRegs) {
     let irq = save_irq_disable();
 
-    // Look up capability in current thread's CSpace
     CAP_LOCK.lock();
-    let cap = match cspace_lookup(current_thread(), cap_slot) {
+    let cap = match lookup_invoke_target_locked(regs.cap_slot) {
         Ok(c) => c,
         Err(e) => {
             CAP_LOCK.unlock();
             restore_irq(irq);
-            return syscall_error_from_cap_error(e) as u64;
+            regs.set_error(syscall_error_from_cap_error(e));
+            drain_reaper();
+            return;
         }
     };
-
-    // Copy cap to stack, release CAP_LOCK before further operations
     let cap_copy = *cap;
     CAP_LOCK.unlock();
 
-    let label = msg_info_label(msg_info);
-
-    // Dispatch based on object type
-    let result = match cap_copy.obj_type {
-        ObjectType::CNode        => invoke_cnode(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::Untyped      => invoke_untyped(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::Tcb          => invoke_tcb(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::VSpace       => invoke_vspace(&cap_copy, label, mr0, mr1, mr2),
-        ObjectType::SchedContext  => invoke_sched_context(&cap_copy, label, mr0, mr1, mr2),
-        ObjectType::MemoryObject => invoke_memory_object(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::IrqHandler   => invoke_irq(&cap_copy, label, mr0, mr1),
-        ObjectType::IoPort       => invoke_ioport(&cap_copy, label, mr0, mr1),
-        _ => Err(SyscallError::InvalidCapability),
-    };
+    // Route by (obj_type, label) to per-object handler.
+    let result = dispatch_invoke(&cap_copy, regs);
 
     restore_irq(irq);
-    match result {
-        Ok(val) => val,
-        Err(e) => e as u64,
-    }
+    regs.set_result(result);
+
+    // Deferred object destruction: drain the reaper after every syscall.
+    drain_reaper();
 }
 ```
 
@@ -767,41 +800,63 @@ system.
 ```rust
 // kernite/src/cap/object.rs
 
-/// Object type discriminant (stored in KernelObject header and Capability)
+/// Object type discriminant — values pinned to `KERNITE_OBJ_*`
+/// in `kernite/include/uapi/object.h` so the wire-visible retype
+/// target and the kernel-internal enum share one integer.
 #[repr(u8)]
 pub enum ObjectType {
     Null = 0,
-    Untyped = 1,
-    Endpoint = 2,
-    Notification = 3,
-    Tcb = 4,
-    CNode = 5,
-    VSpace = 6,
-    Frame = 7,
-    IrqHandler = 8,
-    IoPort = 9,
-    SchedContext = 10,
-    MemoryObject = 11,
+    Untyped,
+    Tcb,
+    CNode,
+    VSpace,
+    Frame,
+    IrqHandler,
+    IoPort,
+    SchedContext,
+    MemoryObject,
+    EventQueue,
+    Watch,
+    MessagePipe,
+    DataPipe,
+    Timer,
+    KernelRng,
+    SystemControl,
+    Clock,
+    SystemInfo,
+    KernelDebug,
+    MessagePipeCore,
+    DataPipeCore,
+    // 22 is a gap (retired, not reused)
+    Pager           = 23,
+    DeviceControl   = 24,
+    VmHierarchyState = 25,
 }
 
-/// Common header for all kernel objects (must be first field in every object struct)
+/// Common header for all kernel objects (must be first field in every object struct).
 #[repr(C)]
 pub struct KernelObject {
     pub obj_type: ObjectType,
-    pub refcount: u32,
+    pub size_bits: u8,
+    pub ref_count: AtomicU32,
+    pub reaper_link: u64,
+    pub parent_ut: *mut UntypedMemory,
+    pub ut_sibling_next: *mut KernelObject,
+    pub ut_sibling_pprev: *mut *mut KernelObject,
 }
 
-// Example: Endpoint struct with KernelObject header
+// Example: MessagePipe side handle with KernelObject header.
 #[repr(C)]
-pub struct Endpoint {
-    pub header: KernelObject,       // Must be first field
-    pub send_queue: *mut Tcb,       // Linked list of senders (raw pointer, no Vec)
-    pub recv_queue: *mut Tcb,       // Linked list of receivers
+pub struct MessagePipe {
+    pub header: KernelObject,
+    pub core: *mut MessagePipeCore,   // Strong refcount-pinned pointer
+    pub which_side: u8,                // SIDE_A or SIDE_B
+    pub _pad: [u8; 7],
 }
 
 // Capabilities reference objects through raw pointers.
 // The capability's obj_type field tells you how to cast:
-//   let ep: *mut Endpoint = cap.object as *mut Endpoint;
+//   let mp: *mut MessagePipe = cap.object as *mut MessagePipe;
 ```
 
 ### MemoryObject
@@ -815,10 +870,18 @@ Key properties:
 - **Dual-source commit**: `MO_COMMIT` borrows frames from untyped (primary, via `ut_cap` arg)
   or PMM (fallback, when `ut_cap == 0`)
 - **COW clone**: `MO_CLONE` creates a snapshot child with cap-refcounted parent link
+- **COW topology lock**: COW tree mutations are serialized per-tree by a
+  `VmHierarchyState` object (type 25, RFC-0002, landed). While holding
+  `VmHierarchyState.lock`, callers must not take `CAP_LOCK`, must not call
+  `release_object()`, and must not wake or signal any waiter inline.
 - **Reverse maps**: Tracks which VSpaces observe MO pages (inline 8 + overflow chain)
 - **VSpace integration**: `VSPACE_MAP_MO` (0x97), tracking-aware
   `VSPACE_UNMAP` (0x51), `VSPACE_SHARE_RO_PAGE` (0x99),
   `VSPACE_FORK_RANGE` (0x9A)
+- **Shallow release**: `release_object()` enqueues to the object reaper
+  (`object/reaper.rs`) rather than destroying inline. The reaper drains
+  after every `syscall_handle_rust` return, keeping destruction out of
+  deep lock-holding contexts.
 
 See [Memory Management](memory.md) for full design details.
 
@@ -848,7 +911,51 @@ pub const IPC_MAX_MRS: usize = 22;
 /// Controlled at build time; levels: error, warn, info, debug, trace
 ```
 
+The build also links a read-only `kernite_build_info` object. Panic reports and
+`KDEBUG_DUMP_STATE` print:
+
+```text
+kernel: kernite git=<rev12><-dirty> config=<hash12> arch=<arch> rustc=<rustc> profile=<debug|release>
+```
+
+`git` is the short revision or `unknown`; `-dirty` means staged or unstaged
+changes were present at build time. `config` is the first 12 hex digits of a
+SHA-256 over kernel-affecting inputs such as architecture, rustc version,
+kernel log/debug options, serial/debug-symbol options, CPU/stack limits, target
+JSON, linker script, and Rust cfg list. The full hash and canonical summary are
+kept in the linked build-info payload for `KDEBUG_DUMP_STATE`.
+
 ## Invariants and Safety
+
+### Lock Ordering
+
+Locks must be acquired in this order (outermost → innermost). Never hold a
+lock and then acquire one higher in the chain.
+
+```
+CAP_LOCK
+  → IRQ_LOCK                                                  (interrupt delivery)
+  → mp_core.lock / dp_core.lock / eq.lock / tcb_lock / sc.lock  (per-object)
+  → SLEEP_LOCK / FUTEX_LOCK                                   (independent globals)
+  → sched.lock_cpu                                            (per-CPU)
+  → VmHierarchyState.lock                                     (per-COW-tree)
+  → VSpace.lock → ASID_LOCK
+  → MO.commit_lock | MO.rmap_lock                             (disjoint, same level — never hold both)
+  → ut.alloc_lock
+  → FRAME_LOCK → SERIAL_LOCK                                  (global PMM, leaf)
+```
+
+Key constraints:
+- `IRQ_LOCK` nests outside all per-object locks
+- While holding `VmHierarchyState.lock`: must not take `CAP_LOCK`, must not
+  call `release_object()`, must not wake/signal/enqueue any waiter inline
+- `MO.commit_lock` and `MO.rmap_lock` are at the same level and disjoint —
+  holding both simultaneously is forbidden
+- production kernel runtime invariants must use `kassert!`, `kassert_eq!`,
+  `kassert_ne!`, `kbug!`, or `kbug_on!`; new runtime paths must not depend on
+  `debug_assert*` or `cfg(debug_assertions)` because panic diagnostics are part
+  of the production failure contract
+- `tcb_lock` sits with the per-object group — acquired outside `sched.lock_cpu`
 
 ### Key Invariants
 

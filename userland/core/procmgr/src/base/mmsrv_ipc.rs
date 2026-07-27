@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::core::*;
+use trona_kernel::core_types::sysinfo::TronaProcMemSnapshot;
+use trona_kernel::core_types::*;
 
-const TRONA_OK: u64 = trona::TRONA_OK;
-const VSPACE_FLAG_WRITABLE: u64 = trona::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = trona::VSPACE_FLAG_USER;
+const TRONA_OK: u64 = trona_protocol::common::TRONA_OK;
+const VSPACE_FLAG_WRITABLE: u64 = uapi::KERNITE_PAGE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = uapi::KERNITE_PAGE_FLAG_USER;
 
 /// Map initrd pages into a child's VSpace for exec.
 ///
@@ -23,16 +24,16 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
     let mut mapped_device = true;
 
     for pg in 0..initrd_pages {
-        let err = trona::invoke::vspace_map_device(
+        let err = trona_kernel::invoke::vspace_map_device(
             proc_vs,
-            trona::caps::initrd_untyped(),
+            trona_runtime::client::caps::initrd_untyped(),
             (pg as u64) * 4096,
             initrd_base + pg as u64 * 4096,
             VSPACE_FLAG_USER,
         );
         if err != 0 {
             for mapped_pg in 0..pg {
-                trona::invoke::vspace_unmap(proc_vs, initrd_base + mapped_pg as u64 * 4096);
+                trona_kernel::invoke::vspace_unmap(proc_vs, initrd_base + mapped_pg as u64 * 4096);
             }
             mapped_device = false;
             break;
@@ -53,7 +54,7 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
     )
     .is_err()
     {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] exec: initrd MM_ALLOC_INITRD_COPY failed\n");
         });
         return -1;
@@ -67,7 +68,7 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
 /// Returns 0 on success.
 pub(crate) unsafe fn exec_map_bootinfo_mmsrv(pid: u32) -> i32 {
     if alloc_bootinfo_copy_from_mmsrv(pid, crate::BOOTINFO_VADDR, VSPACE_FLAG_USER).is_err() {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] exec: bootinfo MM_ALLOC_BOOTINFO_COPY failed\n");
         });
         return -1;
@@ -82,20 +83,20 @@ pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32
     unsafe {
         let mut mm_msg = TronaMsg::zeroed();
         let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::protocol::MM_MAP_BATCH;
+        mm_msg.label = trona_protocol::mm::MM_MAP_BATCH;
         mm_msg.length = 4;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = ipc_buf_vaddr;
         mm_msg.regs[2] = 1;
         mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const mm_msg,
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] exec: IPC buf MM_MAP_BATCH failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" label=");
@@ -125,22 +126,22 @@ pub(crate) fn register_mmsrv_client(
 ) -> bool {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_REGISTER;
+    msg.label = trona_protocol::mm::MM_REGISTER;
     msg.length = 4;
     msg.regs[0] = client_badge;
     msg.regs[1] = heap_base;
     msg.regs[2] = mmap_base;
     msg.regs[3] = pid as u64;
     unsafe {
-        trona::ipc::set_send_cap_ctx(crate::ipc_ctx(), 0, vspace_cap);
-        let err = trona::ipc::call_ctx(
+        trona_kernel::ipc::set_send_cap_ctx(crate::ipc_ctx(), 0, vspace_cap);
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] register_with_mmsrv failed badge=");
                 _lb.hex(client_badge);
                 _lb.str(b" pid=");
@@ -170,9 +171,9 @@ pub(crate) fn clear_fault_handler(tcb_cap: Cap, pid: u32) {
         return;
     }
 
-    let err = trona::invoke::tcb_set_fault_handler(tcb_cap, 0);
+    let err = trona_kernel::invoke::tcb_set_fault_handler(tcb_cap, 0);
     if err != 0 {
-        trona::uwarn!(|_lb| {
+        trona_runtime::uwarn!(|_lb| {
             _lb.str(b"[PROCMGR] WARN: clear fault handler failed pid=");
             _lb.hex(pid as u64);
             _lb.str(b" err=");
@@ -185,20 +186,20 @@ pub(crate) fn clear_fault_handler(tcb_cap: Cap, pid: u32) {
 pub(crate) fn deregister_mmsrv_client(client_badge: u64) -> bool {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_DEREGISTER;
+    msg.label = trona_protocol::mm::MM_DEREGISTER;
     msg.length = 1;
     msg.regs[0] = client_badge;
     let err = unsafe {
-        trona::ipc::call_ctx(
+        trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         )
     };
 
-    if err != 0 || mm_reply.label != trona::TRONA_OK {
-        trona::uerror!(|_lb| {
+    if err != 0 || mm_reply.label != trona_protocol::common::TRONA_OK {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] deregister_from_mmsrv failed badge=");
             _lb.hex(client_badge);
             _lb.str(b" err=");
@@ -213,11 +214,6 @@ pub(crate) fn deregister_mmsrv_client(client_badge: u64) -> bool {
     true
 }
 
-/// Deregister a process from mmsrv on spawn failure.
-pub(crate) fn deregister_from_mmsrv(pid: u32) -> bool {
-    deregister_mmsrv_client(pid as u64)
-}
-
 pub(crate) unsafe fn prefault_range_in_mmsrv(
     client_badge: u64,
     start_vaddr: u64,
@@ -227,20 +223,20 @@ pub(crate) unsafe fn prefault_range_in_mmsrv(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = trona::protocol::MM_PREFAULT_RANGE;
+        msg.label = trona_protocol::mm::MM_PREFAULT_RANGE;
         msg.length = 4;
         msg.regs[0] = client_badge;
         msg.regs[1] = start_vaddr;
         msg.regs[2] = page_count;
         msg.regs[3] = prot;
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] MM_PREFAULT_RANGE failed badge=");
                 _lb.hex(client_badge);
                 _lb.str(b" addr=");
@@ -270,20 +266,20 @@ pub(crate) unsafe fn mprotect_target_range_in_mmsrv(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = trona::protocol::MM_MPROTECT_TARGET;
+        msg.label = trona_protocol::mm::MM_MPROTECT_TARGET;
         msg.length = 4;
         msg.regs[0] = client_badge;
         msg.regs[1] = start_vaddr;
         msg.regs[2] = length;
         msg.regs[3] = prot;
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| {
+            trona_runtime::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] MM_MPROTECT_TARGET failed badge=");
                 _lb.hex(client_badge);
                 _lb.str(b" addr=");
@@ -304,6 +300,53 @@ pub(crate) unsafe fn mprotect_target_range_in_mmsrv(
     }
 }
 
+/// Query the per-process memory snapshot for `pid` from mmsrv.
+///
+/// The snapshot is copied out of the IPC buffer reserved area before this
+/// function returns, so callers may safely make another IPC immediately.
+pub(crate) fn get_client_vm_snapshot(pid: u32) -> Result<TronaProcMemSnapshot, u64> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona_protocol::mm::MM_GET_CLIENT_STATS;
+    msg.length = 1;
+    msg.regs[0] = pid as u64;
+    let err = unsafe {
+        trona_kernel::ipc::call_ctx(
+            crate::ipc_ctx(),
+            trona_runtime::client::caps::mmsrv_ep(),
+            &raw const msg,
+            &raw mut mm_reply,
+        )
+    };
+    if err != 0 {
+        return Err(err as u64);
+    }
+    if mm_reply.label != TRONA_OK {
+        return Err(mm_reply.label);
+    }
+    let ctx = unsafe { &*crate::ipc_ctx() };
+    if ctx.ipc_buffer.is_null() {
+        return Err(trona_protocol::posix::TRONA_INVALID_OPERATION);
+    }
+    let produced = if mm_reply.length > 0 && mm_reply.regs[0] != 0 {
+        core::cmp::min(
+            mm_reply.regs[0] as usize,
+            core::mem::size_of::<TronaProcMemSnapshot>(),
+        )
+    } else {
+        core::mem::size_of::<TronaProcMemSnapshot>()
+    };
+    let mut snap = TronaProcMemSnapshot::zeroed();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (*ctx.ipc_buffer).reserved.as_ptr() as *const u8,
+            &raw mut snap as *mut u8,
+            produced,
+        );
+    }
+    Ok(snap)
+}
+
 pub(crate) fn quiesce_and_deregister_mmsrv_client(
     tcb_cap: Cap,
     pid: u32,
@@ -322,7 +365,7 @@ pub(crate) fn alloc_initrd_copy_from_mmsrv(
 ) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_ALLOC_INITRD_COPY;
+    msg.label = trona_protocol::mm::MM_ALLOC_INITRD_COPY;
     msg.length = 5;
     msg.regs[0] = pid as u64;
     msg.regs[1] = region_base;
@@ -330,9 +373,9 @@ pub(crate) fn alloc_initrd_copy_from_mmsrv(
     msg.regs[3] = copy_len;
     msg.regs[4] = flags;
     unsafe {
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
@@ -351,15 +394,15 @@ pub(crate) fn alloc_bootinfo_copy_from_mmsrv(
 ) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_ALLOC_BOOTINFO_COPY;
+    msg.label = trona_protocol::mm::MM_ALLOC_BOOTINFO_COPY;
     msg.length = 3;
     msg.regs[0] = pid as u64;
     msg.regs[1] = region_base;
     msg.regs[2] = flags;
     unsafe {
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
@@ -379,16 +422,16 @@ pub(crate) fn copy_from_client_region_to_mmsrv(
 ) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_COPY_FROM_CLIENT_REGION;
+    msg.label = trona_protocol::mm::MM_COPY_FROM_CLIENT_REGION;
     msg.length = 4;
     msg.regs[0] = pid as u64;
     msg.regs[1] = target_vaddr;
     msg.regs[2] = source_vaddr;
     msg.regs[3] = page_count;
     unsafe {
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
@@ -408,11 +451,12 @@ pub(crate) fn alloc_private_copy_from_client_region_to_mmsrv(
     source_vaddr: u64,
     page_count: u64,
     flags: u64,
+    region_type: u64,
 ) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION;
-    msg.length = 7;
+    msg.label = trona_protocol::mm::MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION;
+    msg.length = 8;
     msg.regs[0] = pid as u64;
     msg.regs[1] = region_base;
     msg.regs[2] = region_pages;
@@ -420,15 +464,75 @@ pub(crate) fn alloc_private_copy_from_client_region_to_mmsrv(
     msg.regs[4] = source_vaddr;
     msg.regs[5] = page_count;
     msg.regs[6] = flags;
+    msg.regs[7] = region_type;
     unsafe {
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != TRONA_OK {
             Err((err, mm_reply.label, mm_reply.regs[0]))
+        } else {
+            Ok(mm_reply.regs[0])
+        }
+    }
+}
+
+pub(crate) fn free_stack_region_in_mmsrv(pid: u32, reserve_base: u64) -> Result<(), (i32, u64)> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona_protocol::mm::MM_FREE_STACK_REGION;
+    msg.length = 2;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = reserve_base;
+    unsafe {
+        let err = trona_kernel::ipc::call_ctx(
+            crate::ipc_ctx(),
+            trona_runtime::client::caps::mmsrv_ep(),
+            &raw const msg,
+            &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn alloc_stack_region_in_mmsrv(
+    pid: u32,
+    stack_top: u64,
+    reserve_pages: u64,
+    prefault_pages: u64,
+    guard_pages: u64,
+    flags: u64,
+    source_vaddr: u64,
+    staging_copy_pages: u64,
+) -> Result<u64, (i32, u64)> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona_protocol::mm::MM_ALLOC_STACK_REGION;
+    msg.length = 8;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = stack_top;
+    msg.regs[2] = reserve_pages;
+    msg.regs[3] = prefault_pages;
+    msg.regs[4] = guard_pages;
+    msg.regs[5] = flags;
+    msg.regs[6] = source_vaddr;
+    msg.regs[7] = staging_copy_pages;
+    unsafe {
+        let err = trona_kernel::ipc::call_ctx(
+            crate::ipc_ctx(),
+            trona_runtime::client::caps::mmsrv_ep(),
+            &raw const msg,
+            &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label))
         } else {
             Ok(mm_reply.regs[0])
         }
@@ -447,7 +551,7 @@ pub(crate) fn alloc_typed_copy_from_client_region_to_mmsrv(
 ) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::protocol::MM_ALLOC_TYPED_COPY_FROM_CLIENT_REGION;
+    msg.label = trona_protocol::mm::MM_ALLOC_TYPED_COPY_FROM_CLIENT_REGION;
     msg.length = 8;
     msg.regs[0] = pid as u64;
     msg.regs[1] = region_base;
@@ -458,9 +562,9 @@ pub(crate) fn alloc_typed_copy_from_client_region_to_mmsrv(
     msg.regs[6] = flags;
     msg.regs[7] = region_type;
     unsafe {
-        let err = trona::ipc::call_ctx(
+        let err = trona_kernel::ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::mmsrv_ep(),
+            trona_runtime::client::caps::mmsrv_ep(),
             &raw const msg,
             &raw mut mm_reply,
         );
@@ -473,70 +577,66 @@ pub(crate) fn alloc_typed_copy_from_client_region_to_mmsrv(
 }
 
 /// # Safety
-/// `_initrd` must point to valid initrd data, `initrd_size` must be valid.
+/// `initrd_window_size` must describe the number of initrd bytes the child is
+/// expected to see at `initrd_base_vaddr`.
 pub(crate) unsafe fn map_initrd_to_child_tx(
     child_vs: Cap,
-    _initrd: *const u8,
-    initrd_size: usize,
+    initrd_window_size: usize,
     pid: u32,
-    lib_window_pages: usize,
     initrd_base_vaddr: u64,
 ) -> i32 {
-    let map_pages = if lib_window_pages > 0 {
-            lib_window_pages
-        } else {
-            (initrd_size + 4095) / 4096
-        };
+    if initrd_window_size == 0 {
+        return 0;
+    }
 
-        let mut mapped_with_device = true;
+    let map_pages = (initrd_window_size + 4095) / 4096;
+    let mut mapped_with_device = true;
 
-        for pg in 0..map_pages {
-            let err = trona::invoke::vspace_map_device(
-                child_vs,
-                trona::caps::initrd_untyped(),
-                (pg as u64) * 4096,
-                initrd_base_vaddr + pg as u64 * 4096,
-                VSPACE_FLAG_USER,
-            );
-            if err != 0 {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[PROCMGR] initrd device map failed pg=");
-                    _lb.hex(pg as u64);
-                    _lb.str(b" err=");
-                    _lb.hex(err as u64);
-                    _lb.str(b"\n");
-                });
-                for mapped_pg in 0..pg {
-                    trona::invoke::vspace_unmap(
-                        child_vs,
-                        initrd_base_vaddr + mapped_pg as u64 * 4096,
-                    );
-                }
-                mapped_with_device = false;
-                break;
-            }
-        }
-
-        if mapped_with_device {
-            return 0;
-        }
-
-        let _ = _initrd;
-        let copy_size = map_pages * 4096;
-        if alloc_initrd_copy_from_mmsrv(
-            pid,
-            initrd_base_vaddr,
-            map_pages as u64,
-            copy_size as u64,
+    for pg in 0..map_pages {
+        let err = trona_kernel::invoke::vspace_map_device(
+            child_vs,
+            trona_runtime::client::caps::initrd_untyped(),
+            (pg as u64) * 4096,
+            initrd_base_vaddr + pg as u64 * 4096,
             VSPACE_FLAG_USER,
-        )
-        .is_err()
-        {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] initrd MM_ALLOC_INITRD_COPY failed\n");
+        );
+        if err != 0 {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] initrd device map failed pg=");
+                _lb.hex(pg as u64);
+                _lb.str(b" err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
             });
-            return -1;
+            for mapped_pg in 0..pg {
+                trona_kernel::invoke::vspace_unmap(
+                    child_vs,
+                    initrd_base_vaddr + mapped_pg as u64 * 4096,
+                );
+            }
+            mapped_with_device = false;
+            break;
         }
+    }
+
+    if mapped_with_device {
+        return 0;
+    }
+
+    if alloc_initrd_copy_from_mmsrv(
+        pid,
+        initrd_base_vaddr,
+        map_pages as u64,
+        initrd_window_size as u64,
+        VSPACE_FLAG_USER,
+    )
+    .is_err()
+    {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] initrd MM_ALLOC_INITRD_COPY failed\n");
+        });
+        return -1;
+    }
     0
 }
 
@@ -546,7 +646,7 @@ pub(crate) unsafe fn map_initrd_to_child_tx(
 pub(crate) unsafe fn map_boot_info_to_child_tx(child_vs: Cap, pid: u32) -> i32 {
     let _ = child_vs;
     if alloc_bootinfo_copy_from_mmsrv(pid, crate::BOOTINFO_VADDR, VSPACE_FLAG_USER).is_err() {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] bootinfo MM_ALLOC_BOOTINFO_COPY failed\n");
         });
         return -1;

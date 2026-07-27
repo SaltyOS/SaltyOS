@@ -3,13 +3,10 @@
 //! Tests are skipped gracefully if no data disk is present.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::serial;
-use trona::serial::LineBuf;
-use trona::types::core::*;
-use trona_posix::proc as posix;
+use trona_posix::consts::*;
 use trona_posix::*;
+use trona_runtime::debug::serial;
+use trona_runtime::debug::serial::LineBuf;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

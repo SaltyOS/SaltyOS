@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Futex (Fast Userspace muTEX) implementation
 //!
 //! Provides kernel-mediated wait/wake on userspace memory words.
@@ -7,11 +8,10 @@
 //! queues. Each bucket has its own spinlock for SMP scalability — threads
 //! contending on different addresses never share a lock.
 //!
-//! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{save_irq_disable, restore_irq, SpinLock, VSpace};
+use crate::mm::{SpinLock, VSpace, restore_irq, save_irq_disable};
 use crate::sched::scheduler::scheduler;
-use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
+use crate::sched::thread::Tcb;
 use crate::syscall::{SyscallError, SyscallResult};
 
 /// Number of hash buckets for the futex table.
@@ -37,7 +37,8 @@ impl FutexBucket {
     }
 }
 
-static mut FUTEX_BUCKETS: [FutexBucket; FUTEX_HASH_BUCKETS] = [const { FutexBucket::new() }; FUTEX_HASH_BUCKETS];
+static mut FUTEX_BUCKETS: [FutexBucket; FUTEX_HASH_BUCKETS] =
+    [const { FutexBucket::new() }; FUTEX_HASH_BUCKETS];
 
 /// Hash function for (vspace, vaddr) → bucket index.
 #[inline]
@@ -47,6 +48,14 @@ fn futex_hash(vspace: *mut VSpace, vaddr: u64) -> usize {
     let v = vspace as u64;
     let h = v.wrapping_mul(0x517cc1b727220a95) ^ vaddr.wrapping_mul(0x6c62272e07bb0142);
     (h as usize >> 4) % FUTEX_HASH_BUCKETS
+}
+
+#[inline]
+unsafe fn read_user_futex_word(addr: u64) -> Result<u32, SyscallError> {
+    match unsafe { crate::arch::uaccess::copy_from_user::<u32>(addr) } {
+        Some(word) => Ok(word),
+        None => Err(SyscallError::BadAddress),
+    }
 }
 
 /// Insert TCB at tail of bucket (O(1) with tail pointer).
@@ -65,9 +74,30 @@ unsafe fn bucket_insert(bucket: &mut FutexBucket, tcb: *mut Tcb) {
     }
 }
 
+/// Unlink `node` from `bucket` given its predecessor `prev` and successor
+/// `next`. Leaves `node`'s own `futex_*` fields untouched — the caller sets
+/// them per its wake-vs-requeue disposition.
+///
+/// # Safety
+/// Caller holds the bucket lock; `prev`/`node`/`next` must reflect the
+/// bucket's current linkage at `node`.
+#[inline]
+unsafe fn bucket_unlink(bucket: &mut FutexBucket, prev: *mut Tcb, node: *mut Tcb, next: *mut Tcb) {
+    unsafe {
+        if prev.is_null() {
+            bucket.head = next;
+        } else {
+            (*prev).futex_next = next;
+        }
+        if bucket.tail == node {
+            bucket.tail = prev;
+        }
+    }
+}
+
 /// Remove a specific TCB from the futex wait table.
 ///
-/// Called from TCB_SUSPEND and sleep_queue::check_wakeups (Blocked path).
+/// Called from TCB_STOP and the deadline-queue dispatch path.
 /// Acquires the per-bucket lock internally.
 pub unsafe fn futex_remove_thread(tcb: *mut Tcb) {
     unsafe {
@@ -113,26 +143,6 @@ pub unsafe fn futex_remove_thread(tcb: *mut Tcb) {
     }
 }
 
-/// Futex syscall dispatcher.
-///
-/// - `addr`: user virtual address of the futex word (u32)
-/// - `op`: FUTEX_WAIT (0), FUTEX_WAKE (1), or FUTEX_WAIT_TIMEOUT (2)
-/// - `val`: expected value (WAIT) or max wake count (WAKE)
-/// - `extra`: timeout in nanoseconds (for FUTEX_WAIT_TIMEOUT)
-pub fn syscall_futex(addr: u64, op: u64, val: u64, extra: u64) -> SyscallResult {
-    // Validate address is in user range and aligned
-    if addr == 0 || addr >= 0x0000_8000_0000_0000 || (addr & 3) != 0 {
-        return SyscallResult::err(SyscallError::InvalidArgument);
-    }
-
-    match op {
-        0 => futex_wait(addr, val as u32),
-        1 => futex_wake(addr, val as u32),
-        2 => futex_wait_timeout(addr, val as u32, extra),
-        _ => SyscallResult::err(SyscallError::InvalidOperation),
-    }
-}
-
 /// FUTEX_WAIT: atomically check *addr == expected, then block.
 ///
 /// Returns 0 on successful wake, BESALT_WOULD_BLOCK (9) if *addr != expected.
@@ -151,12 +161,13 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
         let bucket = &mut *(&raw mut FUTEX_BUCKETS[bucket_idx]);
         bucket.lock.lock();
 
-        // Read the user futex word. The kernel shares the user's page tables
-        // so we can read the user address directly while in kernel mode.
-        // SMAP: temporarily allow user memory access for the futex word read.
-        let user_word = {
-            let _guard = crate::arch::uaccess::UserAccessGuard::new();
-            core::ptr::read_volatile(addr as *const u32)
+        let user_word = match read_user_futex_word(addr) {
+            Ok(word) => word,
+            Err(err) => {
+                bucket.lock.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
         };
         if user_word != expected {
             bucket.lock.unlock();
@@ -165,12 +176,7 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
             return SyscallResult::err(SyscallError::WouldBlock);
         }
 
-        // Set up TCB for futex blocking
-        (*current).futex_addr = addr;
-        (*current).futex_vspace = vspace;
-        (*current).futex_next = core::ptr::null_mut();
-        (*current).state = ThreadState::Blocked;
-        (*current).blocked_reason = Some(BlockedReason::FutexBlocked);
+        crate::task::wait::prepare_futex_block_locked(&mut *current, addr, vspace);
 
         // O(1) tail insertion
         bucket_insert(bucket, current);
@@ -209,11 +215,13 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
         let bucket = &mut *(&raw mut FUTEX_BUCKETS[bucket_idx]);
         bucket.lock.lock();
 
-        // Read the user futex word
-        // SMAP: temporarily allow user memory access for the futex word read.
-        let user_word = {
-            let _guard = crate::arch::uaccess::UserAccessGuard::new();
-            core::ptr::read_volatile(addr as *const u32)
+        let user_word = match read_user_futex_word(addr) {
+            Ok(word) => word,
+            Err(err) => {
+                bucket.lock.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
         };
         if user_word != expected {
             bucket.lock.unlock();
@@ -232,13 +240,7 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
             return SyscallResult::err(SyscallError::Cancelled);
         }
 
-        // Set up TCB for futex + timed blocking
-        (*current).futex_addr = addr;
-        (*current).futex_vspace = vspace;
-        (*current).futex_next = core::ptr::null_mut();
-        (*current).futex_wakeup_result = 0;
-        (*current).state = ThreadState::Blocked;
-        (*current).blocked_reason = Some(BlockedReason::FutexTimedBlocked);
+        crate::task::wait::prepare_futex_timed_block_locked(&mut *current, addr, vspace);
 
         // O(1) tail insertion
         bucket_insert(bucket, current);
@@ -247,16 +249,14 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
         bucket.lock.unlock();
 
         // Insert into sleep queue and context-switch (acquires scheduler lock internally)
-        scheduler().block_current_futex_timed(wakeup_ns);
-
-        // After wakeup: no global lock held
-        let result = (*current).futex_wakeup_result;
+        let result = crate::sched::control::block_current_timed_wait(wakeup_ns);
         restore_irq(irq);
 
-        if result != 0 {
-            SyscallResult::err(SyscallError::Cancelled)
-        } else {
-            SyscallResult::ok(0)
+        match result {
+            crate::sched::control::TimedWaitResult::TimedOut(_) => {
+                SyscallResult::err(SyscallError::Cancelled)
+            }
+            crate::sched::control::TimedWaitResult::Completed => SyscallResult::ok(0),
         }
     }
 }
@@ -342,22 +342,9 @@ fn futex_wake(addr: u64, count: u32) -> SyscallResult {
                 continue;
             }
 
-            if matches!((*wake_node).blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
-                crate::sched::sleep_queue::remove(wake_node);
-                // Re-check: check_wakeups may have won the race while we
-                // waited for SLEEP_LOCK inside remove(). If blocked_reason
-                // was cleared to None, the thread is already enqueued.
-                if (*wake_node).blocked_reason.is_none() {
-                    wake_node = next;
-                    continue;
-                }
-                (*wake_node).timer_wakeup_ns = 0;
-                (*wake_node).futex_wakeup_result = 0; // woken by wake, not timeout
-            }
-
-            (*wake_node).blocked_reason = None;
-            (*wake_node).state = ThreadState::Ready;
-            scheduler().enqueue(wake_node);
+            let _ = crate::sched::control::execute_wake_plan(
+                crate::sched::control::futex_wake_plan(wake_node),
+            );
             wake_node = next;
         }
 
@@ -365,4 +352,257 @@ fn futex_wake(addr: u64, count: u32) -> SyscallResult {
 
         SyscallResult::ok(woken as u64)
     }
+}
+
+pub(crate) fn syscall_vspace_futex_wait(
+    cap: &crate::cap::Capability,
+    addr: u64,
+    expected: u32,
+    timeout_ns: u64,
+) -> SyscallResult {
+    use crate::cap::{CapRights, ObjectType};
+
+    if let Err(e) = crate::syscall::validate_capability(cap, ObjectType::VSpace, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    let target_vspace = cap.object as *mut VSpace;
+    unsafe {
+        let current = scheduler().current();
+        if current.is_null() || (*current).vspace_root != target_vspace {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+    }
+
+    if timeout_ns == 0 {
+        futex_wait(addr, expected)
+    } else {
+        futex_wait_timeout(addr, expected, timeout_ns)
+    }
+}
+
+pub(crate) fn syscall_vspace_futex_wake(
+    cap: &crate::cap::Capability,
+    addr: u64,
+    count: u32,
+) -> SyscallResult {
+    use crate::cap::{CapRights, ObjectType};
+
+    if let Err(e) = crate::syscall::validate_capability(cap, ObjectType::VSpace, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    let target_vspace = cap.object as *mut VSpace;
+    unsafe {
+        let current = scheduler().current();
+        if current.is_null() || (*current).vspace_root != target_vspace {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+    }
+
+    futex_wake(addr, count)
+}
+
+/// Acquire the two futex bucket locks in ascending-index order so a pair of
+/// requeues running in opposite directions can never deadlock. When both
+/// indices are equal the single bucket is locked exactly once.
+///
+/// # Safety
+/// Caller must hold no futex bucket lock.
+#[inline]
+unsafe fn lock_futex_buckets(idx_a: usize, idx_b: usize) {
+    unsafe {
+        if idx_a == idx_b {
+            (*(&raw mut FUTEX_BUCKETS[idx_a])).lock.lock();
+        } else {
+            let (lo, hi) = if idx_a < idx_b {
+                (idx_a, idx_b)
+            } else {
+                (idx_b, idx_a)
+            };
+            (*(&raw mut FUTEX_BUCKETS[lo])).lock.lock();
+            (*(&raw mut FUTEX_BUCKETS[hi])).lock.lock();
+        }
+    }
+}
+
+/// Release the two futex bucket locks (single unlock when both equal).
+///
+/// # Safety
+/// Caller currently holds the locks taken by [`lock_futex_buckets`].
+#[inline]
+unsafe fn unlock_futex_buckets(idx_a: usize, idx_b: usize) {
+    unsafe {
+        (*(&raw mut FUTEX_BUCKETS[idx_a])).lock.unlock();
+        if idx_a != idx_b {
+            (*(&raw mut FUTEX_BUCKETS[idx_b])).lock.unlock();
+        }
+    }
+}
+
+/// FUTEX_REQUEUE (`zx_futex_requeue` shape): wake up to `wake_count` waiters
+/// on `addr`, then move up to `requeue_count` of the still-blocked `addr`
+/// waiters onto `requeue_addr`. Both futexes live in `vspace`. Re-validating
+/// `*addr == expected` under the bucket locks closes the classic requeue
+/// lost-wakeup window. Returns the number of threads woken.
+fn futex_requeue(
+    vspace: *mut VSpace,
+    addr: u64,
+    wake_count: u32,
+    requeue_addr: u64,
+    requeue_count: u32,
+    expected: u32,
+) -> SyscallResult {
+    unsafe {
+        let irq = save_irq_disable();
+
+        let idx_src = futex_hash(vspace, addr);
+        let idx_dst = futex_hash(vspace, requeue_addr);
+        lock_futex_buckets(idx_src, idx_dst);
+
+        // Lost-wakeup guard: re-read the futex word under the locks.
+        let user_word = match read_user_futex_word(addr) {
+            Ok(word) => word,
+            Err(err) => {
+                unlock_futex_buckets(idx_src, idx_dst);
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
+        if user_word != expected {
+            unlock_futex_buckets(idx_src, idx_dst);
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::WouldBlock);
+        }
+
+        // Single walk of the source bucket: peel the first `wake_count`
+        // matching waiters into a wake list, the next `requeue_count` into a
+        // requeue list. Both are unlinked here and processed after the walk,
+        // so a same-bucket requeue never re-visits a node it just moved. The
+        // `src` borrow is scoped to this block so the re-home below may take a
+        // fresh `&mut` to the (possibly identical) destination bucket.
+        let (wake_head, requeue_head, woken) = {
+            let src = &mut *(&raw mut FUTEX_BUCKETS[idx_src]);
+            let mut woken: u32 = 0;
+            let mut requeued: u32 = 0;
+            let mut wake_head: *mut Tcb = core::ptr::null_mut();
+            let mut wake_tail: *mut Tcb = core::ptr::null_mut();
+            let mut rq_head: *mut Tcb = core::ptr::null_mut();
+            let mut rq_tail: *mut Tcb = core::ptr::null_mut();
+
+            let mut prev: *mut Tcb = core::ptr::null_mut();
+            let mut node = src.head;
+            while !node.is_null() {
+                let next = (*node).futex_next;
+                if (*node).futex_vspace == vspace && (*node).futex_addr == addr {
+                    if woken < wake_count {
+                        bucket_unlink(src, prev, node, next);
+                        (*node).futex_addr = 0;
+                        (*node).futex_vspace = core::ptr::null_mut();
+                        (*node).futex_next = core::ptr::null_mut();
+                        if wake_head.is_null() {
+                            wake_head = node;
+                        } else {
+                            (*wake_tail).futex_next = node;
+                        }
+                        wake_tail = node;
+                        woken += 1;
+                        node = next;
+                        continue;
+                    } else if requeued < requeue_count {
+                        bucket_unlink(src, prev, node, next);
+                        (*node).futex_next = core::ptr::null_mut();
+                        if rq_head.is_null() {
+                            rq_head = node;
+                        } else {
+                            (*rq_tail).futex_next = node;
+                        }
+                        rq_tail = node;
+                        requeued += 1;
+                        node = next;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                prev = node;
+                node = next;
+            }
+            (wake_head, rq_head, woken)
+        };
+
+        // Re-home the requeued waiters onto `requeue_addr`. `futex_vspace` is
+        // unchanged — both futexes belong to `vspace`. Updating `futex_addr`
+        // is what lets a later `futex_wake` / `futex_remove_thread` (timeout)
+        // locate them in the destination bucket.
+        if !requeue_head.is_null() {
+            let dst = &mut *(&raw mut FUTEX_BUCKETS[idx_dst]);
+            let mut rq = requeue_head;
+            while !rq.is_null() {
+                let next = (*rq).futex_next;
+                (*rq).futex_next = core::ptr::null_mut();
+                (*rq).futex_addr = requeue_addr;
+                bucket_insert(dst, rq);
+                rq = next;
+            }
+        }
+
+        unlock_futex_buckets(idx_src, idx_dst);
+
+        // Wake the peeled list after dropping the bucket locks — the same
+        // cross-subsystem lock discipline `futex_wake` uses.
+        let mut wake_node = wake_head;
+        while !wake_node.is_null() {
+            let next = (*wake_node).futex_next;
+            (*wake_node).futex_next = core::ptr::null_mut();
+            if (*wake_node).blocked_reason.is_some() {
+                let _ = crate::sched::control::execute_wake_plan(
+                    crate::sched::control::futex_wake_plan(wake_node),
+                );
+            }
+            wake_node = next;
+        }
+
+        restore_irq(irq);
+        SyscallResult::ok(woken as u64)
+    }
+}
+
+pub(crate) fn syscall_vspace_futex_requeue(
+    cap: &crate::cap::Capability,
+    addr: u64,
+    requeue_addr: u64,
+    wake_count: u32,
+    requeue_count: u32,
+    expected: u32,
+) -> SyscallResult {
+    use crate::cap::{CapRights, ObjectType};
+
+    if let Err(e) = crate::syscall::validate_capability(cap, ObjectType::VSpace, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Both futex words must be in the user range and 4-byte aligned.
+    for a in [addr, requeue_addr] {
+        if a == 0 || a >= 0x0000_8000_0000_0000 || (a & 3) != 0 {
+            return SyscallResult::err(SyscallError::InvalidArgument);
+        }
+    }
+
+    let target_vspace = cap.object as *mut VSpace;
+    unsafe {
+        let current = scheduler().current();
+        if current.is_null() || (*current).vspace_root != target_vspace {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+    }
+
+    futex_requeue(
+        target_vspace,
+        addr,
+        wake_count,
+        requeue_addr,
+        requeue_count,
+        expected,
+    )
 }

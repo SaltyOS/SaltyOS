@@ -96,6 +96,34 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 /// GICR_CTLR bit: Register Write Pending.
 const GICR_CTLR_RWP: u32 = 1 << 3;
 
+unsafe extern "C" {
+    fn aarch64_gic_mmio_read32(addr: u64) -> u32;
+    fn aarch64_gic_mmio_write32(addr: u64, val: u32);
+    fn aarch64_gic_mmio_write64(addr: u64, val: u64);
+    fn aarch64_gic_read_mpidr_el1() -> u64;
+    fn aarch64_gic_icc_iar1_read() -> u64;
+    fn aarch64_gic_icc_eoir1_write(val: u64);
+    fn aarch64_gic_icc_pmr_write(val: u64);
+    fn aarch64_gic_icc_pmr_read() -> u64;
+    fn aarch64_gic_icc_bpr1_write(val: u64);
+    fn aarch64_gic_icc_sre_read() -> u64;
+    fn aarch64_gic_icc_sre_write(val: u64);
+    fn aarch64_gic_icc_igrpen1_write(val: u64);
+    fn aarch64_gic_icc_ctlr_read() -> u64;
+    fn aarch64_gic_icc_ctlr_write(val: u64);
+    fn aarch64_gic_icc_ap0r0_write(val: u64);
+    fn aarch64_gic_icc_ap0r1_write(val: u64);
+    fn aarch64_gic_icc_ap0r2_write(val: u64);
+    fn aarch64_gic_icc_ap0r3_write(val: u64);
+    fn aarch64_gic_icc_ap1r0_write(val: u64);
+    fn aarch64_gic_icc_ap1r1_write(val: u64);
+    fn aarch64_gic_icc_ap1r2_write(val: u64);
+    fn aarch64_gic_icc_ap1r3_write(val: u64);
+    fn aarch64_gic_icc_sgi1r_write(val: u64);
+    fn aarch64_gic_icc_sre_el2_enable();
+    fn aarch64_gic_isb();
+}
+
 // ---------------------------------------------------------------------------
 // MMIO helpers
 // ---------------------------------------------------------------------------
@@ -106,18 +134,9 @@ const GICR_CTLR_RWP: u32 = 1 << 3;
 /// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 unsafe fn mmio_read32(addr: u64) -> u32 {
-    let val: u32;
     // SAFETY: Caller guarantees `addr` is a valid MMIO location. Use a plain
     // base-register load so HVF sees a simple syndrome-bearing access form.
-    unsafe {
-        core::arch::asm!(
-            "ldr {val:w}, [{addr}]",
-            addr = in(reg) addr,
-            val = lateout(reg) val,
-            options(nostack, preserves_flags),
-        );
-    }
-    val
+    unsafe { aarch64_gic_mmio_read32(addr) }
 }
 
 /// Volatile 32-bit MMIO write.
@@ -129,12 +148,7 @@ unsafe fn mmio_write32(addr: u64, val: u32) {
     // SAFETY: Caller guarantees `addr` is a valid MMIO location. Use a plain
     // base-register store to avoid writeback addressing forms in HVF MMIO exits.
     unsafe {
-        core::arch::asm!(
-            "str {val:w}, [{addr}]",
-            addr = in(reg) addr,
-            val = in(reg) val,
-            options(nostack, preserves_flags),
-        );
+        aarch64_gic_mmio_write32(addr, val);
     }
 }
 
@@ -147,12 +161,7 @@ unsafe fn mmio_write64(addr: u64, val: u64) {
     // SAFETY: Caller guarantees `addr` is valid MMIO and 64-bit aligned. Use
     // a plain base-register store to keep the fault syndrome fully decoded.
     unsafe {
-        core::arch::asm!(
-            "str {val}, [{addr}]",
-            addr = in(reg) addr,
-            val = in(reg) val,
-            options(nostack, preserves_flags),
-        );
+        aarch64_gic_mmio_write64(addr, val);
     }
 }
 
@@ -189,11 +198,8 @@ fn implemented_irq_count(gicd: u64) -> u32 {
 
 #[inline(always)]
 fn current_cpu_affinity() -> u64 {
-    let mpidr: u64;
     // SAFETY: Reading MPIDR_EL1 is always safe in privileged code.
-    unsafe {
-        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
-    }
+    let mpidr = unsafe { aarch64_gic_read_mpidr_el1() };
     ((mpidr >> 32) & 0xff) << 32
         | ((mpidr >> 16) & 0xff) << 16
         | ((mpidr >> 8) & 0xff) << 8
@@ -208,15 +214,8 @@ fn current_cpu_affinity() -> u64 {
 /// Returns the INTID of the highest-priority pending interrupt.
 #[inline(always)]
 fn icc_iar1_read() -> u32 {
-    let val: u64;
     // SAFETY: Reading ICC_IAR1_EL1 is safe from EL1 when GIC is initialized.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, S3_0_C12_C12_0",
-            out(reg) val,
-            options(nomem, nostack),
-        );
-    }
+    let val = unsafe { aarch64_gic_icc_iar1_read() };
     val as u32
 }
 
@@ -226,11 +225,7 @@ fn icc_eoir1_write(intid: u32) {
     let val = intid as u64;
     // SAFETY: Writing ICC_EOIR1_EL1 is safe from EL1 after acknowledging.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C12_1, {}",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_eoir1_write(val);
     }
 }
 
@@ -240,26 +235,15 @@ fn icc_pmr_write(priority: u8) {
     let val = priority as u64;
     // SAFETY: Writing ICC_PMR_EL1 is safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C4_C6_0, {}",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_pmr_write(val);
     }
 }
 
 /// Read ICC_PMR_EL1 (Priority Mask Register).
 #[inline(always)]
 fn icc_pmr_read() -> u8 {
-    let val: u64;
     // SAFETY: Reading ICC_PMR_EL1 is safe from EL1.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, S3_0_C4_C6_0",
-            out(reg) val,
-            options(nomem, nostack),
-        );
-    }
+    let val = unsafe { aarch64_gic_icc_pmr_read() };
     val as u8
 }
 
@@ -269,27 +253,15 @@ fn icc_bpr1_write(bpr: u8) {
     let val = bpr as u64;
     // SAFETY: Writing ICC_BPR1_EL1 is safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C12_3, {}",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_bpr1_write(val);
     }
 }
 
 /// Read ICC_SRE_EL1 (System Register Enable).
 #[inline(always)]
 fn icc_sre_read() -> u64 {
-    let val: u64;
     // SAFETY: Reading ICC_SRE_EL1 is safe from EL1.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, S3_0_C12_C12_5",
-            out(reg) val,
-            options(nomem, nostack),
-        );
-    }
-    val
+    unsafe { aarch64_gic_icc_sre_read() }
 }
 
 /// Write ICC_SRE_EL1 (System Register Enable).
@@ -297,12 +269,7 @@ fn icc_sre_read() -> u64 {
 fn icc_sre_write(val: u64) {
     // SAFETY: Writing ICC_SRE_EL1 is safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C12_5, {}",
-            "isb",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_sre_write(val);
     }
 }
 
@@ -311,28 +278,15 @@ fn icc_sre_write(val: u64) {
 fn icc_igrpen1_write(val: u64) {
     // SAFETY: Writing ICC_IGRPEN1_EL1 is safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C12_7, {}",
-            "isb",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_igrpen1_write(val);
     }
 }
 
 /// Read ICC_CTLR_EL1.
 #[inline(always)]
 fn icc_ctlr_read() -> u64 {
-    let val: u64;
     // SAFETY: Reading ICC_CTLR_EL1 is safe from EL1.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, S3_0_C12_C12_4",
-            out(reg) val,
-            options(nomem, nostack),
-        );
-    }
-    val
+    unsafe { aarch64_gic_icc_ctlr_read() }
 }
 
 /// Write ICC_CTLR_EL1.
@@ -340,50 +294,56 @@ fn icc_ctlr_read() -> u64 {
 fn icc_ctlr_write(val: u64) {
     // SAFETY: Writing ICC_CTLR_EL1 is safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C12_4, {}",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_ctlr_write(val);
     }
 }
 
-macro_rules! define_icc_bank_writer {
-    ($name:ident, $sysreg:literal) => {
-        #[inline(always)]
-        fn $name(val: u64) {
-            // SAFETY: Writing ICC bank registers is safe from EL1.
-            unsafe {
-                core::arch::asm!(
-                    concat!("msr ", $sysreg, ", {}"),
-                    in(reg) val,
-                    options(nomem, nostack),
-                );
-            }
-        }
-    };
+#[inline(always)]
+fn icc_ap0r0_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap0r0_write(val) }
 }
 
-define_icc_bank_writer!(icc_ap0r0_write, "S3_0_C12_C8_4");
-define_icc_bank_writer!(icc_ap0r1_write, "S3_0_C12_C8_5");
-define_icc_bank_writer!(icc_ap0r2_write, "S3_0_C12_C8_6");
-define_icc_bank_writer!(icc_ap0r3_write, "S3_0_C12_C8_7");
-define_icc_bank_writer!(icc_ap1r0_write, "S3_0_C12_C9_0");
-define_icc_bank_writer!(icc_ap1r1_write, "S3_0_C12_C9_1");
-define_icc_bank_writer!(icc_ap1r2_write, "S3_0_C12_C9_2");
-define_icc_bank_writer!(icc_ap1r3_write, "S3_0_C12_C9_3");
+#[inline(always)]
+fn icc_ap0r1_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap0r1_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap0r2_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap0r2_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap0r3_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap0r3_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap1r0_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap1r0_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap1r1_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap1r1_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap1r2_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap1r2_write(val) }
+}
+
+#[inline(always)]
+fn icc_ap1r3_write(val: u64) {
+    unsafe { aarch64_gic_icc_ap1r3_write(val) }
+}
 
 /// Write ICC_SGI1R_EL1 (SGI Generation Register, Group 1).
 #[inline(always)]
 fn icc_sgi1r_write(val: u64) {
     // SAFETY: Writing ICC_SGI1R_EL1 triggers an SGI; safe from EL1.
     unsafe {
-        core::arch::asm!(
-            "msr S3_0_C12_C11_5, {}",
-            "isb",
-            in(reg) val,
-            options(nomem, nostack),
-        );
+        aarch64_gic_icc_sgi1r_write(val);
     }
 }
 
@@ -464,7 +424,10 @@ pub fn init() {
     // Enable the distributor with ARE_NS and Group 1 NS.
     // SAFETY: GICD MMIO is mapped.
     unsafe {
-        mmio_write32(gicd + GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
+        mmio_write32(
+            gicd + GICD_CTLR,
+            GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS,
+        );
     }
     gicd_wait_for_rwp(gicd);
 
@@ -482,7 +445,7 @@ pub fn init() {
     // ---- Step 3: BSP CPU Interface (ICC) ----
     init_cpu_interface();
 
-    crate::serial_puts("[GIC] GICv3 initialized (distributor + BSP)\n");
+    crate::kernel::printk::serial_puts("[GIC] GICv3 initialized (distributor + BSP)\n");
 }
 
 /// Initialize the redistributor for the given CPU.
@@ -539,11 +502,8 @@ fn init_redistributor(cpu_id: usize) {
 /// all priorities, and enables Group 1 interrupts.
 fn init_cpu_interface() {
     if super::current_el() == 2 {
-        let sre_el2: u64;
         unsafe {
-            core::arch::asm!("mrs {}, ICC_SRE_EL2", out(reg) sre_el2, options(nomem, nostack));
-            core::arch::asm!("msr ICC_SRE_EL2, {}", in(reg) (sre_el2 | 0x1), options(nomem, nostack));
-            core::arch::asm!("isb", options(nomem, nostack));
+            aarch64_gic_icc_sre_el2_enable();
         }
     }
 
@@ -551,7 +511,7 @@ fn init_cpu_interface() {
     let sre = icc_sre_read();
     icc_sre_write(sre | 0x1);
     if (icc_sre_read() & 0x1) == 0 {
-        crate::serial_puts("[GIC] WARNING: ICC_SRE_EL1.SRE did not stick\n");
+        crate::kernel::printk::serial_puts("[GIC] WARNING: ICC_SRE_EL1.SRE did not stick\n");
     }
 
     let pribits = (((icc_ctlr_read() >> 8) & 0x7) + 1) as u32;
@@ -594,7 +554,7 @@ fn init_cpu_interface() {
         }
         // SAFETY: ISB is always safe.
         unsafe {
-            core::arch::asm!("isb", options(nomem, nostack));
+            aarch64_gic_isb();
         }
     }
 
@@ -617,7 +577,7 @@ fn init_cpu_interface() {
 
     // SAFETY: ISB is always safe.
     unsafe {
-        core::arch::asm!("isb", options(nomem, nostack));
+        aarch64_gic_isb();
     }
 
     // Enable Group 1 interrupts.
@@ -626,7 +586,7 @@ fn init_cpu_interface() {
     // Ensure all writes are visible.
     // SAFETY: ISB is always safe.
     unsafe {
-        core::arch::asm!("isb", options(nomem, nostack));
+        aarch64_gic_isb();
     }
 }
 
@@ -681,7 +641,7 @@ pub fn enable_irq(intid: u32) {
         // SAFETY: ISB is always safe and ensures subsequent instructions see
         // the completed interrupt-enable side effects.
         unsafe {
-            core::arch::asm!("isb", options(nomem, nostack));
+            aarch64_gic_isb();
         }
     }
 }
@@ -787,5 +747,4 @@ pub fn remap_to_direct_map() {
         }
         offset += crate::mm::PAGE_SIZE as u64;
     }
-
 }

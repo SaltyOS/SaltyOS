@@ -24,9 +24,9 @@
  */
 
 /* Common page sizes (used by paging interface) */
-#define PAGING_PAGE_4K      (4ULL * 1024)
-#define PAGING_PAGE_2M      (2ULL * 1024 * 1024)
-#define PAGING_PAGE_1G      (1ULL * 1024 * 1024 * 1024)
+#define PAGING_PAGE_4K (4ULL * 1024)
+#define PAGING_PAGE_2M (2ULL * 1024 * 1024)
+#define PAGING_PAGE_1G (1ULL * 1024 * 1024 * 1024)
 
 /* =============================================================================
  * Public API - Architecture-Neutral Interface
@@ -81,8 +81,8 @@ void paging_load_cr3(uint64_t root_table);
  * Returns: Physical address of root page table, or 0 on failure
  */
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
-                              uint64_t kernel_phys, uint64_t kernel_size,
-                              uint64_t identity_end);
+                             uint64_t kernel_phys, uint64_t kernel_size,
+                             uint64_t identity_end);
 
 /*
  * Get the kernel virtual base address

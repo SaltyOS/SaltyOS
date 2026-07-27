@@ -324,6 +324,6 @@ $DEBUG && CMD+=(-d int,cpu_reset -D qemu.log)
 $HEADLESS && CMD+=(-display none)
 
 # --- GDB server ---
-$GDB && CMD+=(-s)
+$GDB && CMD+=(-s -S)
 
 exec "${CMD[@]}"

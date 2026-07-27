@@ -1,14 +1,24 @@
 [Service]
 Name=dnssrv
 Binary=/bin/dnssrv
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
 After=netsrv namesrv mmsrv saltyfs vfs
+Requires=namesrv.socket netsrv-ep.socket
+RequiresInterface=mmsrv:process-client
 
 [Capabilities]
-# System roles via trona::caps::*, service-local via generated svc_caps::*.
-Require=namesrv
-Require=mmsrv
-Require=netsrv:netsrv_ep
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

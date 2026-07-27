@@ -16,14 +16,22 @@ configure =
     --no-default-features
 
 [depends]
-build = openssl, freebsd-utils
-runtime = freebsd-utils
+build = openssl >= 3.4, freebsd-utils >= 14.2
+runtime = freebsd-utils >= 14.2
 
 [env]
-OPENSSL_DIR = ${PORTDIR}/../openssl/${ARCH_STAGE}
+# OPENSSL_DIR: openssl stage overlays into the sysroot at /usr, so point
+# the openssl-sys crate at that rather than at a peer stage-dir.
+OPENSSL_DIR = ${SYSROOT}/usr
 OPENSSL_STATIC = 1
-LIBRARY_PATH = ${PORTDIR}/../freebsd-utils/${ARCH_STAGE}/usr/lib
+# Make the sysroot's usr/lib explicit on the Rust linker's -L path so
+# libpam.so from freebsd-utils overlay is found even if the clang
+# driver's --sysroot search isn't plumbed through cargo's link step.
+LIBRARY_PATH = ${SYSROOT}/usr/lib
 
-[install]
-usr/bin/sudo = sudo
-usr/bin/visudo = visudo
+[stage]
+mode = script
+commands =
+    mkdir -p ${STAGE}/usr/bin
+    install -m 0755 target/${SALTY_HOST}/release/sudo ${STAGE}/usr/bin/sudo
+    install -m 0755 target/${SALTY_HOST}/release/visudo ${STAGE}/usr/bin/visudo

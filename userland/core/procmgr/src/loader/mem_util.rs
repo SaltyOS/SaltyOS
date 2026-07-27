@@ -1,7 +1,7 @@
 //! Memory utility functions shared across loader and lifecycle modules.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona_posix::consts::*;
+use trona_protocol::posix_abi::mm::*;
 
 /// Zero `len` bytes at `ptr` using u64-wide volatile writes for bulk throughput,
 /// with byte-granular head/tail for alignment.
@@ -61,18 +61,16 @@ pub(crate) unsafe fn alloc_staging_buffer(num_pages: usize) -> *mut u8 {
             Some(v) => v,
             None => return core::ptr::null_mut(),
         };
-        let ptr = trona_posix::mm::posix_mmap(
+        match trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             len,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
-        );
-        if ptr as usize == usize::MAX {
-            core::ptr::null_mut()
-        } else {
-            ptr
+        ) {
+            Ok(ptr) => ptr,
+            Err(_) => core::ptr::null_mut(),
         }
     }
 }
@@ -86,6 +84,6 @@ pub(crate) unsafe fn free_staging_buffer(ptr: *mut u8, num_pages: usize) {
             Some(v) => v,
             None => return,
         };
-        trona_posix::mm::posix_munmap(ptr, len);
+        let _ = trona_runtime::client::mm::munmap(ptr, len);
     }
 }

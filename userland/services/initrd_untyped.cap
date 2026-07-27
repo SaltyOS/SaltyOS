@@ -1,0 +1,5 @@
+[Unit]
+Name=initrd_untyped.cap
+
+[Capability]
+SourceSlot=17

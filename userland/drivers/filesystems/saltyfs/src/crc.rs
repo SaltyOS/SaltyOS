@@ -23,6 +23,7 @@ pub(crate) static CRC32C_TABLE: [u32; 256] = {
     table
 };
 
+#[allow(dead_code)]
 pub(crate) fn crc32c(data: *const u8, len: usize) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for i in 0..len {

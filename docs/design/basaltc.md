@@ -74,11 +74,11 @@ The startup sequence:
 | `misc.rs` | Rust | dirname, basename, utime, syslog stubs | Mixed |
 | `pthread.rs` | Rust | pthreads, mutexes, condvars, semaphores, TLS | trona::sync / trona::tls |
 | `search.rs` | Rust | tsearch, tfind, tdelete, twalk | Pure Rust |
-| `dlfcn.rs` | Rust | dlopen/dlsym stubs | Returns errors |
+| `dlfcn.rs` | Rust | dlopen/dlsym/dlclose/dladdr/dl_iterate_phdr/dlfunc/dlerror C ABI shims | Dispatches into rtld via `RtldDlfcnV1` (see `docs/spec/rtld-loader.md` § 11) |
 | `socket.rs` | Rust | Socket API (socket, bind, connect, etc.) | trona posix_socket |
 | `inet.rs` | Rust | inet_aton, htonl, getservbyname, etc. | Pure Rust |
 | `netif.rs` | Rust | if_nametoindex, if_indextoname | Pure Rust |
-| `getrandom.rs` | Rust | getrandom, getentropy | trona::syscall (RDRAND/RNDR) |
+| `getrandom.rs` | Rust | getrandom, getentropy | trona::syscall (`KernelRng`) |
 | `getopt.rs` | Rust | POSIX getopt + GNU getopt_long/getopt_long_only | Pure Rust |
 | `fts.rs` | Rust | BSD file tree stream (fts_open, fts_read, etc.) | opendir/stat |
 | `iconv.rs` | Rust | Character encoding conversion (8 encodings) | Pure Rust |
@@ -157,32 +157,28 @@ The allocator is deliberately simple. Performance-critical paths in SaltyOS use 
 
 ### CRT Initialization
 
-The CRT startup parses the SaltyOS auxiliary vector (`auxv`) to discover per-process resources:
+The CRT startup parses the standard ELF auxiliary vector plus one
+SaltyOS-private pointer, `AT_SALTYOS_STARTUP`, to discover per-process
+resources. The referenced `SaltyOSStartupLayoutV1` carries bootstrap-only
+addresses and pointers such as the IPC buffer, dynamic-loader window,
+CSpace layout pointer, and embedded capability-table pointer.
 
-| Tag | Constant | Purpose |
-|-----|----------|---------|
-| `0x1000` | `AT_TRONA_UNTYPED` | Untyped memory cap (rtld bootstrap only; general frame alloc via mmsrv) |
-| `0x1001` | `AT_TRONA_VSPACE` | VSpace capability slot |
-| `0x1002` | `AT_TRONA_SCRATCH` | Scratch virtual address region |
-| `0x1005` | `AT_TRONA_FRAME_SLOT` | Frame slot for page mapping |
-| `0x1007` | `AT_TRONA_SLOT_BASE` | Slot allocator pool base |
-| `0x1008` | `AT_TRONA_SLOT_COUNT` | Slot allocator pool size |
+The RTLD may consume slots while loading shared libraries, so it publishes
+the post-startup cursor in `TronaRuntimeV1.next_free_slot` while leaving
+`SaltyOSStartupLayoutV1` bootstrap-only. The shared `SaltyOSCspaceLayoutV1`
+still describes the slot ranges available to the process.
 
-The RTLD may have already consumed some slots while loading shared libraries, so its exported `__trona_slot_base` / `__trona_slot_count` take precedence over raw auxv values when non-zero.
-
-After slot allocation setup, the heap region is placed 1 MB after the scratch area, and the mmap region starts 16 MB after the heap base.
+After slot allocation setup, the heap region is placed relative to the
+planned process layout rather than a legacy scratch auxv tag.
 
 ## SaltyOS Auxv Entries
 
 | Tag | Name | Type | Description |
 |-----|------|------|-------------|
 | `0x0000` | `AT_NULL` | - | End of auxv |
-| `0x1000` | `AT_TRONA_UNTYPED` | slot | Untyped memory cap (rtld bootstrap only; general frame allocation via mmsrv) |
-| `0x1001` | `AT_TRONA_VSPACE` | slot | VSpace cap for mapping frames |
-| `0x1002` | `AT_TRONA_SCRATCH` | vaddr | Scratch region base address |
-| `0x1005` | `AT_TRONA_FRAME_SLOT` | slot | CSpace slot for temporary frames |
-| `0x1007` | `AT_TRONA_SLOT_BASE` | slot | First available cap slot |
-| `0x1008` | `AT_TRONA_SLOT_COUNT` | count | Number of available cap slots |
+| `0x0003` | `AT_PHDR` | vaddr | Main executable program-header table |
+| `0x0007` | `AT_BASE` | vaddr | Runtime linker base address |
+| `0x2005` | `AT_SALTYOS_STARTUP` | ptr | Pointer to validated `SaltyOSStartupLayoutV1` |
 
 ## FreeBSD Compatibility Layer
 
@@ -246,7 +242,7 @@ basaltc provides 105 headers in `lib/basalt/c/include/` organized to match stand
 
 **No timezone database.** Timezone support is via the POSIX `TZ` environment variable only (e.g., `TZ=EST5EDT,M3.2.0,M11.1.0`). There is no `/usr/share/zoneinfo` or binary TZ file support. `tzset()` parses POSIX TZ strings with full DST transition rule support (Mm.w.d format). Without `TZ`, the default is UTC.
 
-**No dlopen.** The dynamic linker loads shared libraries at process startup only. Runtime dynamic loading (`dlopen`, `dlsym`, `dlclose`) stubs return errors.
+**Runtime dlfcn lives in the rtld.** libc's `dlfcn.rs` is a thin C ABI shim; the runtime dynamic linker (`ldtrona-elf.so`) owns `dlopen` / `dlsym` / `dlclose` / `dladdr` / `dl_iterate_phdr` and the dynamic TLS DTV. RTLD_NEXT, RTLD_DEFAULT, RTLD_GLOBAL, RTLD_LOCAL, RTLD_NOLOAD, and RTLD_NODELETE are implemented. See `docs/spec/rtld-loader.md` § 11 for the full ABI.
 
 **No device nodes.** `mknod()`, `mknodat()` return `ENOSYS`.
 
@@ -258,7 +254,7 @@ basaltc provides 105 headers in `lib/basalt/c/include/` organized to match stand
 
 ## Build Pipeline
 
-basaltc is built in three steps, then linked into a single shared object. Nearly all logic is in Rust -- only assembly stubs (crt_start.S, setjmp.S) and one freestanding C file (string.c for statically-linked init) remain as non-Rust sources:
+basaltc is built in three steps, then linked into a single shared object. Most libc policy remains in Rust, while all ISA instructions live in explicit per-architecture `.S` files under `src/arch/<arch>/`:
 
 ```
 Step 1: Rust sources
@@ -269,9 +265,13 @@ Step 1: Rust sources
 Step 2: Assembly sources
   crt_start.S ── clang -c ──> crt_start.o    (NOT linked into libc.so)
   setjmp.S   ── clang -c ──> setjmp.o
+  math*.S    ── clang -c ──> basaltc_math*.o
+  mem*.S     ── clang -c ──> basaltc_mem*.o
+  string*.S  ── clang -c ──> basaltc_string*.o
+  misc.S     ── clang -c ──> basaltc_misc.o
 
 Step 3: Link
-  basaltc.o + setjmp.o + core.o + compiler_builtins.o
+  basaltc.o + setjmp.o + arch asm objects + core.o + compiler_builtins.o
   ───> libc.so  (-shared, -T arch/<ARCH>/basaltc.ld, -soname libc.so)
 ```
 

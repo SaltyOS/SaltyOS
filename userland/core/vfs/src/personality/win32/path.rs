@@ -14,7 +14,8 @@
 //! - Path length is capped at 260 (MAX_PATH) without prefix, or 32767
 //!   with `\\?\` prefix.
 
-use crate::vfs_core::error::{VfsError, VfsResult};
+use crate::core::error::{VfsError, VfsResult};
+use crate::core::identity::VnodeKey;
 
 /// Win32 MAX_PATH (without \\?\ prefix).
 pub(crate) const MAX_PATH_WIN32: usize = 260;
@@ -135,11 +136,7 @@ unsafe fn is_pipe_prefix(buf: *const u8, len: usize) -> bool {
 ///
 /// - `src` must point to at least `len` readable bytes.
 /// - `dst` must point to at least `len` writable bytes.
-pub(crate) unsafe fn normalize_separators(
-    src: *const u8,
-    len: usize,
-    dst: *mut u8,
-) -> usize {
+pub(crate) unsafe fn normalize_separators(src: *const u8, len: usize, dst: *mut u8) -> usize {
     unsafe {
         let mut out = 0usize;
         let mut prev_sep = false;
@@ -222,4 +219,263 @@ pub(crate) fn check_path_length(len: usize, had_nt_prefix: bool) -> VfsResult<()
     } else {
         Ok(())
     }
+}
+
+/// Canonical NT path plus the namei anchor it must be resolved
+/// against. `anchor_vkey == VnodeKey::NONE` means the path is
+/// already rooted in the global namespace; otherwise `bytes` is a
+/// relative path to walk from the supplied per-drive cwd.
+pub(crate) struct CanonicalNtPath<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) anchor_vkey: VnodeKey,
+}
+
+/// Canonicalise an NT-shaped UTF-8 path into a saltyos namei
+/// walker-shaped absolute path. Pipeline:
+///
+/// 1. Strip `\\?\` / `\\.\` prefix via [`strip_nt_prefix`].
+/// 2. Replace `\` with `/` via [`normalize_separators`] (also
+///    collapses runs of consecutive separators).
+/// 3. Resolve the leading drive letter (`C:` → `/c`). The
+///    saltyos drive table picks up each mounted drive at boot;
+///    callers that hit an unbound letter receive
+///    `VfsError::NoEnt`.
+/// 4. Validate length + forbidden characters.
+///
+/// Returns the canonical UTF-8 path written into `dst`. The
+/// caller owns `dst`; the returned slice borrows from it.
+///
+/// # Safety
+///
+/// `dst` must have at least `src.len() + 4` bytes (enough room
+/// for the worst-case `/d/<rest>` expansion of a drive letter).
+pub(crate) unsafe fn canonicalize_nt_path<'a>(
+    src: &[u8],
+    drives: &super::drives::DriveTable,
+    drive_cwds: &[VnodeKey; super::drives::DRIVE_LETTER_COUNT],
+    dst: &'a mut [u8],
+) -> VfsResult<CanonicalNtPath<'a>> {
+    if src.is_empty() {
+        return Err(VfsError::Inval);
+    }
+    if dst.len() < src.len() + 4 {
+        return Err(VfsError::NameTooLong);
+    }
+
+    // 1. Strip NT prefix.
+    let prefix = unsafe { strip_nt_prefix(src.as_ptr(), src.len()) };
+    let after_prefix = &src[prefix.offset..];
+
+    // Reject `\\.\pipe\...` — pipe namespace not yet wired into
+    // canonicalisation; the dispatcher should route those to the
+    // pipe path before calling here.
+    if prefix.is_pipe_ns {
+        return Err(VfsError::NotSup);
+    }
+
+    // 2. Normalise separators into a scratch buffer.
+    let mut sep_scratch = [0u8; MAX_PATH_WIN32_LONG];
+    if after_prefix.len() > sep_scratch.len() {
+        return Err(VfsError::NameTooLong);
+    }
+    let normalised_len = unsafe {
+        normalize_separators(
+            after_prefix.as_ptr(),
+            after_prefix.len(),
+            sep_scratch.as_mut_ptr(),
+        )
+    };
+    let normalised = &sep_scratch[..normalised_len];
+
+    // 3. Drive-letter resolution. `C:/foo/bar` → `/c/foo/bar`;
+    // `C:foo` walks from C:'s recorded cwd when one exists.
+    let mut out_len = 0usize;
+    let mut anchor_vkey = VnodeKey::NONE;
+    let mut anchored_relative = false;
+    let resolved_tail = if normalised.len() >= 2 && normalised[1] == b':' {
+        let letter = normalised[0];
+        let Some(drive_idx) = super::casefold::drive_letter_index(letter) else {
+            return Err(VfsError::Inval);
+        };
+        let slot = drives.lookup(drive_idx as u8);
+        if !slot.is_assigned() {
+            return Err(VfsError::NoEnt);
+        }
+        let mut rest = &normalised[2..];
+        if !rest.is_empty() && rest[0] == b'/' {
+            emit_drive_prefix(dst, &mut out_len, drive_idx as u8)?;
+            rest = &rest[1..];
+        } else if let Some(vkey) = drive_cwds
+            .get(drive_idx)
+            .copied()
+            .filter(|vkey| vkey.is_valid())
+        {
+            anchor_vkey = vkey;
+            anchored_relative = true;
+        } else {
+            emit_drive_prefix(dst, &mut out_len, drive_idx as u8)?;
+        }
+        rest
+    } else if !normalised.is_empty() && normalised[0] == b'/' {
+        // Root-relative path (`\foo`) is rooted at the current
+        // Win32 drive, not at the neutral namespace root.
+        let drive_idx = current_drive_index(drives)?;
+        if !drives.lookup(drive_idx).is_assigned() {
+            return Err(VfsError::NoEnt);
+        }
+        emit_drive_prefix(dst, &mut out_len, drive_idx)?;
+        &normalised[1..]
+    } else {
+        // Plain relative path: walk from current-drive cwd when
+        // present, otherwise fall back to that drive's root.
+        let drive_idx = current_drive_index(drives)?;
+        if !drives.lookup(drive_idx).is_assigned() {
+            return Err(VfsError::NoEnt);
+        }
+        if let Some(vkey) = drive_cwds
+            .get(drive_idx as usize)
+            .copied()
+            .filter(|vkey| vkey.is_valid())
+        {
+            anchor_vkey = vkey;
+            anchored_relative = true;
+        } else {
+            emit_drive_prefix(dst, &mut out_len, drive_idx)?;
+        }
+        normalised
+    };
+
+    if !resolved_tail.is_empty() {
+        out_len = append_tail_components(
+            resolved_tail,
+            prefix.is_verbatim,
+            dst,
+            out_len,
+            prefix.had_prefix,
+            !anchored_relative,
+        )?;
+    } else if out_len == 0 {
+        if anchored_relative {
+            dst[0] = b'.';
+            out_len = 1;
+        } else {
+            // Empty path post-canonicalisation → "/".
+            dst[0] = b'/';
+            out_len = 1;
+        }
+    }
+
+    // 4. Length cap (post-canonicalisation).
+    check_path_length(out_len, prefix.had_prefix)?;
+
+    Ok(CanonicalNtPath {
+        bytes: &dst[..out_len],
+        anchor_vkey,
+    })
+}
+
+fn append_tail_components(
+    tail: &[u8],
+    verbatim: bool,
+    dst: &mut [u8],
+    mut out_len: usize,
+    had_nt_prefix: bool,
+    force_absolute: bool,
+) -> VfsResult<usize> {
+    if out_len == 0 {
+        if force_absolute {
+            if dst.is_empty() {
+                return Err(VfsError::NameTooLong);
+            }
+            dst[0] = b'/';
+            out_len = 1;
+        }
+    } else if dst[out_len - 1] != b'/' {
+        if out_len >= dst.len() {
+            return Err(VfsError::NameTooLong);
+        }
+        dst[out_len] = b'/';
+        out_len += 1;
+    }
+
+    let mut component_start = 0usize;
+    let mut wrote_any = false;
+    while component_start <= tail.len() {
+        let component_end = match tail[component_start..].iter().position(|&b| b == b'/') {
+            Some(pos) => component_start + pos,
+            None => tail.len(),
+        };
+        let raw = &tail[component_start..component_end];
+        let component = if verbatim {
+            raw
+        } else {
+            trim_trailing_dots_spaces(raw)
+        };
+
+        if !component.is_empty() {
+            if !verbatim {
+                validate_no_forbidden_chars(component)?;
+                if let Some(dev) = super::reserved::intercept(component) {
+                    return rewrite_reserved_device(dev, dst, had_nt_prefix);
+                }
+            }
+            if wrote_any {
+                if out_len >= dst.len() {
+                    return Err(VfsError::NameTooLong);
+                }
+                dst[out_len] = b'/';
+                out_len += 1;
+            }
+            if out_len + component.len() > dst.len() {
+                return Err(VfsError::NameTooLong);
+            }
+            dst[out_len..out_len + component.len()].copy_from_slice(component);
+            out_len += component.len();
+            wrote_any = true;
+        }
+
+        if component_end == tail.len() {
+            break;
+        }
+        component_start = component_end + 1;
+    }
+
+    check_path_length(out_len, had_nt_prefix)?;
+    Ok(out_len)
+}
+
+fn emit_drive_prefix(dst: &mut [u8], out_len: &mut usize, drive_idx: u8) -> VfsResult<()> {
+    if *out_len + 2 > dst.len() {
+        return Err(VfsError::NameTooLong);
+    }
+    dst[*out_len] = b'/';
+    *out_len += 1;
+    dst[*out_len] = b'a' + drive_idx;
+    *out_len += 1;
+    Ok(())
+}
+
+fn current_drive_index(drives: &super::drives::DriveTable) -> VfsResult<u8> {
+    if drives.current_drive < super::drives::DRIVE_LETTER_COUNT as u8 {
+        Ok(drives.current_drive)
+    } else {
+        Err(VfsError::NoEnt)
+    }
+}
+
+fn rewrite_reserved_device(
+    dev: super::reserved::ReservedDev,
+    dst: &mut [u8],
+    had_nt_prefix: bool,
+) -> VfsResult<usize> {
+    let name = super::reserved::devfs_name(dev);
+    let prefix = b"/dev/";
+    let out_len = prefix.len() + name.len();
+    if out_len > dst.len() {
+        return Err(VfsError::NameTooLong);
+    }
+    dst[..prefix.len()].copy_from_slice(prefix);
+    dst[prefix.len()..out_len].copy_from_slice(name);
+    check_path_length(out_len, had_nt_prefix)?;
+    Ok(out_len)
 }

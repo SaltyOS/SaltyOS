@@ -1,8 +1,8 @@
 //! Concurrent Win32 console/csrss stress test.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::serial;
 use trona_posix::*;
+use trona_runtime::debug::serial;
 
 const CONSOLE_STRESS_PATH: &[u8] = b"/bin/console_stress_pe\0";
 const CONSOLE_CHILDREN: usize = 4;

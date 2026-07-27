@@ -1,0 +1,6 @@
+[Unit]
+Name=rsrcsrv-raw.socket
+
+[Socket]
+Provider=rsrcsrv
+Alias=authority_raw

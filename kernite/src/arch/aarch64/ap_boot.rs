@@ -40,13 +40,13 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     // Guard: detect duplicate cpu_id. If another AP already claimed this
     // slot, two APs would share the same kernel stack -> corruption.
     if !super::cpu::try_claim_ap(cpu_id) {
-        crate::serial_puts("[AP] DUPLICATE cpu_id detected, halting\n");
+        crate::kernel::printk::serial_puts("[AP] DUPLICATE cpu_id detected, halting\n");
         loop {
             super::halt();
         }
     }
 
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[AP] Entry cpu_id=");
         _g.dec(cpu_id as u64);
         _g.puts(" EL");
@@ -60,7 +60,7 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     // 2. Initialize GIC redistributor + CPU interface for this AP.
     super::gic::init_ap(cpu_id);
 
-    // 3. Initialize FPU lazy switching (CPACR_EL1 trap on this CPU).
+    // 3. Configure CPACR_EL1.FPEN=0b11 for eager FPU on this AP.
     super::fpu::init();
 
     // 4. Enable PAN (Privileged Access Never) if supported.
@@ -72,7 +72,10 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_phys = crate::mm::pmm_alloc_contiguous(STACK_PAGES)
+        let stack_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+            subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+        };
+        let stack_phys = crate::mm::pmm_alloc_contiguous_owned(STACK_PAGES, &stack_owner)
             .expect("[AP] Failed to allocate syscall kernel stack");
         let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
         super::cpu::set_kernel_stack(stack_top);
@@ -81,14 +84,14 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     // 6. Initialize per-CPU stack canary.
     super::cpu::init_ap_canary(cpu_id);
 
-    // 7. Start timer on this CPU (enables CNTP + PPI 30).
+    // 7. Start timer on this CPU (enables CNTV + PPI 27).
     super::timer::start();
 
     // 8. Initialize scheduler for this CPU (creates per-CPU idle thread).
     crate::sched::init_cpu(cpu_id);
 
     // 10. Emit AP online log before signaling ready to reduce interleaving.
-    crate::kinfo!(|_g| {
+    crate::kernel::printk::kinfo!(|_g| {
         _g.puts("[AP] CPU ");
         _g.dec(cpu_id as u64);
         _g.puts(" online\n");

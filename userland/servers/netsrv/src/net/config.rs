@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Runtime network configuration owned by netsrv.
 
-use trona::consts::server::{NETCFG_STATE_CONFIGURING, NETCFG_STATE_DOWN, NETCFG_STATE_READY};
+const NETCFG_STATE_DOWN: u8 = 0;
+const NETCFG_STATE_CONFIGURING: u8 = 1;
+const NETCFG_STATE_READY: u8 = 2;
 
 pub(crate) const HOSTNAME: &[u8] = b"salty";
 pub(crate) const IFACE_NAME: &[u8] = b"eth0";
@@ -36,7 +38,7 @@ struct NetworkConfig {
 impl NetworkConfig {
     const fn zeroed() -> Self {
         Self {
-            state: NETCFG_STATE_DOWN as u8,
+            state: NETCFG_STATE_DOWN,
             our_ip: 0,
             subnet_mask: 0,
             gateway_ip: 0,
@@ -56,7 +58,7 @@ pub(crate) fn init(mac: [u8; 6]) {
     // SAFETY: Single-threaded netsrv owns the config.
     unsafe {
         let cfg = &raw mut CONFIG;
-        (*cfg).state = NETCFG_STATE_CONFIGURING as u8;
+        (*cfg).state = NETCFG_STATE_CONFIGURING;
         (*cfg).our_ip = 0;
         (*cfg).subnet_mask = 0;
         (*cfg).gateway_ip = 0;
@@ -73,7 +75,7 @@ pub(crate) fn begin_reconfigure() {
     // SAFETY: Single-threaded netsrv owns the config.
     unsafe {
         let cfg = &raw mut CONFIG;
-        (*cfg).state = NETCFG_STATE_CONFIGURING as u8;
+        (*cfg).state = NETCFG_STATE_CONFIGURING;
         (*cfg).our_ip = 0;
         (*cfg).subnet_mask = 0;
         (*cfg).gateway_ip = 0;
@@ -95,7 +97,7 @@ fn apply(state: u8, our_ip: u32, subnet_mask: u32, gateway_ip: u32, dns_server: 
 
 pub(crate) fn apply_dhcp(our_ip: u32, subnet_mask: u32, gateway_ip: u32, dns_server: u32) {
     apply(
-        NETCFG_STATE_READY as u8,
+        NETCFG_STATE_READY,
         our_ip,
         subnet_mask,
         gateway_ip,
@@ -109,7 +111,7 @@ pub(crate) fn state() -> u8 {
 }
 
 pub(crate) fn is_ready() -> bool {
-    matches!(state() as u64, NETCFG_STATE_READY)
+    matches!(state(), NETCFG_STATE_READY)
 }
 
 pub(crate) fn our_ip() -> u32 {

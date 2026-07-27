@@ -1,6 +1,11 @@
 # SaltyOS Process Manager Build (Rust)
 # SPDX-License-Identifier: GPL-2.0-only
 
+if false
+# Archived only. init now owns spawn / lifecycle supervision, and this
+# pre-init-kernite-ABI procmgr tree is intentionally kept out of every
+# Meson build target while the source remains available for history.
+
 procmgr_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 
 # Per-program debug override
@@ -19,12 +24,16 @@ procmgr_obj = custom_target('procmgr_obj',
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=procmgr',
     '--crate-type=lib',
-    '--extern', 'trona=' + trona_rmeta,
+    '--extern', 'uapi=' + trona_uapi_rmeta,
+    '--extern', 'trona_kernel=' + trona_kernel_rmeta,
+    '--extern', 'trona_runtime=' + trona_runtime_rmeta,
+    '--extern', 'trona_protocol=' + trona_protocol_rmeta,
+    '--extern', 'trona_server=' + trona_server_rmeta,
     '--extern', 'trona_posix=' + trona_posix_rmeta,
     '--extern', 'trona_loader=' + trona_loader_rmeta,
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libtrona_rust, trona_posix, trona_loader],
+  depends: [core, compiler_builtins, trona_uapi, trona_kernel, trona_protocol, trona_server, trona_runtime, trona_posix, trona_loader],
   build_by_default: true,
 )
 
@@ -47,3 +56,4 @@ procmgr_elf = custom_target('procmgr_elf',
   ],
   build_by_default: true,
 )
+endif

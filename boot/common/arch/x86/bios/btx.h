@@ -25,13 +25,13 @@
  *
  * This wraps bios_disk_read from v86.c
  */
-#define btx_disk_read(drive, lba, sectors, buffer) \
-    bios_disk_read((drive), (lba), (sectors), (buffer))
+#define btx_disk_read(drive, lba, sectors, buffer)                             \
+  bios_disk_read((drive), (lba), (sectors), (buffer))
 
 /*
  * Convenience function: INT 15h E820 memory map
  */
-#define btx_get_memory_map_entry(continuation, buffer) \
-    bios_e820_get_entry((continuation), (buffer))
+#define btx_get_memory_map_entry(continuation, buffer)                         \
+  bios_e820_get_entry((continuation), (buffer))
 
 #endif /* BOOT_COMMON_ARCH_X86_BIOS_BTX_H */

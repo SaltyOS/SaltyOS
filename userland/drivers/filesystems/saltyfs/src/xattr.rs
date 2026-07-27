@@ -21,18 +21,20 @@
 //! This module implements the inline path fully in stage 6; the indirect
 //! path is layered on top in stage 7 without disturbing the inline format.
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::protocol::*;
-use trona::types::core::*;
+use trona_kernel::core_types::*;
+use trona_protocol::common::{
+    TRONA_ALREADY_EXISTS, TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_NOT_FOUND,
+    TRONA_OK, TRONA_OUT_OF_MEMORY, TRONA_OUT_OF_RANGE, TRONA_READONLY,
+};
 
-use crate::alloc::{alloc_block, free_block, bitmap_flush};
+use crate::alloc::{alloc_block, bitmap_flush, free_block};
 use crate::block::{read_block, write_block};
-use crate::btree::{btree_find_all_for_ino, btree_cow_delete, btree_cow_insert, btree_cow_update};
+use crate::btree::{btree_cow_delete, btree_cow_insert, btree_cow_update, btree_find_all_for_ino};
 use crate::consts::*;
 use crate::handlers::get_inode;
+use crate::session;
 use crate::types::*;
-use crate::{SB, BLOCK_SIZE, MOUNTED, NEXT_INO, READONLY};
+use crate::{BLOCK_SIZE, MOUNTED, READONLY, SB};
 
 /// Local twin of `handlers::ro_reject_if_readonly`. Kept here so xattr.rs
 /// does not depend on private helpers.
@@ -55,12 +57,7 @@ fn ro_reject() -> Option<TronaMsg> {
 /// checks for `trusted.*` / `security.*` are deferred to a future multi-user
 /// PR — see docs/design/saltyfs.md.
 fn valid_xattr_namespace(name: &[u8]) -> bool {
-    const PREFIXES: [&[u8]; 4] = [
-        b"user.",
-        b"trusted.",
-        b"security.",
-        b"system.",
-    ];
+    const PREFIXES: [&[u8]; 4] = [b"user.", b"trusted.", b"security.", b"system."];
     for p in PREFIXES.iter() {
         if name.len() > p.len() && &name[..p.len()] == *p {
             return true;
@@ -125,10 +122,7 @@ fn build_indirect_xattr(name: &[u8], value_len: u32, ref_ino: u64, out: &mut [u8
 /// Search for an existing XATTR_ITEM on `ino` whose stored name equals
 /// `name`. Uses hash + linear probing (max 16 slots) to match the DIR_ITEM
 /// insertion pattern. Returns `(key, data_ptr, item_size)` on hit.
-fn find_xattr_by_name(
-    ino: u64,
-    name: &[u8],
-) -> Option<(BTreeKey, *const u8, u32)> {
+fn find_xattr_by_name(ino: u64, name: &[u8]) -> Option<(BTreeKey, *const u8, u32)> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let mut key = BTreeKey {
         object_id: ino,
@@ -188,11 +182,7 @@ fn find_free_xattr_slot(ino: u64, name: &[u8]) -> Option<BTreeKey> {
 /// not referenced by any directory entry; the only reference is the
 /// XATTR_ITEM indirect payload that callers will write immediately after.
 fn alloc_hidden_inode(value_len: u64, bs: u64) -> Option<u64> {
-    let new_ino = unsafe {
-        let n = *(&raw const NEXT_INO);
-        *(&raw mut NEXT_INO) = n + 1;
-        n
-    };
+    let new_ino = crate::block::allocate_next_inode();
     let inode = SaltyInodeItem {
         generation: unsafe { (*(&raw const SB)).generation + 1 },
         size: value_len,
@@ -367,10 +357,7 @@ fn read_hidden_inode_value(ino: u64, dst: *mut u8, count: u64) -> u64 {
 
         if extent.extent_type == EXTENT_REGULAR {
             let disk_start = extent.disk_bytenr + extent.offset;
-            let num_bytes = core::cmp::min(
-                extent.num_bytes,
-                count.saturating_sub(bytes_written),
-            );
+            let num_bytes = core::cmp::min(extent.num_bytes, count.saturating_sub(bytes_written));
 
             let mut pos = 0u64;
             while pos < num_bytes {
@@ -384,7 +371,8 @@ fn read_hidden_inode_value(ino: u64, dst: *mut u8, count: u64) -> u64 {
                     return false;
                 }
                 unsafe {
-                    let dst_ptr = dst.add((extent_file_offset + bytes_written) as usize + pos as usize);
+                    let dst_ptr =
+                        dst.add((extent_file_offset + bytes_written) as usize + pos as usize);
                     for j in 0..can as usize {
                         *dst_ptr.add(j) = *block_data.add(off_in_block as usize + j);
                     }
@@ -396,10 +384,7 @@ fn read_hidden_inode_value(ino: u64, dst: *mut u8, count: u64) -> u64 {
             // Hidden inode values we write always go via EXTENT_REGULAR above,
             // but if an older path created an inline extent we still honour it.
             let inline_data = unsafe { data_ptr.add(core::mem::size_of::<ExtentData>()) };
-            let inline_len = core::cmp::min(
-                extent.ram_bytes,
-                count.saturating_sub(bytes_written),
-            );
+            let inline_len = core::cmp::min(extent.ram_bytes, count.saturating_sub(bytes_written));
             unsafe {
                 let dst_ptr = dst.add((extent_file_offset + bytes_written) as usize);
                 for j in 0..inline_len as usize {
@@ -418,7 +403,7 @@ fn read_hidden_inode_value(ino: u64, dst: *mut u8, count: u64) -> u64 {
 // Public handlers
 // ======================================================================
 
-/// Handle SALTYFS_SETXATTR.
+/// Handle BACKEND_SETXATTR.
 ///
 /// Request:
 ///   regs[0] = ino
@@ -432,11 +417,13 @@ pub(crate) fn handle_setxattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
-    if let Some(r) = ro_reject() { return r; }
-    if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
+    if let Some(r) = ro_reject() {
+        return r;
+    }
+    let Some((shm_vaddr, shm_size)) = crate::session::live_shm_region_for_msg(msg) else {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
-    }
+    };
 
     let ino = msg.regs[0];
     let flags = msg.regs[1];
@@ -448,16 +435,13 @@ pub(crate) fn handle_setxattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
-    let shm_size = VFS_SHM_PAGES * 4096;
-    if shm_offset >= shm_size
-        || (name_len as u64) + value_len > shm_size - shm_offset
-    {
+    if shm_offset >= shm_size || (name_len as u64) + value_len > shm_size - shm_offset {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     // Read name + value from SHM.
-    let name_ptr = (VFS_SHM_VADDR + shm_offset) as *const u8;
+    let name_ptr = (shm_vaddr + shm_offset) as *const u8;
     let value_ptr = unsafe { name_ptr.add(name_len) };
     let name_slice = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let value_slice = unsafe { core::slice::from_raw_parts(value_ptr, value_len as usize) };
@@ -542,7 +526,7 @@ pub(crate) fn handle_setxattr(msg: &TronaMsg) -> TronaMsg {
                 let old_name_len = old_hdr.name_len as usize;
                 let old_ref_ino = unsafe {
                     core::ptr::read_unaligned(
-                        old_ptr.add(XATTR_HEADER_SIZE + old_name_len) as *const u64,
+                        old_ptr.add(XATTR_HEADER_SIZE + old_name_len) as *const u64
                     )
                 };
                 if old_ref_ino != new_hidden {
@@ -599,7 +583,7 @@ pub(crate) fn handle_setxattr(msg: &TronaMsg) -> TronaMsg {
     reply
 }
 
-/// Handle SALTYFS_GETXATTR.
+/// Handle BACKEND_GETXATTR.
 ///
 /// Request:
 ///   regs[0] = ino
@@ -616,10 +600,10 @@ pub(crate) fn handle_getxattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
-    if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
+    let Some((shm_vaddr, shm_size)) = crate::session::live_shm_region_for_msg(msg) else {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
-    }
+    };
 
     let ino = msg.regs[0];
     let shm_offset = msg.regs[1];
@@ -630,7 +614,6 @@ pub(crate) fn handle_getxattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
-    let shm_size = VFS_SHM_PAGES * 4096;
     if shm_offset >= shm_size
         || (name_len as u64) > shm_size - shm_offset
         || buf_bytes > shm_size - shm_offset
@@ -639,7 +622,7 @@ pub(crate) fn handle_getxattr(msg: &TronaMsg) -> TronaMsg {
         return reply;
     }
 
-    let name_ptr = (VFS_SHM_VADDR + shm_offset) as *const u8;
+    let name_ptr = (shm_vaddr + shm_offset) as *const u8;
     let name_slice = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
 
     let (_, data_ptr, _size) = match find_xattr_by_name(ino, name_slice) {
@@ -678,7 +661,7 @@ pub(crate) fn handle_getxattr(msg: &TronaMsg) -> TronaMsg {
         // Indirect: pull the value from the hidden inode's extents.
         let ref_ino = unsafe {
             core::ptr::read_unaligned(
-                data_ptr.add(XATTR_HEADER_SIZE + hdr.name_len as usize) as *const u64,
+                data_ptr.add(XATTR_HEADER_SIZE + hdr.name_len as usize) as *const u64
             )
         };
         let got = read_hidden_inode_value(ref_ino, dst, value_len);
@@ -691,7 +674,7 @@ pub(crate) fn handle_getxattr(msg: &TronaMsg) -> TronaMsg {
     reply
 }
 
-/// Handle SALTYFS_REMOVEXATTR.
+/// Handle BACKEND_REMOVEXATTR.
 ///
 /// Request:
 ///   regs[0] = ino
@@ -703,7 +686,9 @@ pub(crate) fn handle_removexattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
-    if let Some(r) = ro_reject() { return r; }
+    if let Some(r) = ro_reject() {
+        return r;
+    }
 
     let ino = msg.regs[0];
     let name_len = msg.regs[1] as usize;
@@ -757,7 +742,7 @@ pub(crate) fn handle_removexattr(msg: &TronaMsg) -> TronaMsg {
     reply
 }
 
-/// Handle SALTYFS_LISTXATTR.
+/// Handle BACKEND_LISTXATTR.
 ///
 /// Request:
 ///   regs[0] = ino
@@ -774,22 +759,21 @@ pub(crate) fn handle_listxattr(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
-    if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
+    let Some((shm_vaddr, shm_size)) = session::live_shm_region() else {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
-    }
+    };
 
     let ino = msg.regs[0];
     let shm_offset = msg.regs[1];
     let buf_bytes = msg.regs[2];
 
-    let shm_size = VFS_SHM_PAGES * 4096;
     if shm_offset > shm_size || buf_bytes > shm_size - shm_offset {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
-    let base = (VFS_SHM_VADDR + shm_offset) as *mut u8;
+    let base = (shm_vaddr + shm_offset) as *mut u8;
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
 
     let mut bytes_needed = 0u64;
@@ -832,7 +816,11 @@ pub(crate) fn handle_listxattr(msg: &TronaMsg) -> TronaMsg {
 pub(crate) fn delete_all_xattrs(ino: u64) {
     loop {
         let root_tree = unsafe { (*(&raw const SB)).root_tree };
-        let mut keys = [BTreeKey { object_id: 0, item_type: 0, offset: 0 }; 128];
+        let mut keys = [BTreeKey {
+            object_id: 0,
+            item_type: 0,
+            offset: 0,
+        }; 128];
         let mut refs = [0u64; 128];
         let mut kinds = [false; 128]; // true = indirect
         let mut count = 0usize;
@@ -844,9 +832,7 @@ pub(crate) fn delete_all_xattrs(ino: u64) {
                 if (hdr.flags & XATTR_FLAG_INDIRECT) != 0 {
                     let n = hdr.name_len as usize;
                     let ref_ino = unsafe {
-                        core::ptr::read_unaligned(
-                            data_ptr.add(XATTR_HEADER_SIZE + n) as *const u64,
-                        )
+                        core::ptr::read_unaligned(data_ptr.add(XATTR_HEADER_SIZE + n) as *const u64)
                     };
                     refs[count] = ref_ino;
                     kinds[count] = true;

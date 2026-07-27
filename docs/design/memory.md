@@ -103,14 +103,24 @@ for cache efficiency. The PMM provides `FrameMeta::to_owner()` and
 struct FrameMeta {
     owner_tag: u8,       // FrameOwner discriminant
     subkind: u8,         // MoMetaKind or KernelMetaKind (0 if N/A)
-    map_count: u8,       // number of VSpaces mapping this frame (Layer 2 rmap)
-    flags: u8,           // DIRTY | REFERENCED | PINNED
-    page_idx: u32,       // valid when owner_tag == MoData
+    flags: u8,           // DIRTY | REFERENCED | PINNED | WRITEBACK | ACTIVE
+    _pad0: u8,           // explicit alignment tail
+    map_count: u32,      // number of VSpaces mapping this frame (Layer 2 rmap)
     owner_ptr: u64,      // *mut MemoryObject (MoData/MoMeta), 0 otherwise
+    page_idx: u32,       // valid when owner_tag == MoData
+    _pad1: u32,          // explicit alignment tail
 }
-// 16 bytes per frame
-// 512 MB RAM → 131K frames × 16 = 2 MB metadata
+// 24 bytes per frame (layout-pinned by a compile-time size_of assertion)
+// 512 MB RAM → 131K frames × 24 = ~3 MB metadata
+// 16  GB RAM →   4M frames × 24 = 96 MB metadata (~0.6 % of RAM)
 ```
+
+`map_count` is `u32` (not saturating `u8`) so heavily-shared pages —
+notably COW parents, shared libraries, and notification pages across many
+pthread children — cannot saturate the counter. This matters because
+`FrameAllocator::free_internal` panics if any frame is returned to the
+free pool with `map_count != 0`, so a saturating counter would make
+legitimate teardowns look like use-after-free bugs.
 
 ### Allocation API
 
@@ -334,8 +344,9 @@ Each physical frame tracks how many VSpaces map it via a counter in
 region rmaps.
 
 This reuses the same `FrameMeta` layout defined in the PMM section
-(fields: `owner_tag`, `subkind`, `map_count`, `flags`, `page_idx`,
-`owner_ptr` — 16 bytes per frame).
+(fields: `owner_tag`, `subkind`, `flags`, `map_count`, `owner_ptr`,
+`page_idx` — 24 bytes per frame, layout pinned by a compile-time
+`size_of` assertion).
 
 `map_count` is a **reclaimability hint**, not a precise reverse mapping
 list. It tells you whether a frame is mapped anywhere (and thus whether
@@ -535,24 +546,37 @@ a pure allocation, not a transfer.
 MO data pages come from **untyped** (primary) or **PMM** (fallback).
 The caller provides a `ut_cap` argument to `MO_COMMIT`:
 
-- `ut_cap != 0`: Carve page-sized frames from the untyped watermark
-  (or its free list). Radix tree entry tagged with `PHYS_TAG_UNTYPED`
-  (bit 0). Per-untyped `alloc_lock` protects watermark and free list.
+- `ut_cap != 0`: Carve page-sized frames via `UntypedMemory::carve_block`,
+  which consults the multi-class freelist (Layer 1) before bumping the
+  watermark. Radix tree entry tagged with `PHYS_TAG_UNTYPED` (bit 0).
+  PMM ownership is transferred to `MoData`; `FrameMeta::source_ut` records
+  the exact untyped source for release.
 - `ut_cap == 0`: Allocate from PMM bitmap (fallback/legacy path).
   No tag bit set.
+
+The kernel-side allocator on `UntypedMemory` is multi-class: a single
+untyped source can host objects of up to `MAX_CLASSES_PER_SOURCE = 8`
+distinct `obj_size` values. Each `(obj_size, free_head, free_count)`
+bucket is keyed by byte size; same-size objects of different
+`ObjectType` (e.g., Notification = IrqHandler = 48 B) share a single
+bucket because the next `init_object` overwrites the entire region.
 
 Per-page commit sequence (untyped path):
 ```
 mo.commit_lock.lock()
   reserve_slot(page_idx, BUSY)  ← path + empty check + sentinel, atomic
 mo.commit_lock.unlock()
-ut.alloc_lock.lock()
-  pop free_list or bump watermark → phys
-ut.alloc_lock.unlock()
+ut.carve_mo_page() -> phys
+                                  ← internally: lock → bucket lookup,
+                                    pop matching freelist or bump
+                                    watermark → outstanding-page count
+                                    increment → unlock.
 zero page                         ← outside all locks
 mo.commit_lock.lock()
   radix leaf = phys | PHYS_TAG_UNTYPED
 mo.commit_lock.unlock()
+PMM::transfer_with_source(phys,
+  UntypedReserved{ut} → MoData{mo,page_idx}, source_ut=ut)
 ```
 
 Lock ordering: `mo.commit_lock` → `ut.alloc_lock` (never reversed).
@@ -564,7 +588,12 @@ mo.commit_lock.lock()
   mo.pages.remove(page_idx)
 mo.commit_lock.unlock()
 if entry & PHYS_TAG_UNTYPED:
-  ut.alloc_lock → push to source untyped free list
+  ut = PMM::source_untyped(phys)
+  ut.release_committed_mo_page(phys, mo, page_idx)
+                                  ← internally: lock → PMM owner
+                                    MoData→UntypedReserved → push to
+                                    matching bucket's freelist → decrement
+                                    outstanding-page count → unlock.
 else:
   pmm_free(phys)
 ```
@@ -575,18 +604,16 @@ mo.commit_lock.lock()
   for each page in mo.pages:
     for each rmap in mo.reverse_maps:
       unmap PTE, TLB shootdown
-    if PHYS_TAG_UNTYPED: batch collect
-    else: pmm_free(phys)
+    release_resident_data_page(mo, page_idx, entry)
 mo.commit_lock.unlock()
-for each batched untyped page:
-  ut.alloc_lock → push to source free list
 for each metadata page (radix nodes, rmap overflow):
   pmm.free(phys, FrameOwner::MoMeta { mo, kind })
 ```
 
-Untyped frame reclaim: `find_untyped_for_phys(phys)` searches the
-init-created untyped list by physical range. Design invariant: untyped
-source ranges are disjoint and never split.
+Untyped frame reclaim: live MO data pages have `MoData` ownership and carry
+their source in `FrameMeta::source_ut`; free paths use that source instead of
+range-scanning. The init-created untyped range scan remains a fallback for
+device and legacy diagnostic queries.
 
 ### Invoke labels
 
@@ -751,30 +778,42 @@ page. The kernel resolves it by committing the page into the MO:
 
 If PMM alloc fails, the fault falls through to mmsrv.
 
-**3. Stack growth** (fault near user SP, below current stack mapping):
+**3. Stack growth**
 
-The kernel extends the stack MO and VMA:
+The kernel does not grow stacks on demand. Every user thread's stack
+is provisioned at spawn / fork time as:
 
-```
-1. Fault at vaddr → check: vaddr >= user_stack_min
-                          && vaddr < user_stack_top
-                          && vaddr < current stack VMA base
-2. Lookup stack VmArea in Maple tree
-3. Compute new_base = vaddr & ~0xFFF (page-align down)
-4. growth_pages = (old_vma.va_start - new_base) / PAGE_SIZE
-5. mo.page_count += growth_pages  // extend MO capacity
-6. For each new page (bottom-up):
-   a. PMM::alloc(MoData { mo, new_page_idx }) → phys
-   b. Zero-fill phys
-   c. mo.pages.insert(new_page_idx, phys)
-   d. vspace.map(new_vaddr, phys, USER_RW)
-   e. pmm_retain_mapping(phys)
-7. Update VmArea in Maple tree: va_start = new_base,
-   page_count += growth_pages, mo_offset adjusted
-8. Update MO reverse_maps entry for this VSpace
-```
+- a **full-span reserve** — one VmArea tagged `REGION_KIND_STACK`
+  spanning the entire per-service reserve (default 1 MiB; see
+  `StackLayoutSpec` in `lib/trona/substrate/stack_plan.rs` and the
+  `[Memory]` keys in `.service` manifests),
+- a **full-capacity `MemoryObject`** — one MO sized to the reserve,
+  with the top `prefault_pages` (default 16 KiB) committed eagerly and
+  the rest uncommitted,
+- **demand PTEs** for the whole reserve installed via
+  `VSPACE_MAP_MO | VSPACE_FLAG_DEMAND`, so uncommitted pages carry a
+  demand marker rather than no PTE,
+- an **unmapped guard hole** immediately below the reserve base
+  (default 4 KiB). No VmArea covers the guard; the kernel relies on
+  absence to enforce the boundary.
 
-If PMM alloc fails at any step, the fault falls through to mmsrv.
+Subsequent stack growth is therefore **the ordinary demand-fault
+path** (§1 above) — `handle_demand_fault` sees a demand PTE covered by
+the existing full-span VmArea, allocates a PMM frame tagged
+`MoData { mo, page_idx }`, commits into the MO radix tree under
+`commit_lock`, and promotes the PTE to present. An access below the
+reserve base lands in the guard hole, finds no VmArea, and falls
+through to SIGSEGV (slow-path §below).
+
+The TCB's `user_stack_top` / `user_stack_min` / `user_stack_guard_bottom`
+fields are a cache of the authoritative VmArea span, published via
+`TCB_SET_STACK_BOUNDS` (see `docs/spec/syscalls.md`). They exist for
+signal delivery and fault-diagnostic purposes; the VmArea is the
+source of truth. See memory-model-audit invariants `I21`–`I24`.
+
+The legacy fault-driven stack-growth path (where the kernel extended
+the stack VmArea and MO on-demand below its current base) has been
+removed — full-span reserve + demand PTE makes it dead code.
 
 ### Slow-path (mmsrv IPC)
 
@@ -783,8 +822,8 @@ via VMFault IPC:
 
 - MO page not yet committed (no demand PTE, VmArea exists) →
   mmsrv calls `MO_COMMIT` + `VSPACE_MAP_MO`
-- No VmArea covers fault address → segfault (mmsrv does not reply,
-  thread stays FaultBlocked)
+- No VmArea covers fault address → segfault (mmsrv sends a non-OK
+  fault reply and the arch handler destroys the thread)
 - PMM exhausted in fast-path → mmsrv decides (OOM kill, cache flush)
 - Policy decisions (quota enforcement) → mmsrv decides
 
@@ -839,13 +878,29 @@ The kernel is `#![no_std]` with `core::` only. No `alloc` crate.
 ## Lock Ordering Addendum
 
 Beyond the global lock ordering (`CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state
-→ VSpace.lock → MM_LOCK`), two per-object locks are used in the MO/Untyped layer:
+→ VSpace.waiter_lock → VSpace.lock → MM_LOCK`), two per-object locks are used in
+the MO/Untyped layer:
 
+- **per-VSpace `waiter_lock`**: Serializes `VSpaceTracking.waiter_head` mutation
+  (intrusive list of TCBs blocked on VSpace teardown), the `is_active()`
+  recheck that gates `block_current_on_vspace` enqueue, and the last-deactivate
+  splice-all wake in `wakeup_vspace_waiters_locked`. Nested strictly inside the
+  per-CPU `scheduler.lock_state`.
 - **per-MO `commit_lock`**: Protects radix tree mutations during commit/decommit.
   Ordering: `commit_lock` → `ut.alloc_lock` (never reversed).
-- **per-Untyped `alloc_lock`**: Protects watermark and free list during page
-  allocation/return. Multiple MOs can hold their respective `commit_lock`
-  concurrently while contending on the same `alloc_lock`.
+- **per-Untyped `alloc_lock`**: Protects watermark, `class_buckets[]`,
+  `class_count` (the multi-class typed-object freelist), AND
+  `child_head` (the per-object children list — `KernelObject.parent_ut`
+  plus `hlist`-style sibling links anchor every object in the source
+  untyped's registry). Covers retype, untype, MO commit/decommit,
+  reset, and `add_child` / `remove_child`. Also covers the unified
+  `carve_block` / `release_block` primitives shared between cap retype
+  and MO_COMMIT (no direct `free_list_head` access remains outside
+  `UntypedMemory` methods). Children-list mutation under `alloc_lock`
+  is restricted to in-memory pointer ops — never call into outer-tier
+  locks (CDT, slot bitmap, PMM) while holding it. Multiple MOs can
+  hold their respective `commit_lock` concurrently while contending
+  on the same `alloc_lock`.
 
 These locks are finer-grained than the global `MM_LOCK` and are only acquired
 during MO commit/decommit paths, not during general memory operations.
@@ -924,3 +979,85 @@ Future work:
 - **FileBacked MoKind**: Page cache integration for file-backed mappings
 - **Per-MO dirty bitmap**: For FileBacked writeback tracking (design above)
 - **PageCache FrameOwner**: Enum variant exists but not yet used
+
+---
+
+## Mapping truth vs policy truth (mmsrv ↔ kernel)
+
+The memory subsystem keeps two distinct truth tables and is explicit
+about which one owns which property. Mixing them is the failure mode
+that produced Blocker #4 in `docs/spec/memory-model-audit.md`; the
+split below is what closed it.
+
+**Mapping truth — kernel (`kernite`).** The hardware fact: VA range
+↔ MemoryObject + offset ↔ access rights. Maintained by `VSpace`,
+`VmArea` (Maple-tree indexed), and the MO radix tree. The kernel is
+the sole authority on whether a page table entry exists, what frame
+it points at, and which MO it derives from. Userland cannot override
+this view.
+
+**Policy truth — userland (`mmsrv`).** The POSIX-level interpretation
+that sits on top of the mapping truth: the per-region `region_type`
+classification (heap / stack / image-text / image-data / shared-RO /
+file-shared / IPC / image-bss), `backing_kind` plus file/shm/device
+backing identifiers, prot promotion semantics, lazy population
+flags, procfs `VmExe` / `VmStk` / `VmLib` / `VmData` projection.
+None of this is observable from kernel `VmArea` and none of it
+should be: the kernel does not know about POSIX.
+
+**Synchronization between the two truths is owned by
+`mmsrv::txn`.** Every operation that mutates both truths (fork,
+mmap, munmap, mprotect, mremap) goes through the transaction
+primitive: stage the new policy records, journal the kernel-side
+side effects, then either commit-swap atomically or drop the guard
+and roll the kernel state back. Specifically:
+
+- `RegionStage` accumulates the new `MmRegion` records on a
+  separate staging buffer; the live `MmClient.regions` pointer is
+  untouched until commit.
+- `RollbackDelta` records each kernel-side install (vspace_map_mo /
+  vspace_fork_range plus any cnode_copy of MO caps). Its `Drop`
+  replays the journal in reverse on failure paths, panic-free.
+- `commit_swap` performs the in-place pointer swap of the four
+  region fields (`regions`, `region_count`, `region_cap`,
+  `regions_buf`) and the three scalar VA fields (`heap_base`,
+  `heap_current`, `mmap_next`) in one stretch, freeing the old
+  region buffer afterward.
+
+This makes the audit's `fork_atomicity` and `no_partial_publish`
+invariants structural: a client whose fork failed observes the
+exact pre-call state, not a half-built region table over a
+half-mapped VSpace.
+
+The mmsrv source tree implements the same separation as a
+three-layer module split:
+
+| Layer | Files | Reaches into |
+|---|---|---|
+| `mmsrv::posix_policy` | `mmap.rs` / `shm.rs` / `client.rs` / `pool.rs` / `types.rs` | `kernel_vm` and `txn` only |
+| `mmsrv::txn` | `txn.rs` | `kernel_vm` only |
+| `mmsrv::kernel_vm` | `kernel_vm.rs` | `trona::invoke::*` |
+
+`just layering-check` enforces the boundary mechanically: the
+recipe greps for direct `invoke::vspace_*` / `invoke::mo_*` /
+`invoke::cnode_copy` calls in policy files and for policy-type
+references in `kernel_vm.rs`, and is wired in as a dependency of
+`just warn` so the gate runs on every CI warn pass.
+
+**Why the truths are not merged.** mmsrv cannot be deleted because
+the kernel does not expose POSIX-level metadata, and giving it that
+metadata would drag POSIX semantics into the microkernel's trusted
+base (anti-goal for SaltyOS). mmsrv cannot be reduced to a stateless
+shim because procfs / mremap / lazy-fault paths need policy state
+the kernel does not carry. The transactional mirror is the smallest
+arrangement that lets the two truths coexist without partial-state
+divergence.
+
+**Forward path: subsystem split.** When a non-POSIX subsystem
+(Win32 VAD-style mappings, a Starnix-like Linux compatibility
+layer) wants to use the generic VM substrate without POSIX
+semantics, the same module boundary becomes the cut line for a
+separate `posix_mmsrv` server. Today the boundary is enforced
+in-process; the migration would lift `mmsrv::posix_policy` into a
+new server while leaving `kernel_vm` and `txn` shared. Until then,
+no server split is needed.

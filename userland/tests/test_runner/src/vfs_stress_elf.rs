@@ -4,7 +4,10 @@
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 #[used]
 static VFS_STRESS_BLOB_A: [u8; 64 * 1024] = [0x5A; 64 * 1024];

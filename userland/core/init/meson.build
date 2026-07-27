@@ -1,7 +1,7 @@
 # SaltyOS Init Process Build (Rust, statically linked)
 # SPDX-License-Identifier: GPL-2.0-only
 
-init_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
+init_link = meson.project_source_root() / 'lib/trona/trona-static-pie.ld'
 
 # Per-program debug override
 _prog_rust_args = rust_userland_args
@@ -19,20 +19,22 @@ init_obj = custom_target('init_obj',
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=init',
     '--crate-type=lib',
-    '--extern', 'trona=' + trona_rmeta,
+    '--extern', 'uapi=' + trona_uapi_rmeta,
+    '--extern', 'trona_kernel=' + trona_kernel_rmeta,
+    '--extern', 'trona_runtime=' + trona_runtime_rmeta,
+    '--extern', 'trona_protocol=' + trona_protocol_rmeta,
+    '--extern', 'trona_server=' + trona_server_rmeta,
     '--extern', 'trona_posix=' + trona_posix_rmeta,
     '--extern', 'trona_loader=' + trona_loader_rmeta,
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libtrona_rust, trona_posix, trona_loader],
+  depends: [core, compiler_builtins, trona_uapi, trona_kernel, trona_protocol, trona_server, trona_runtime, trona_posix, trona_loader],
   build_by_default: true,
 )
 
-# Step 2: .o + trona .o files + fork.o + core.o + compiler_builtins.o + string.c -> init.elf (static)
+# Step 2: crt_start.o + init.o + static libc/libtrona -> init.elf (static)
 init_elf = custom_target('init_elf',
-  input: [init_obj, trona_substrate_obj, trona_posix_obj, trona_loader_obj,
-          fork_obj, core_obj, compiler_builtins_obj,
-          meson.project_source_root() / 'lib/basalt/c/src/string.c'],
+  input: [crt_start_obj, init_obj, libc_a, libtrona_a],
   output: 'init.elf',
   command: [cc_cmd,
     '--target=' + c_target,
@@ -42,16 +44,17 @@ init_elf = custom_target('init_elf',
     '-fno-stack-protector',
     '-T', init_link,
     '-o', '@OUTPUT@',
+    '-Wl,--undefined=main',
+    '-Wl,--start-group',
     '@INPUT@',
+    '-Wl,--end-group',
   ],
   build_by_default: true,
 )
 
 # Step 3: stripped init ELF for boot image/initrd (keep init.elf for debugging)
 init_boot_elf = custom_target('init_boot_elf',
-  input: [init_obj, trona_substrate_obj, trona_posix_obj, trona_loader_obj,
-          fork_obj, core_obj, compiler_builtins_obj,
-          meson.project_source_root() / 'lib/basalt/c/src/string.c'],
+  input: [crt_start_obj, init_obj, libc_a, libtrona_a],
   output: 'init.boot.elf',
   command: [cc_cmd,
     '--target=' + c_target,
@@ -62,7 +65,10 @@ init_boot_elf = custom_target('init_boot_elf',
     '-Wl,-S',
     '-T', init_link,
     '-o', '@OUTPUT@',
+    '-Wl,--undefined=main',
+    '-Wl,--start-group',
     '@INPUT@',
+    '-Wl,--end-group',
   ],
   build_by_default: true,
 )

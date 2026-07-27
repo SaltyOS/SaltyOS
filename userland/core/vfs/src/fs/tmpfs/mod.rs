@@ -1,45 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Tmpfs — independent in-memory filesystem with size/inode limits.
+//
+//! tmpfs — in-memory filesystem with size and inode quotas.
 //!
-//! tmpfs is a completely independent filesystem that does NOT reuse ramfs
-//! code. It has its own block chain pool, dirent array, symlink pool, and
-//! memory accounting (configurable size and inode limits).
+//! Independent reimplementation from ramfs (no read-only path, no
+//! initrd projection) plus quota accounting on every mutation.
+//! `size=NNN` and `nr_inodes=NNN` mount options seed the quota
+//! caps (`max_bytes` / `max_inodes`); 0 means unlimited.
 //!
-//! # Mount options
+//! Module layout:
 //!
-//! - `size=NNN` — maximum total data bytes (0 = unlimited)
-//! - `nr_inodes=NNN` — maximum inode count (0 = unlimited)
-//!
-//! # Module layout
-//!
-//! - [`types`] — `TmpfsVnodeData`, `TmpfsMountData`
-//! - [`pool`] — Per-mount pool management (allocation, growth, block chains, accounting)
-//! - [`vops`] — `VopVector` function implementations
-//! - [`vfsops`] — `VfsOps` function implementations
+//! - [`types`]   — `Dirent`, `TmpfsVnodeData`, `TmpfsMountData`.
+//! - [`pool`]    — per-mount pool allocators, chain helpers, quota
+//!                accounting (`check_bytes` / `account_bytes_*` /
+//!                `check_inodes` / `account_inode_*`).
+//! - [`vfsops`]  — `VfsOps`.
+//! - [`vops`]    — `VopVector`.
 
-mod pool;
-mod types;
+pub(crate) mod pool;
+pub(crate) mod types;
 mod vfsops;
 mod vops;
 
-pub(crate) use types::{TmpfsMountData, TmpfsVnodeData};
-
-use crate::vfs_core::error::VfsResult;
-use crate::vfs_core::vfs::{register_fs_type, VfsOps};
-use crate::vfs_core::vop::{VopVector, VopMetaOps, VopDataOps, META_OPS_DEFAULT, DATA_OPS_DEFAULT};
-
-// =========================================================================
-// Static dispatch tables
-// =========================================================================
+use crate::core::vop::{DATA_OPS_DEFAULT, VfsOps, VopDataOps, VopMetaOps, VopVector};
 
 /// Tmpfs vnode operation dispatch table.
 pub(crate) static TMPFS_VOPS: VopVector = VopVector {
     meta: VopMetaOps {
         lookup: vops::tmpfs_lookup,
-        lookup_ci: vops::tmpfs_lookup,
+        lookup_ci: vops::tmpfs_lookup_ci,
         create: vops::tmpfs_create,
         mkdir: vops::tmpfs_mkdir,
         symlink: vops::tmpfs_symlink,
+        mkfifo: crate::core::vop::META_OPS_DEFAULT.mkfifo,
         unlink: vops::tmpfs_unlink,
         rmdir: vops::tmpfs_rmdir,
         link: vops::tmpfs_link,
@@ -51,15 +43,22 @@ pub(crate) static TMPFS_VOPS: VopVector = VopVector {
         access: vops::tmpfs_access,
         readlink: vops::tmpfs_readlink,
         truncate: vops::tmpfs_truncate,
+        data_size: vops::tmpfs_data_size,
         inactive: vops::tmpfs_inactive,
     },
     data: VopDataOps {
         read: vops::tmpfs_read,
         write: vops::tmpfs_write,
+        writeback: vops::tmpfs_write,
         fsync: vops::tmpfs_fsync,
         readdir: vops::tmpfs_readdir,
         statfs: vops::tmpfs_statfs,
-        ..DATA_OPS_DEFAULT
+        getxattr: DATA_OPS_DEFAULT.getxattr,
+        setxattr: DATA_OPS_DEFAULT.setxattr,
+        listxattr: DATA_OPS_DEFAULT.listxattr,
+        removexattr: DATA_OPS_DEFAULT.removexattr,
+        ioctl: DATA_OPS_DEFAULT.ioctl,
+        mmap_get_page: DATA_OPS_DEFAULT.mmap_get_page,
     },
 };
 
@@ -72,18 +71,3 @@ pub(crate) static TMPFS_VFSOPS: VfsOps = VfsOps {
     statfs: vfsops::tmpfs_statfs,
     sync: vfsops::tmpfs_sync,
 };
-
-// =========================================================================
-// Registration
-// =========================================================================
-
-/// Register the `tmpfs` filesystem type. Called during VFS bootstrap Stage 2.
-pub(crate) unsafe fn register() -> VfsResult<()> {
-    unsafe {
-        register_fs_type(
-            b"tmpfs",
-            &raw const TMPFS_VFSOPS,
-            &raw const TMPFS_VOPS,
-        )
-    }
-}

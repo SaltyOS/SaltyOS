@@ -1,17 +1,25 @@
 [Service]
 Name=win32_csrss
 Binary=/bin/win32_csrss
-Type=notify
+Type=broker
 Restart=always
 
 [Dependencies]
-After=console namesrv vfs procmgr
+After=console namesrv vfs
 Before=
+Requires=namesrv.socket console.socket
+RequiresInterface=vfs:process-client
 
 [Capabilities]
-# System roles via trona::caps::* — all four (namesrv, console, vfs, procmgr)
-# are populated by procmgr's populate_cap_table for every post-procmgr child.
-Require=namesrv
-Require=console
-Require=vfs
-Require=procmgr
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

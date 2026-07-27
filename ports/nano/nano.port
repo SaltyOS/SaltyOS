@@ -36,14 +36,11 @@ configure =
     --without-libintl-prefix
 
 [depends]
-build = ncurses
+build = ncurses >= 6.5
 
 [env]
 CFLAGS_FOR_BUILD =
-NCURSESW_CFLAGS = -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include
-NCURSESW_LIBS = -L${PORTDIR}/../ncurses/${ARCH_STAGE} -lncursesw
-EXTRA_CFLAGS = -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include -Wno-implicit-function-declaration
-EXTRA_LDFLAGS = -L${PORTDIR}/../ncurses/${ARCH_STAGE}
+EXTRA_CFLAGS = -Wno-implicit-function-declaration
 EXTRA_LIBS = -lncursesw
 
 [autoconf_cache]
@@ -68,5 +65,12 @@ sed_in_place 's/VT_GETSTATE/DISABLED_VT_GETSTATE/g' ${SRCDIR}/src/nano.c || true
 # Replace mkstemps() with mkstemp() if present
 sed_in_place 's/mkstemps(tempfile_name, strlen(extension))/mkstemp(tempfile_name)/g' ${SRCDIR}/src/files.c || true
 
-[install]
-bin/nano = src/nano
+[stage]
+mode = make-install
+
+[stage.exclude]
+usr/share/info
+usr/share/man
+usr/share/locale
+usr/share/doc
+usr/share/nano

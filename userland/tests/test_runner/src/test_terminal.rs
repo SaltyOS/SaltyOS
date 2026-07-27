@@ -1,11 +1,9 @@
 //! Terminal (termios) tests
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::posix::TIOCGWINSZ;
-use trona::serial;
-use trona::types::core::*;
-use trona_posix::proc as posix;
+use trona_posix::consts::{TIOCGPGRP, TIOCGWINSZ};
 use trona_posix::*;
+use trona_runtime::debug::serial;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -139,6 +137,23 @@ pub fn run() -> bool {
         return false;
     }
     puts(b"[TEST_TERMINAL] PASS: original termios restored\n");
+
+    // Test 5: ioctl(TIOCGPGRP) — exercises the async controlling-tty
+    // resolve (the devfs ctty-control ioctl parks on init for the caller's
+    // session, then on posix_ttysrv). This is a liveness check for the P1
+    // invariant: the round-trip must COMPLETE (no init↔VFS reactor
+    // deadlock). A process with no controlling terminal legitimately gets
+    // an error — still a completed round-trip, which is what we verify.
+    puts(b"[TEST_TERMINAL] Test 5: ioctl(TIOCGPGRP) ctty resolve\n");
+    let mut pgrp: i32 = -1;
+    let _ = unsafe {
+        trona_posix::posix_ioctl(
+            fd,
+            TIOCGPGRP,
+            (&raw mut pgrp as *mut i32).cast::<u8>() as u64,
+        )
+    };
+    puts(b"[TEST_TERMINAL] PASS: ioctl(TIOCGPGRP) completed (no ctty deadlock)\n");
 
     unsafe { trona_posix::posix_close(fd) };
     puts(b"[TEST_TERMINAL] All terminal tests passed\n");

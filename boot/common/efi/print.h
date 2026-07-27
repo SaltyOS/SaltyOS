@@ -9,8 +9,8 @@
 #ifndef BOOT_COMMON_EFI_PRINT_H
 #define BOOT_COMMON_EFI_PRINT_H
 
-#include "efi_types.h"
 #include "efi_protocol.h"
+#include "efi_types.h"
 
 /*
  * Initialize the UEFI print subsystem.

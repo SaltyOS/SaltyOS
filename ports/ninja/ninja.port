@@ -22,5 +22,8 @@ configure =
     -DBUILD_TESTING=OFF
     -DCMAKE_CXX_STANDARD=17
 
-[install]
-bin/ninja = _build/ninja
+[stage]
+mode = script
+commands =
+    mkdir -p ${STAGE}/usr/bin
+    install -m 0755 _build/ninja ${STAGE}/usr/bin/ninja

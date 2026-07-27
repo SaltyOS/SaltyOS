@@ -26,8 +26,8 @@
  * blue_pos:  Bit position of the blue channel
  */
 void fb_console_init(uint64_t fb_addr, uint32_t width, uint32_t height,
-                     uint32_t pitch, uint32_t bpp,
-                     uint8_t red_pos, uint8_t green_pos, uint8_t blue_pos);
+                     uint32_t pitch, uint32_t bpp, uint8_t red_pos,
+                     uint8_t green_pos, uint8_t blue_pos);
 
 /* Output a single character to the framebuffer console */
 void fb_console_putc(char c);

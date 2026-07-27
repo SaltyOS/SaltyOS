@@ -1,10 +1,20 @@
 [Service]
 Name=namesrv
 Binary=/bin/namesrv
-Type=notify
+Type=broker
 Restart=always
-PreProcmgr=yes
 
 [Dependencies]
-After=console
-Before=vfs
+Before=rsrcsrv mmsrv vfs
+
+[Quotas]
+TCB=64
+SchedContext=64
+Endpoint=128
+Notification=128
+CNode=32
+VSpace=16
+Frame=16384
+IrqHandler=16
+IoPort=32
+MemoryObject=1024

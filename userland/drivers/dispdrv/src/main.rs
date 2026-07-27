@@ -8,35 +8,60 @@
 #![no_std]
 #![no_main]
 
-extern crate trona;
+extern crate trona_kernel;
 extern crate trona_posix;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
 mod font;
 mod vt100;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::framebuffer;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::syscall::syscall;
-use trona::types::core::*;
-use trona_posix::consts::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_kernel::uapi;
+use trona_protocol::common::{TRONA_BUSY, TRONA_INVALID_OPERATION, TRONA_OK, TRONA_OUT_OF_MEMORY};
+use trona_protocol::correlation::{
+    CORRELATION_BACKEND_DISPDRV, CORRELATION_CLASS_DEV, CORRELATION_HEADER_REG_COUNT,
+    CORRELATION_HEADER_REG_START, CORRELATION_KIND_COMPLETION, CORRELATION_KIND_REQUEST,
+    CorrelationHeader, ensure_correlation_wire_length,
+};
+use trona_protocol::display::{
+    DISPLAY_FILL_RECT, DISPLAY_GET_INFO, DISPLAY_PRESENT, DISPLAY_SETUP_CONSOLE_RING,
+    DISPLAY_SETUP_RING, DISPLAY_WRITE_TEXT,
+};
+use trona_protocol::namesrv::NAMESRV_REGISTER;
+use trona_protocol::vfs::backend::{
+    BACKEND_FEATURE_ASYNC_V1, VFS_BACKEND_OPEN_SESSION, VFS_BACKEND_REPLY_INVALID,
+    VFS_BACKEND_REPLY_OK,
+};
+use trona_runtime::core::slot_alloc::TransferCap;
+use trona_runtime::debug::framebuffer;
 
-const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
+const FB_MAP_VADDR: u64 = 0x0000_0000_5000_0000;
 const MAX_DAMAGE_SCANLINES: usize = 8192;
 const DAMAGE_WORD_BITS: usize = 64;
 const DAMAGE_WORDS: usize = MAX_DAMAGE_SCANLINES / DAMAGE_WORD_BITS;
 
 // slot 3 is kept as procmgr EP for slot_alloc expansion; display service EP is separate.
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_VSPACE: u64 = 1;
-const CAP_SELF_CSPACE: u64 = 2;
-const CAP_RING_NTFN: u64 = 69;   // Terminal ring notification (received from posix_ttysrv)
-const TERM_RING_VADDR: u64 = 0x0000_0000_0060_0000;
+const CAP_SELF_CSPACE: u64 = uapi::KERNITE_CAP_SELF_CSPACE as u64;
+
+const TERM_RING_PAGES: u64 = 4; // matches posix_ttysrv producer
+const CONSOLE_RING_PAGES: u64 = 16; // matches console producer
 const TERM_RING_HDR_SIZE: usize = 16;
-const TERMINAL_BATCH_TIMEOUT_NS: u64 = 1_000_000;
+const CONSOLE_RING_HDR_SIZE: usize = 16;
+const RECV_SLOT_COUNT: u64 = 8;
+
+const FB_GET_INFO: u64 = 0xA00;
+const FB_PRESENT: u64 = 0xA01;
+const FB_GET_BACKING_MO: u64 = 0xA02;
+
+static mut RECV_SLOTS: trona_server::recv_slot::RecvSlotArena =
+    trona_server::recv_slot::RecvSlotArena::new_empty();
+static mut VFS_CALLBACK_EP: u64 = 0;
+static mut VFS_SESSION_ID: u32 = 0;
 
 struct DisplayState {
     vram: *mut u8,
@@ -82,7 +107,12 @@ struct DisplayState {
     damage_rows: [u64; DAMAGE_WORDS],
     // SHM ring buffer for terminal data from posix_ttysrv
     term_ring_base: *mut u8,
+    term_ring_shm_id: u64,
     term_ring_active: bool,
+    // SHM ring buffer for display output from console server
+    console_ring_base: *mut u8,
+    console_ring_shm_id: u64,
+    console_ring_active: bool,
     // Alternate screen buffer
     alt_shadow: *mut u8,
     alt_active: bool,
@@ -96,7 +126,7 @@ struct DisplayState {
     // Character sets: 0=ASCII(B), 1=DecGraphics(0), 2=UK(A)
     g0_charset: u8,
     g1_charset: u8,
-    active_charset: u8, // 0=G0, 1=G1 (toggled by SO/SI)
+    active_charset: u8,   // 0=G0, 1=G1 (toggled by SO/SI)
     esc_intermediate: u8, // Tracks '(', ')', '*', '+', '#' for EscapeIntermediate state
     // Saved charset state for DECSC/DECRC
     saved_g0_charset: u8,
@@ -141,7 +171,14 @@ struct Cell {
 
 impl Cell {
     const fn blank(fg: u32, bg: u32) -> Self {
-        Cell { ch: b' ', charset: 0, flags: 0, _pad: 0, fg, bg }
+        Cell {
+            ch: b' ',
+            charset: 0,
+            flags: 0,
+            _pad: 0,
+            fg,
+            bg,
+        }
     }
 }
 
@@ -153,7 +190,11 @@ fn cell_put(state: &mut DisplayState, col: u32, row: u32, ch: u8) {
     if col >= state.max_cols || row >= state.max_rows || state.cells.is_null() {
         return;
     }
-    let charset_id = if state.active_charset == 0 { state.g0_charset } else { state.g1_charset };
+    let charset_id = if state.active_charset == 0 {
+        state.g0_charset
+    } else {
+        state.g1_charset
+    };
     let flags = (state.bold as u8)
         | ((state.reverse_video as u8) << 1)
         | ((state.dim as u8) << 2)
@@ -164,19 +205,14 @@ fn cell_put(state: &mut DisplayState, col: u32, row: u32, ch: u8) {
     let idx = cell_idx(state, col, row);
     // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
     unsafe {
-        *state.cells.add(idx) = Cell { ch, charset: charset_id, flags, _pad: 0, fg: state.fg, bg: state.bg };
-    }
-}
-
-fn cell_clear(state: &mut DisplayState, col: u32, row: u32) {
-    if col >= state.max_cols || row >= state.max_rows || state.cells.is_null() {
-        return;
-    }
-    let bg = effective_bg(state);
-    let idx = cell_idx(state, col, row);
-    // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
-    unsafe {
-        *state.cells.add(idx) = Cell::blank(state.fg, bg);
+        *state.cells.add(idx) = Cell {
+            ch,
+            charset: charset_id,
+            flags,
+            _pad: 0,
+            fg: state.fg,
+            bg: state.bg,
+        };
     }
 }
 
@@ -184,7 +220,11 @@ fn cell_clear_range(state: &mut DisplayState, col_start: u32, col_end: u32, row:
     if state.cells.is_null() || row >= state.max_rows {
         return;
     }
-    let end = if col_end > state.max_cols { state.max_cols } else { col_end };
+    let end = if col_end > state.max_cols {
+        state.max_cols
+    } else {
+        col_end
+    };
     let bg = effective_bg(state);
     for col in col_start..end {
         let idx = cell_idx(state, col, row);
@@ -199,7 +239,11 @@ fn cell_clear_rows(state: &mut DisplayState, row_start: u32, row_end: u32) {
     if state.cells.is_null() {
         return;
     }
-    let end = if row_end > state.max_rows { state.max_rows } else { row_end };
+    let end = if row_end > state.max_rows {
+        state.max_rows
+    } else {
+        row_end
+    };
     let bg = effective_bg(state);
     let cols = state.max_cols;
     for row in row_start..end {
@@ -215,48 +259,211 @@ fn cell_clear_rows(state: &mut DisplayState, row_start: u32, row_end: u32) {
 
 fn idle() -> ! {
     loop {
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona_kernel::syscall::yield_now();
     }
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    trona_posix::tls::current_ipc_ctx()
+    trona_runtime::current_ipc_ctx()
 }
 
-unsafe fn recv_timed_ctx(
-    ctx: *mut IpcContext,
-    ep: Cap,
-    timeout_ns: u64,
-    msg: *mut TronaMsg,
-    badge: *mut u64,
-) -> i32 {
-    let r = syscall(SYS_RECV_TIMED, ep, timeout_ns, 0, 0, 0, 0);
-    if r.error == 0 {
-        unsafe {
-            if !badge.is_null() {
-                *badge = r.value;
+fn decode_request_correlation(msg: &TronaMsg) -> Option<CorrelationHeader> {
+    if (msg.length as usize) < (CORRELATION_HEADER_REG_START + CORRELATION_HEADER_REG_COUNT) {
+        return None;
+    }
+    let words = [
+        msg.regs[CORRELATION_HEADER_REG_START],
+        msg.regs[CORRELATION_HEADER_REG_START + 1],
+        msg.regs[CORRELATION_HEADER_REG_START + 2],
+        msg.regs[CORRELATION_HEADER_REG_START + 3],
+    ];
+    let header = CorrelationHeader::decode_words(words);
+    if header.kind != CORRELATION_KIND_REQUEST
+        || header.class != CORRELATION_CLASS_DEV
+        || header.backend != CORRELATION_BACKEND_DISPDRV
+    {
+        return None;
+    }
+    Some(header)
+}
+
+fn stamp_completion_correlation(reply: &mut TronaMsg, request: CorrelationHeader) {
+    let words = CorrelationHeader {
+        class: request.class,
+        backend: request.backend,
+        kind: CORRELATION_KIND_COMPLETION,
+        flags: 0,
+        session: request.session,
+        opcode: request.opcode,
+        _reserved0: 0,
+        token: request.token,
+        request_seq: request.request_seq,
+        request_seq_secondary: request.request_seq_secondary,
+    }
+    .encode_words();
+    reply.regs[CORRELATION_HEADER_REG_START] = words[0];
+    reply.regs[CORRELATION_HEADER_REG_START + 1] = words[1];
+    reply.regs[CORRELATION_HEADER_REG_START + 2] = words[2];
+    reply.regs[CORRELATION_HEADER_REG_START + 3] = words[3];
+    ensure_correlation_wire_length(&mut reply.length);
+}
+
+fn handle_backend_open_session(msg: &TronaMsg, reply: &mut TronaMsg) {
+    let incoming = unsafe {
+        let arena = &mut *(&raw mut RECV_SLOTS);
+        trona_server::recv_slot::capture_transferred_cap(ipc_ctx(), arena).unwrap_or(0)
+    };
+    if incoming == 0 {
+        reply.label = VFS_BACKEND_REPLY_INVALID;
+        return;
+    }
+    unsafe {
+        let prev = *(&raw const VFS_CALLBACK_EP);
+        if prev != 0 && prev != incoming {
+            trona_runtime::core::slot_alloc::delete_and_free(prev);
+        }
+        *(&raw mut VFS_CALLBACK_EP) = incoming;
+        *(&raw mut VFS_SESSION_ID) = msg.regs[1] as u32;
+    }
+    reply.label = VFS_BACKEND_REPLY_OK;
+    reply.regs[0] = 8;
+    reply.regs[1] = BACKEND_FEATURE_ASYNC_V1;
+    reply.regs[2] = 0;
+    reply.length = 3;
+}
+
+fn handle_get_backing_mo(state: &DisplayState, reply: &mut TronaMsg) -> Option<TransferCap> {
+    let fb_untyped = trona_runtime::client::caps::fb_untyped().addr();
+    let Some(temp_slot) = trona_runtime::core::slot_alloc::alloc_slot() else {
+        reply.label = TRONA_OUT_OF_MEMORY;
+        return None;
+    };
+    let copy_err = trona_kernel::invoke::cnode_copy_ref(
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_CSPACE),
+        trona_runtime::core::slot_alloc::resolved_cap_ref(fb_untyped),
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_CSPACE),
+        temp_slot.borrow(),
+        // The framebuffer backing egressed to clients never confers EXECUTE —
+        // a client may not map device memory executable (W^X).
+        (trona_kernel::uapi::KERNITE_RIGHT_ALL & !trona_kernel::uapi::KERNITE_RIGHT_EXECUTE) as u64,
+    );
+    if copy_err != 0 {
+        // copy failed: `temp_slot` (OwnedSlot) Drop frees the empty slot.
+        reply.label = copy_err as u64;
+        return None;
+    }
+    // The copy landed a cap; adopt the slot as an OwnedCap and transfer it.
+    let tc = temp_slot.assume_filled().into_transfer();
+    unsafe {
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, tc.slot());
+    }
+    reply.label = TRONA_OK;
+    reply.regs[0] = state.height as u64 * state.pitch as u64;
+    reply.length = 1;
+    Some(tc)
+}
+
+unsafe fn release_staged_cap(ctx: *mut IpcContext, cap_tc: Option<TransferCap>) {
+    if cap_tc.is_none() {
+        return;
+    }
+    unsafe {
+        ipc::clear_send_caps_ctx(ctx);
+    }
+    drop(cap_tc);
+}
+
+/// Cookie for the single service-pipe `STATE_READABLE` Watch (kind 0, slot 0,
+/// generation 1). dispdrv's only input source is the service pipe.
+const DISPDRV_SERVICE_COOKIE: u64 = trona_server::event_loop::encode_cookie(0, 0, 1);
+
+/// Single-source reactor dispatcher. The reactor blocks on the service pipe;
+/// `dispatch_state` preserves the former `finish_request` reply routing —
+/// correlated requests reply to `VFS_CALLBACK_EP`, direct ones reply on the
+/// service pipe — and recycles the recv-slot arena in `prepare_mp_read`.
+struct DispdrvDispatcher {
+    recv_ep: Cap,
+    watch_cap: Cap,
+    eq_cap: Cap,
+    state: *mut DisplayState,
+}
+
+impl trona_server::event_loop::EqDispatcher for DispdrvDispatcher {
+    fn resolve_mp_recv(&self, _cookie: u64) -> Option<Cap> {
+        Some(self.recv_ep)
+    }
+
+    fn dispatch_state(
+        &mut self,
+        _cookie: u64,
+        msg: &TronaMsg,
+        _meta: trona_server::event_loop::MpReadMeta,
+    ) -> i32 {
+        // SAFETY: single-threaded reactor; `state` points at main's live
+        // DisplayState (the reactor loop never returns).
+        let state = unsafe { &mut *self.state };
+        let mut reply = TronaMsg::zeroed();
+        let request_correlation = decode_request_correlation(msg);
+        let mut cap_to_free: Option<TransferCap> = None;
+
+        match msg.label {
+            VFS_BACKEND_OPEN_SESSION => handle_backend_open_session(msg, &mut reply),
+            DISPLAY_GET_INFO => handle_get_info(state, &mut reply),
+            FB_GET_INFO => handle_get_info(state, &mut reply),
+            DISPLAY_PRESENT => handle_present(state, &mut reply),
+            FB_PRESENT => handle_present(state, &mut reply),
+            FB_GET_BACKING_MO => {
+                cap_to_free = handle_get_backing_mo(state, &mut reply);
             }
-            if !msg.is_null() && !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
-                let buf = (*ctx).ipc_buffer as *const TronaMsg;
-                *msg = *buf;
+            DISPLAY_FILL_RECT => handle_fill_rect(state, msg, &mut reply),
+            DISPLAY_WRITE_TEXT => handle_write_text(state, msg, &mut reply),
+            DISPLAY_SETUP_RING => handle_setup_ring(state, msg, &mut reply),
+            DISPLAY_SETUP_CONSOLE_RING => handle_setup_console_ring(state, msg, &mut reply),
+            _ => reply.label = TRONA_INVALID_OPERATION,
+        }
+
+        let ctx = ipc_ctx();
+        // SAFETY: `ctx` is this thread's IPC context. Mirrors finish_request's
+        // reply routing without the read (the reactor owns the read).
+        unsafe {
+            if let Some(header) = request_correlation {
+                stamp_completion_correlation(&mut reply, header);
+                let ep = *(&raw const VFS_CALLBACK_EP);
+                if ep != 0 {
+                    let _ = ipc::mp_write_ctx(ctx, ep, &raw const reply);
+                }
+                release_staged_cap(ctx, cap_to_free);
+            } else {
+                let _ = ipc::mp_write_reply_ctx(ctx, self.recv_ep, &raw const reply);
+                release_staged_cap(ctx, cap_to_free);
             }
         }
+        0
     }
-    r.error as i32
-}
 
-fn signal_ready() {
-    let ntfn = trona::caps::readiness_ntfn();
-    let r = syscall(SYS_SIGNAL, ntfn, 1, 0, 0, 0, 0);
-    trona::udebug!(|_lb| {
-        _lb.str(b"[dispdrv] signal_ready ntfn=");
-        _lb.hex(ntfn);
-        _lb.str(b" err=");
-        _lb.hex(r.error);
-        _lb.str(b" value=");
-        _lb.hex(r.value);
-        _lb.str(b"\n");
-    });
+    fn prepare_mp_read(&mut self, _cookie: u64) -> bool {
+        // Recycle the recv-slot arena before the next MP_READ (cap receiving),
+        // mirroring the former finish_request recycle timing.
+        // SAFETY: single-threaded reactor owns RECV_SLOTS.
+        unsafe {
+            (&mut *(&raw mut RECV_SLOTS)).recycle_for_next_recv(ipc_ctx(), CAP_SELF_CSPACE);
+        }
+        true
+    }
+
+    fn rearm_state_source(&mut self, _cookie: u64) -> i32 {
+        trona_kernel::invoke::watch_register(
+            trona_kernel::core_types::CapRef::flat(self.watch_cap),
+            trona_kernel::core_types::CapRef::flat(self.recv_ep),
+            trona_kernel::core_types::CapRef::flat(self.eq_cap),
+            uapi::KERNITE_STATE_READABLE as u64,
+            DISPDRV_SERVICE_COOKIE,
+        )
+    }
+
+    fn handle_overflow(&mut self, _dropped: u64) {}
+
+    fn handle_timer(&mut self, _cookie: u64) {}
 }
 
 fn pack_color(r: u8, g: u8, b: u8, rp: u8, gp: u8, bp: u8) -> u32 {
@@ -264,8 +471,16 @@ fn pack_color(r: u8, g: u8, b: u8, rp: u8, gp: u8, bp: u8) -> u32 {
 }
 
 fn mark_damage(state: &mut DisplayState, y_start: u32, y_end: u32) {
-    let start = if y_start > state.height { state.height } else { y_start };
-    let end = if y_end > state.height { state.height } else { y_end };
+    let start = if y_start > state.height {
+        state.height
+    } else {
+        y_start
+    };
+    let end = if y_end > state.height {
+        state.height
+    } else {
+        y_end
+    };
     if start >= end {
         return;
     }
@@ -288,7 +503,9 @@ fn mark_damage(state: &mut DisplayState, y_start: u32, y_end: u32) {
 
 /// XOR-invert a glyph cell in the shadow buffer for cursor display.
 fn invert_cursor_cell(state: &mut DisplayState, col: u32, row: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let px = col * gw;
@@ -374,7 +591,9 @@ fn repaint_all_cells(state: &mut DisplayState) {
 }
 
 fn flush_damage(state: &mut DisplayState) {
-    if state.shadow.is_null() || state.vram.is_null() { return; }
+    if state.shadow.is_null() || state.vram.is_null() {
+        return;
+    }
     // Erase previously drawn cursor (un-invert)
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
@@ -464,9 +683,7 @@ unsafe fn read_pixel(src: *const u8, bpp_bytes: usize) -> u32 {
     unsafe {
         match bpp_bytes {
             4 => core::ptr::read(src as *const u32),
-            3 => {
-                (*src as u32) | ((*src.add(1) as u32) << 8) | ((*src.add(2) as u32) << 16)
-            }
+            3 => (*src as u32) | ((*src.add(1) as u32) << 8) | ((*src.add(2) as u32) << 16),
             2 => core::ptr::read(src as *const u16) as u32,
             _ => core::ptr::read(src as *const u32),
         }
@@ -504,7 +721,9 @@ fn effective_bg(state: &DisplayState) -> u32 {
 /// Render a glyph's pixels into the shadow buffer without updating the cell buffer.
 /// Used by both `draw_glyph` (normal rendering) and `repaint_all_cells` (DECSCNM).
 fn render_glyph_pixels(state: &mut DisplayState, c: u8, col: u32, row: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let px = col * gw;
@@ -599,12 +818,22 @@ fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
 }
 
 fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let pitch = state.pitch as usize;
     let bpp_bytes = (state.bpp / 8) as usize;
 
-    let x_end = if x + w > state.width { state.width } else { x + w };
-    let y_end = if y + h > state.height { state.height } else { y + h };
+    let x_end = if x + w > state.width {
+        state.width
+    } else {
+        x + w
+    };
+    let y_end = if y + h > state.height {
+        state.height
+    } else {
+        y + h
+    };
 
     if x >= state.width || y >= state.height {
         return;
@@ -625,7 +854,9 @@ fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u3
 }
 
 fn scroll_up_region(state: &mut DisplayState, top: u32, bottom: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let rows = bottom - top;
@@ -670,7 +901,9 @@ fn scroll_up(state: &mut DisplayState) {
 }
 
 fn scroll_down_region(state: &mut DisplayState, top: u32, bottom: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let rows = bottom - top;
@@ -709,14 +942,20 @@ fn scroll_down_region(state: &mut DisplayState, top: u32, bottom: u32) {
 }
 
 fn insert_lines(state: &mut DisplayState, at_row: u32, count: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let max = state.scroll_bottom;
     if at_row >= max {
         return;
     }
-    let count = if at_row + count > max { max - at_row } else { count };
+    let count = if at_row + count > max {
+        max - at_row
+    } else {
+        count
+    };
     let rows_to_move = max - at_row - count;
     if rows_to_move > 0 && count > 0 {
         let src_y = at_row as usize * row_bytes;
@@ -750,14 +989,20 @@ fn insert_lines(state: &mut DisplayState, at_row: u32, count: u32) {
 }
 
 fn delete_lines(state: &mut DisplayState, at_row: u32, count: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gh = font::GLYPH_HEIGHT;
     let row_bytes = gh as usize * state.pitch as usize;
     let max = state.scroll_bottom;
     if at_row >= max {
         return;
     }
-    let count = if at_row + count > max { max - at_row } else { count };
+    let count = if at_row + count > max {
+        max - at_row
+    } else {
+        count
+    };
     let rows_to_move = max - at_row - count;
     if rows_to_move > 0 && count > 0 {
         let src_y = (at_row + count) as usize * row_bytes;
@@ -792,7 +1037,9 @@ fn delete_lines(state: &mut DisplayState, at_row: u32, count: u32) {
 }
 
 fn insert_chars(state: &mut DisplayState, count: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let col = state.text_col;
@@ -801,7 +1048,11 @@ fn insert_chars(state: &mut DisplayState, count: u32) {
     if col >= max_cols {
         return;
     }
-    let count = if col + count > max_cols { max_cols - col } else { count };
+    let count = if col + count > max_cols {
+        max_cols - col
+    } else {
+        count
+    };
     let chars_to_move = max_cols - col - count;
 
     let py = row * gh;
@@ -842,7 +1093,9 @@ fn insert_chars(state: &mut DisplayState, count: u32) {
 }
 
 fn delete_chars(state: &mut DisplayState, count: u32) {
-    if state.shadow.is_null() { return; }
+    if state.shadow.is_null() {
+        return;
+    }
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let col = state.text_col;
@@ -851,7 +1104,11 @@ fn delete_chars(state: &mut DisplayState, count: u32) {
     if col >= max_cols {
         return;
     }
-    let count = if col + count > max_cols { max_cols - col } else { count };
+    let count = if col + count > max_cols {
+        max_cols - col
+    } else {
+        count
+    };
     let chars_to_move = max_cols - col - count;
 
     let py = row * gh;
@@ -900,7 +1157,11 @@ fn erase_chars(state: &mut DisplayState, count: u32) {
     if col >= max_cols {
         return;
     }
-    let count = if col + count > max_cols { max_cols - col } else { count };
+    let count = if col + count > max_cols {
+        max_cols - col
+    } else {
+        count
+    };
     let bg = effective_bg(state);
     let px = col * gw;
     let py = row * gh;
@@ -918,7 +1179,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
     // Lazy-allocate alt buffer
     if state.alt_shadow.is_null() {
         let ptr = unsafe {
-            trona_posix::mm::posix_mmap(
+            trona_runtime::client::mm::mmap(
                 core::ptr::null_mut(),
                 (fb_size + 4095) & !4095u64,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -926,6 +1187,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
                 -1,
                 0,
             )
+            .unwrap_or(usize::MAX as *mut u8)
         };
         if ptr == usize::MAX as *mut u8 || ptr.is_null() {
             return;
@@ -939,7 +1201,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
         let cell_bytes = grid * core::mem::size_of::<Cell>();
         let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
         let ptr = unsafe {
-            trona_posix::mm::posix_mmap(
+            trona_runtime::client::mm::mmap(
                 core::ptr::null_mut(),
                 cell_len,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -947,6 +1209,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
                 -1,
                 0,
             )
+            .unwrap_or(usize::MAX as *mut u8)
         };
         if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
             state.alt_cells = ptr as *mut Cell;
@@ -1081,7 +1344,11 @@ fn terminal_putc(state: &mut DisplayState, c: u8) {
                 col += 1;
             }
         }
-        let next = if next > state.max_cols { state.max_cols } else { next };
+        let next = if next > state.max_cols {
+            state.max_cols
+        } else {
+            next
+        };
         while state.text_col < next {
             draw_glyph(state, b' ', state.text_col, state.text_row);
             state.text_col += 1;
@@ -1122,11 +1389,13 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
     let fb_size = fb.height as u64 * fb.pitch as u64;
     let num_pages = (fb_size + 4095) / 4096;
 
-    let map_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_WRITE_THROUGH;
+    let map_flags = (uapi::KERNITE_PAGE_FLAG_WRITABLE
+        | uapi::KERNITE_PAGE_FLAG_USER
+        | uapi::KERNITE_PAGE_FLAG_NOCACHE) as u64;
 
     let (err, mapped) = invoke::vspace_map_device_range(
-        CAP_SELF_VSPACE,
-        trona::caps::fb_untyped(),
+        trona_kernel::core_types::CapRef::flat(CAP_SELF_VSPACE),
+        trona_runtime::client::caps::fb_untyped().cap_ref(),
         0,
         FB_MAP_VADDR,
         num_pages,
@@ -1134,7 +1403,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
     );
 
     if err != 0 || mapped != num_pages {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[dispdrv] FB batch map failed: err=");
             _lb.hex(err as u64);
             _lb.str(b" mapped=");
@@ -1146,7 +1415,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
         return false;
     }
 
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[dispdrv] Mapped ");
         _lb.hex(num_pages);
         _lb.str(b" FB pages at ");
@@ -1160,7 +1429,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
     let len = (fb_size + 4095) & !4095u64;
     let ptr = unsafe {
-        trona_posix::mm::posix_mmap(
+        trona_runtime::client::mm::mmap(
             core::ptr::null_mut(),
             len,
             0x3,  // PROT_READ | PROT_WRITE
@@ -1168,15 +1437,16 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
             -1,
             0,
         )
+        .unwrap_or(usize::MAX as *mut u8)
     };
     if ptr == usize::MAX as *mut u8 || ptr.is_null() {
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[dispdrv] Shadow buffer posix_mmap failed\n");
         });
         return core::ptr::null_mut();
     }
 
-    trona::udebug!(|_lb| {
+    trona_runtime::udebug!(|_lb| {
         _lb.str(b"[dispdrv] Shadow buffer: ");
         _lb.hex(len / 4096);
         _lb.str(b" pages at ");
@@ -1188,12 +1458,14 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
 }
 
 fn register_with_namesrv() -> bool {
+    const ENTRY_FLAG_BADGE_AS_CALLER: u64 = 1 << 0;
+    const REGISTER_FLAGS_REG: usize = 31;
+
     let mut reg_msg = TronaMsg::zeroed();
     let mut reg_reply = TronaMsg::zeroed();
     let svc_name = b"dispdrv";
-    reg_msg.label = NS_REGISTER;
+    reg_msg.label = NAMESRV_REGISTER;
     reg_msg.regs[0] = svc_name.len() as u64;
-    reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
     let ns_dst = &raw mut reg_msg.regs[1] as *mut u8;
     // SAFETY: Writing name bytes into message register area.
     unsafe {
@@ -1201,22 +1473,32 @@ fn register_with_namesrv() -> bool {
             *ns_dst.add(i) = svc_name[i];
         }
     }
+    reg_msg.regs[REGISTER_FLAGS_REG] = ENTRY_FLAG_BADGE_AS_CALLER;
+    reg_msg.length = (REGISTER_FLAGS_REG + 1) as u64;
 
+    let Some(publish_tc) = trona_runtime::client::caps::service_client_ep_for_transfer() else {
+        trona_runtime::uerror!(|_lb| {
+            _lb.str(b"[dispdrv] No service client ep to publish\n");
+        });
+        return false;
+    };
     unsafe {
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
-        let err = ipc::call_ctx(
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, publish_tc.slot());
+        let err = ipc::mp_call_ctx(
             ipc_ctx(),
-            trona::caps::namesrv_ep(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
             &raw const reg_msg,
             &raw mut reg_reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
+        drop(publish_tc);
         if err == 0 && reg_reply.label == TRONA_OK {
-            trona::uinfo!(|_lb| {
+            trona_runtime::uinfo!(|_lb| {
                 _lb.str(b"[dispdrv] registered with namesrv\n");
             });
             return true;
         }
-        trona::uerror!(|_lb| {
+        trona_runtime::uerror!(|_lb| {
             _lb.str(b"[dispdrv] namesrv register failed: err=");
             _lb.hex(err as u64);
             _lb.str(b" label=");
@@ -1302,8 +1584,11 @@ fn handle_write_text(state: &mut DisplayState, msg: &TronaMsg, reply: &mut Trona
 
 /// Drain all available bytes from the SHM terminal ring and process through VT100.
 fn drain_terminal_ring(state: &mut DisplayState) {
-    if state.term_ring_base.is_null() { return; }
-    // Undraw cursor before processing (same as handle_terminal_write)
+    if state.term_ring_base.is_null() {
+        return;
+    }
+    // Undraw cursor before processing so a stale cursor glyph is not
+    // left behind at the previous location while we push new bytes.
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1312,7 +1597,9 @@ fn drain_terminal_ring(state: &mut DisplayState) {
     // SAFETY: SHM is mapped and ring header is at base.
     unsafe {
         let ring_size = core::ptr::read_volatile(base.add(8) as *const u32) as usize;
-        if ring_size == 0 { return; }
+        if ring_size == 0 {
+            return;
+        }
         let mut buf = [0u8; 256];
         loop {
             let head = core::ptr::read_volatile(base as *const u32) as usize;
@@ -1321,7 +1608,9 @@ fn drain_terminal_ring(state: &mut DisplayState) {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let tail = core::ptr::read_volatile(base.add(4) as *const u32) as usize;
             let available = (head + ring_size - tail) % ring_size;
-            if available == 0 { break; }
+            if available == 0 {
+                break;
+            }
             let count = core::cmp::min(available, buf.len());
             let dp = base.add(TERM_RING_HDR_SIZE);
             let mut i = 0usize;
@@ -1332,10 +1621,7 @@ fn drain_terminal_ring(state: &mut DisplayState) {
             // Release: all data reads above complete before the tail update
             // that publishes free space to the producer.
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::write_volatile(
-                base.add(4) as *mut u32,
-                ((tail + count) % ring_size) as u32,
-            );
+            core::ptr::write_volatile(base.add(4) as *mut u32, ((tail + count) % ring_size) as u32);
             for i in 0..count {
                 vt100::process_byte(state, buf[i]);
             }
@@ -1343,84 +1629,186 @@ fn drain_terminal_ring(state: &mut DisplayState) {
     }
 }
 
-/// Handle DISPLAY_SETUP_RING: bind notification, map SHM ring buffer.
+/// Handle DISPLAY_SETUP_RING: map the caller's SHM as the terminal ring.
+/// Producers kick the display service endpoint with DISPLAY_PRESENT after
+/// publishing bytes.
 fn handle_setup_ring(state: &mut DisplayState, msg: &TronaMsg, reply: &mut TronaMsg) {
     let shm_id = msg.regs[0];
 
-    // Notification cap was transferred via extra_caps into CAP_RING_NTFN.
-    // Bind it to our TCB so signals wake us from recv.
-    let bind_err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RING_NTFN);
-    if bind_err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[dispdrv] ring: bind notification failed err=");
-            _lb.dec(bind_err as u64);
-            _lb.str(b"\n");
-        });
-        reply.label = TRONA_INVALID_OPERATION;
+    if state.term_ring_active && !state.term_ring_base.is_null() {
+        if state.term_ring_shm_id == shm_id {
+            // The producer can replay setup after observing a stale
+            // readiness signal. Treat it as idempotent so mmsrv is not
+            // asked to map over the existing fixed ring VA.
+            reply.label = TRONA_OK;
+            reply.regs[0] = 0;
+            reply.length = 1;
+        } else {
+            reply.label = TRONA_BUSY;
+        }
         return;
     }
 
-    // Map SHM (RW — we need to update the tail pointer).
-    let mut map_msg = TronaMsg::zeroed();
-    map_msg.label = MM_SHM_MAP;
-    map_msg.regs[0] = shm_id;
-    map_msg.regs[1] = 0; // map into self
-    map_msg.regs[2] = TERM_RING_VADDR;
-    map_msg.regs[3] = 0x3; // RW
-    map_msg.length = 4;
-    let mut map_reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; nested call to mmsrv during handler.
-    let map_err = unsafe {
-        ipc::call_ctx(
-            ipc_ctx(),
-            trona::caps::mmsrv_ep(),
-            &raw const map_msg,
-            &raw mut map_reply,
-        )
+    // The producer created the ring under a well-known name; create-by-name
+    // returns the same MO (with our own cap) so we can map it RW at the fixed
+    // ring VA (we update the tail pointer). `shm_map` consumes the cap, so the
+    // local slot is freed afterward.
+    let bytes = TERM_RING_PAGES * 4096;
+    let (shm_idx, shm_cap) = match trona_runtime::client::mm::shm_create(shm_id, bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] ring: SHM create-existing failed\n");
+            });
+            reply.label = TRONA_INVALID_OPERATION;
+            return;
+        }
     };
-    if map_err != 0 || map_reply.label != TRONA_OK {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[dispdrv] ring: SHM map failed err=");
-            _lb.dec(if map_err != 0 { map_err as u64 } else { map_reply.label });
-            _lb.str(b"\n");
-        });
-        reply.label = TRONA_INVALID_OPERATION;
-        return;
-    }
+    // mmsrv auto-places the consumer's mapping in its mmap window; the ring
+    // is position-independent, so use the returned VA as the base.
+    let map_res =
+        trona_runtime::client::mm::shm_map(shm_idx, shm_cap.into_transfer(), 0, bytes, 0x3);
+    let ring_va = match map_res {
+        Ok(va) => va,
+        Err(_) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] ring: SHM map failed\n");
+            });
+            reply.label = TRONA_INVALID_OPERATION;
+            return;
+        }
+    };
 
-    state.term_ring_base = TERM_RING_VADDR as *mut u8;
+    state.term_ring_base = ring_va as *mut u8;
+    state.term_ring_shm_id = shm_id;
     state.term_ring_active = true;
+
     reply.label = TRONA_OK;
-    trona::uinfo!(|_lb| {
+    reply.regs[0] = 0; // bit index: terminal ring = bit 0
+    reply.length = 1;
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[dispdrv] Terminal ring buffer active\n");
     });
 }
 
-fn handle_terminal_write(state: &mut DisplayState, msg: &TronaMsg) {
+/// Drain all available bytes from the console SHM ring and process through VT100.
+fn drain_console_ring(state: &mut DisplayState) {
+    if state.console_ring_base.is_null() {
+        return;
+    }
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
     }
-
-    let data_len = msg.regs[0] as usize;
-    let text_ptr = &msg.regs[1] as *const u64 as *const u8;
-    let max_bytes = if data_len > 152 { 152 } else { data_len };
-
-    for i in 0..max_bytes {
-        // SAFETY: Reading text bytes from message registers, bounded by max_bytes.
-        let c = unsafe { *text_ptr.add(i) };
-        vt100::process_byte(state, c);
+    let base = state.console_ring_base;
+    // SAFETY: SHM is mapped and ring header is at base.
+    unsafe {
+        let ring_size = core::ptr::read_volatile(base.add(8) as *const u32) as usize;
+        if ring_size == 0 {
+            return;
+        }
+        let mut buf = [0u8; 256];
+        loop {
+            let head = core::ptr::read_volatile(base as *const u32) as usize;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            let tail = core::ptr::read_volatile(base.add(4) as *const u32) as usize;
+            let available = (head + ring_size - tail) % ring_size;
+            if available == 0 {
+                break;
+            }
+            let count = core::cmp::min(available, buf.len());
+            let dp = base.add(CONSOLE_RING_HDR_SIZE);
+            let mut i = 0usize;
+            while i < count {
+                buf[i] = core::ptr::read_volatile(dp.add((tail + i) % ring_size));
+                i += 1;
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(base.add(4) as *mut u32, ((tail + count) % ring_size) as u32);
+            for i in 0..count {
+                vt100::process_byte(state, buf[i]);
+            }
+        }
     }
 }
 
+/// Handle DISPLAY_SETUP_CONSOLE_RING: map the caller's SHM as the
+/// console display ring. Producers kick the display service endpoint
+/// with DISPLAY_PRESENT after publishing bytes.
+fn handle_setup_console_ring(state: &mut DisplayState, msg: &TronaMsg, reply: &mut TronaMsg) {
+    let shm_id = msg.regs[0];
+
+    if state.console_ring_active && !state.console_ring_base.is_null() {
+        if state.console_ring_shm_id == shm_id {
+            reply.label = TRONA_OK;
+            reply.regs[0] = 1;
+            reply.length = 1;
+        } else {
+            reply.label = TRONA_BUSY;
+        }
+        return;
+    }
+
+    // Create-by-name to obtain our own cap to the producer's SHM, then map it
+    // RW at the fixed console ring VA (we update the tail pointer). `shm_map`
+    // consumes the cap, so the local slot is freed afterward.
+    let bytes = CONSOLE_RING_PAGES * 4096;
+    let (shm_idx, shm_cap) = match trona_runtime::client::mm::shm_create(shm_id, bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] console ring: SHM create-existing failed\n");
+            });
+            reply.label = TRONA_INVALID_OPERATION;
+            return;
+        }
+    };
+    // Position-independent consumer mapping: use the returned VA as the base.
+    let map_res =
+        trona_runtime::client::mm::shm_map(shm_idx, shm_cap.into_transfer(), 0, bytes, 0x3);
+    let ring_va = match map_res {
+        Ok(va) => va,
+        Err(_) => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] console ring: SHM map failed\n");
+            });
+            reply.label = TRONA_INVALID_OPERATION;
+            return;
+        }
+    };
+
+    state.console_ring_base = ring_va as *mut u8;
+    state.console_ring_shm_id = shm_id;
+    state.console_ring_active = true;
+
+    reply.label = TRONA_OK;
+    reply.regs[0] = 1; // bit index: console display ring = bit 1
+    reply.length = 1;
+    trona_runtime::uinfo!(|_lb| {
+        _lb.str(b"[dispdrv] Console ring buffer active\n");
+    });
+}
+
 fn handle_present(state: &mut DisplayState, reply: &mut TronaMsg) {
+    let mut drained_any = false;
+    if state.term_ring_active {
+        drain_terminal_ring(state);
+        drained_any = true;
+    }
+    if state.console_ring_active {
+        drain_console_ring(state);
+        drained_any = true;
+    }
+    if drained_any {
+        flush_damage(state);
+    }
     flush_damage(state);
     reply.label = TRONA_OK;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[dispdrv] Display server starting\n");
     });
 
@@ -1451,11 +1839,15 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         fb_green_size = fb.green_size;
         fb_blue_size = fb.blue_size;
 
-        trona::uinfo!(|_lb| {
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[dispdrv] FB: ");
-            _lb.dec(fb.width as u64); _lb.str(b"x"); _lb.dec(fb.height as u64);
-            _lb.str(b" bpp="); _lb.dec(fb.bpp as u64);
-            _lb.str(b" pitch="); _lb.dec(fb.pitch as u64);
+            _lb.dec(fb.width as u64);
+            _lb.str(b"x");
+            _lb.dec(fb.height as u64);
+            _lb.str(b" bpp=");
+            _lb.dec(fb.bpp as u64);
+            _lb.str(b" pitch=");
+            _lb.dec(fb.pitch as u64);
             _lb.str(b"\n");
         });
 
@@ -1468,7 +1860,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 // SAFETY: Both VRAM and shadow are mapped with sufficient size.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        vram_ptr as *const u8, shadow_ptr, fb_size as usize,
+                        vram_ptr as *const u8,
+                        shadow_ptr,
+                        fb_size as usize,
                     );
                 }
             }
@@ -1476,22 +1870,40 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
 
     if fb.is_none() {
-        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] No framebuffer detected, running degraded\n"); });
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[dispdrv] No framebuffer detected, running degraded\n");
+        });
     } else if vram_ptr.is_null() {
-        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] Framebuffer mapping failed, running degraded\n"); });
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[dispdrv] Framebuffer mapping failed, running degraded\n");
+        });
     } else if shadow_ptr.is_null() {
-        trona::uwarn!(|_lb| { _lb.str(b"[dispdrv] Shadow buffer allocation failed, running degraded\n"); });
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[dispdrv] Shadow buffer allocation failed, running degraded\n");
+        });
     }
 
     let fg_val = if !shadow_ptr.is_null() {
         pack_color(0xCC, 0xCC, 0xCC, fb_red_pos, fb_green_pos, fb_blue_pos)
-    } else { 0 };
+    } else {
+        0
+    };
     let bg_val = if !shadow_ptr.is_null() {
         pack_color(0x00, 0x00, 0x00, fb_red_pos, fb_green_pos, fb_blue_pos)
-    } else { 0 };
+    } else {
+        0
+    };
 
-    let max_cols = if fb_width > 0 { fb_width / font::GLYPH_WIDTH } else { 0 };
-    let max_rows = if fb_height > 0 { fb_height / font::GLYPH_HEIGHT } else { 0 };
+    let max_cols = if fb_width > 0 {
+        fb_width / font::GLYPH_WIDTH
+    } else {
+        0
+    };
+    let max_rows = if fb_height > 0 {
+        fb_height / font::GLYPH_HEIGHT
+    } else {
+        0
+    };
 
     let mut default_tabs: u128 = 0;
     {
@@ -1545,7 +1957,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         damage_max_y: 0,
         damage_rows: [0; DAMAGE_WORDS],
         term_ring_base: core::ptr::null_mut(),
+        term_ring_shm_id: 0,
         term_ring_active: false,
+        console_ring_base: core::ptr::null_mut(),
+        console_ring_shm_id: 0,
+        console_ring_active: false,
         alt_shadow: core::ptr::null_mut(),
         alt_active: false,
         primary_col: 0,
@@ -1579,8 +1995,15 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     };
 
     if !vram_ptr.is_null() && !shadow_ptr.is_null() {
-        syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
-        trona::uinfo!(|_lb| {
+        trona_kernel::syscall::invoke(
+            trona_runtime::client::caps::kernel_debug_cap().addr(),
+            uapi::KERNITE_INV_KDEBUG_CONSOLE_CONTROL as u64,
+            0,
+            0,
+            0,
+            0,
+        );
+        trona_runtime::uinfo!(|_lb| {
             _lb.str(b"[dispdrv] Kernel console disabled, display server owns FB\n");
         });
 
@@ -1589,20 +2012,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             let cell_bytes = grid * core::mem::size_of::<Cell>();
             let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
             let ptr = unsafe {
-                trona_posix::mm::posix_mmap(
-                    core::ptr::null_mut(),
-                    cell_len,
-                    0x3,
-                    0x22,
-                    -1,
-                    0,
-                )
+                trona_runtime::client::mm::mmap(core::ptr::null_mut(), cell_len, 0x3, 0x22, -1, 0)
+                    .unwrap_or(usize::MAX as *mut u8)
             };
             if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
                 state.cells = ptr as *mut Cell;
                 for i in 0..grid {
                     // SAFETY: Just-allocated buffer, i < grid.
-                    unsafe { *state.cells.add(i) = Cell::blank(fg_val, bg_val); }
+                    unsafe {
+                        *state.cells.add(i) = Cell::blank(fg_val, bg_val);
+                    }
                 }
             }
         }
@@ -1614,156 +2033,74 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         flush_damage(&mut state);
     }
 
+    unsafe {
+        let allocator = trona_server::recv_slot::SlotAllocator {
+            alloc_consecutive: trona_runtime::core::slot_alloc::slot_alloc_consecutive_cb,
+            invoke_depth: trona_runtime::core::slot_alloc::slot_invoke_depth_cb,
+        };
+        let arena = &mut *(&raw mut RECV_SLOTS);
+        if !arena.init_with_allocator(allocator, RECV_SLOT_COUNT) {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] FATAL: recv-slot arena allocation failed\n");
+            });
+            return -1;
+        }
+        arena.arm_first(ipc_ctx(), CAP_SELF_CSPACE);
+    }
+
     register_with_namesrv();
 
-    signal_ready();
-    trona::uinfo!(|_lb| {
+    trona_runtime::uinfo!(|_lb| {
         _lb.str(b"[dispdrv] Ready, entering server loop\n");
     });
 
-    // IPC server loop
-    let mut msg = TronaMsg::zeroed();
-    let mut badge: u64 = 0;
-
-    // Pre-configure receive slot for DISPLAY_SETUP_RING cap transfer.
-    // When posix_ttysrv sends the ring notification cap, it lands at CAP_RING_NTFN.
-    // SAFETY: IPC context is valid.
-    unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RING_NTFN, 0);
-    }
-
-    let err = unsafe {
-        ipc::recv_ctx(
-            ipc_ctx(),
-            trona::caps::service_ep(),
-            &raw mut msg,
-            &raw mut badge,
-        )
-    };
-    if err != 0 {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[dispdrv] initial recv failed err=");
-            _lb.hex(err as u64);
-            _lb.str(b"\n");
-        });
-        idle();
-    }
-
-    loop {
-        // SHM ring notification: posix_ttysrv wrote terminal data to shared memory.
-        // Drain the ring, process VT100 bytes, flush damage, then recv next.
-        if badge != 0 && msg.label == 0 && msg.length == 0 {
-            if state.term_ring_active {
-                drain_terminal_ring(&mut state);
-                flush_damage(&mut state);
-            }
-            let err = unsafe {
-                ipc::recv_ctx(
-                    ipc_ctx(),
-                    trona::caps::service_ep(),
-                    &raw mut msg,
-                    &raw mut badge,
-                )
-            };
-            if err != 0 {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[dispdrv] recv failed after ring drain\n");
-                });
-                break;
-            }
-            continue;
-        }
-
-        if msg.label == DISPLAY_TERMINAL_WRITE {
-            loop {
-                handle_terminal_write(&mut state, &msg);
-
-                let timed_err = unsafe {
-                    recv_timed_ctx(
-                        ipc_ctx(),
-                        trona::caps::service_ep(),
-                        TERMINAL_BATCH_TIMEOUT_NS,
-                        &raw mut msg,
-                        &raw mut badge,
-                    )
-                };
-
-                if timed_err != 0 {
-                    flush_damage(&mut state);
-                    let err = unsafe {
-                        ipc::recv_ctx(
-                            ipc_ctx(),
-                            trona::caps::service_ep(),
-                            &raw mut msg,
-                            &raw mut badge,
-                        )
-                    };
-                    if err != 0 {
-                        trona::uerror!(|_lb| {
-                            _lb.str(b"[dispdrv] recv failed err=");
-                            _lb.hex(err as u64);
-                            _lb.str(b"\n");
-                        });
-                        break;
-                    }
-                    break;
-                }
-
-                if msg.label != DISPLAY_TERMINAL_WRITE {
-                    flush_damage(&mut state);
-                    break;
-                }
-            }
-
-            continue;
-        }
-
-        let mut reply = TronaMsg::zeroed();
-
-        match msg.label {
-            DISPLAY_GET_INFO => {
-                handle_get_info(&state, &mut reply);
-            }
-            DISPLAY_PRESENT => {
-                handle_present(&mut state, &mut reply);
-            }
-            DISPLAY_FILL_RECT => {
-                handle_fill_rect(&mut state, &msg, &mut reply);
-            }
-            DISPLAY_WRITE_TEXT => {
-                handle_write_text(&mut state, &msg, &mut reply);
-            }
-            DISPLAY_TERMINAL_WRITE => {
-                handle_terminal_write(&mut state, &msg);
-                flush_damage(&mut state);
-                reply.label = TRONA_OK;
-            }
-            DISPLAY_SETUP_RING => {
-                handle_setup_ring(&mut state, &msg, &mut reply);
-            }
-            _ => {
-                reply.label = TRONA_INVALID_OPERATION;
-            }
-        }
-
-        let err = unsafe {
-            ipc::reply_recv_ctx(
-                ipc_ctx(),
-                trona::caps::service_ep(),
-                &raw const reply,
-                &raw mut msg,
-                &raw mut badge,
-            )
-        };
-        if err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[dispdrv] reply_recv failed err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
+    // Single-source EventLoop reactor on the service pipe. `dispatch_state`
+    // preserves the former finish_request reply routing (VFS callback EP for
+    // correlated requests, service pipe otherwise); the recv-slot arena
+    // (armed above) is recycled in `prepare_mp_read`. Replaces the former
+    // mp_write_reply_read loop, which spun on WOULD_BLOCK once MP_READ became
+    // non-blocking.
+    let ctx = ipc_ctx();
+    let recv_ep = trona_runtime::client::caps::service_recv_ep().addr();
+    let eq =
+        trona_runtime::core::slot_alloc::rsrc_alloc_object(uapi::KERNITE_OBJ_EVENT_QUEUE as u64, 4);
+    let watch =
+        trona_runtime::core::slot_alloc::rsrc_alloc_object(uapi::KERNITE_OBJ_WATCH as u64, 0);
+    let (eq, watch) = match (eq, watch) {
+        (Some(eq), Some(watch)) => (eq, watch),
+        _ => {
+            trona_runtime::uerror!(|_lb| {
+                _lb.str(b"[dispdrv] reactor EventQueue/Watch alloc failed\n");
             });
-            break;
+            idle();
+        }
+    };
+    let eq_cap = eq.borrow().addr();
+    let watch_cap = watch.borrow().addr();
+    let _ = trona_kernel::invoke::watch_register(
+        trona_kernel::core_types::CapRef::flat(watch_cap),
+        trona_kernel::core_types::CapRef::flat(recv_ep),
+        trona_kernel::core_types::CapRef::flat(eq_cap),
+        uapi::KERNITE_STATE_READABLE as u64,
+        DISPDRV_SERVICE_COOKIE,
+    );
+    core::mem::forget(eq);
+    core::mem::forget(watch);
+    let mut reactor = trona_server::event_loop::EventLoop::new(
+        eq_cap,
+        DispdrvDispatcher {
+            recv_ep,
+            watch_cap,
+            eq_cap,
+            state: &raw mut state,
+        },
+    );
+    loop {
+        // SAFETY: `ctx` is this thread's IPC context; block on the EQ and
+        // dispatch one ready event (recv-slot recycle happens in
+        // prepare_mp_read).
+        unsafe {
+            let _ = reactor.run_iteration(ctx);
         }
     }
-
-    idle();
 }

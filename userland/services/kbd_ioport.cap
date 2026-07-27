@@ -1,0 +1,5 @@
+[Unit]
+Name=kbd_ioport.cap
+
+[Capability]
+SourceSlot=22

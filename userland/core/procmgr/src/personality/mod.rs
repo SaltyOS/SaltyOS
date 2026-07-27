@@ -4,10 +4,13 @@
 pub(crate) mod posix;
 mod win32;
 
-use trona::ipc;
-use trona::types::core::{Cap, TronaMsg};
+use trona_kernel::core_types::{Cap, TronaMsg};
+use trona_kernel::ipc;
 
-use crate::base::proc_table::{SUBSYS_POSIX, SUBSYS_WIN32};
+use crate::base::proc_table::{
+    COMPLETION_EVENT_CONTINUED, COMPLETION_EVENT_EXITED, COMPLETION_EVENT_STOPPED, SUBSYS_POSIX,
+    SUBSYS_WIN32,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -36,6 +39,7 @@ pub struct PersonalityOps {
     pub pre_teardown: unsafe fn(PersonalityKind, u64),
     pub post_teardown: unsafe fn(PersonalityKind, u64),
     pub register_provider_cap: unsafe fn(PersonalityKind, Cap) -> Result<(), ()>,
+    pub observes_completion_event: fn(PersonalityKind, u8) -> bool,
 }
 
 unsafe fn install_bootstrap_cap_builtin(
@@ -63,8 +67,8 @@ unsafe fn install_bootstrap_cap_external(
             return false;
         }
 
-        let _ = trona::invoke::cnode_delete(child_cn, dst_slot);
-        trona::invoke::cnode_mint(
+        let _ = trona_kernel::invoke::cnode_delete(child_cn, dst_slot);
+        trona_kernel::invoke::cnode_mint(
             crate::CAP_SELF_CSPACE,
             provider_cap,
             child_cn,
@@ -86,13 +90,13 @@ unsafe fn register_vfs_client_win32(kind: PersonalityKind, pid: u32) -> bool {
 
         let mut vfs_msg = TronaMsg::zeroed();
         let mut vfs_reply = TronaMsg::zeroed();
-        vfs_msg.label = trona::protocol::VFS_CLIENT_REGISTER;
+        vfs_msg.label = trona_protocol::vfs::public::VFS_CLIENT_REGISTER;
         vfs_msg.length = 2;
         vfs_msg.regs[0] = pid as u64;
         vfs_msg.regs[1] = vfs_subsystem_id as u64;
         let err = ipc::call_ctx(
             crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
+            crate::base::cap_helpers::vfs_provider_ep(),
             &raw const vfs_msg,
             &raw mut vfs_reply,
         );
@@ -103,26 +107,12 @@ unsafe fn register_vfs_client_win32(kind: PersonalityKind, pid: u32) -> bool {
 unsafe fn pre_teardown_common(_kind: PersonalityKind, _badge: u64) {}
 
 unsafe fn post_teardown_common(_kind: PersonalityKind, badge: u64) {
-    unsafe {
-        let mut vfs_msg = TronaMsg::zeroed();
-        vfs_msg.label = trona::protocol::VFS_CLIENT_EXIT;
-        vfs_msg.length = 1;
-        vfs_msg.regs[0] = badge;
-        let err = ipc::send_timed_ctx(
-            crate::ipc_ctx(),
-            trona::caps::vfs_ep(),
-            &raw const vfs_msg,
-            50_000_000,
-        );
-        if err != 0 {
-            trona::uwarn!(|_lb| {
-                _lb.str(b"[PROCMGR] VFS client-exit timed out badge=");
-                _lb.hex(badge);
-                _lb.str(b" err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
-            });
-        }
+    if !crate::base::vfs_notify::enqueue_client_exit(badge) {
+        trona_runtime::uwarn!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS client-exit queue full badge=");
+            _lb.hex(badge);
+            _lb.str(b"\n");
+        });
     }
 }
 
@@ -130,11 +120,22 @@ unsafe fn register_provider_cap_builtin(_kind: PersonalityKind, _cap: Cap) -> Re
     Err(())
 }
 
+fn observes_completion_event_posix(_kind: PersonalityKind, event_kind: u8) -> bool {
+    matches!(
+        event_kind,
+        COMPLETION_EVENT_EXITED | COMPLETION_EVENT_STOPPED | COMPLETION_EVENT_CONTINUED
+    )
+}
+
+fn observes_completion_event_win32(_kind: PersonalityKind, event_kind: u8) -> bool {
+    matches!(event_kind, COMPLETION_EVENT_EXITED)
+}
+
 unsafe fn register_provider_cap_external(kind: PersonalityKind, cap: Cap) -> Result<(), ()> {
     unsafe {
         let slot = &raw mut PROVIDER_CAPS[kind.index()];
         if *slot != 0 {
-            trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, *slot);
+            trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, *slot);
             (&mut *(&raw mut crate::ALLOCATOR)).free_single_slot(*slot);
         }
         *slot = cap;
@@ -148,6 +149,7 @@ static POSIX_OPS: PersonalityOps = PersonalityOps {
     pre_teardown: pre_teardown_common,
     post_teardown: post_teardown_common,
     register_provider_cap: register_provider_cap_builtin,
+    observes_completion_event: observes_completion_event_posix,
 };
 
 static WIN32_OPS: PersonalityOps = PersonalityOps {
@@ -156,6 +158,7 @@ static WIN32_OPS: PersonalityOps = PersonalityOps {
     pre_teardown: pre_teardown_common,
     post_teardown: post_teardown_common,
     register_provider_cap: register_provider_cap_external,
+    observes_completion_event: observes_completion_event_win32,
 };
 
 static DESCRIPTORS: [PersonalityDescriptor; 2] = [
@@ -229,6 +232,10 @@ impl PersonalityKind {
         unsafe { (self.descriptor().ops.register_provider_cap)(self, cap) }
     }
 
+    pub fn observes_completion_event(self, event_kind: u8) -> bool {
+        (self.descriptor().ops.observes_completion_event)(self, event_kind)
+    }
+
     pub unsafe fn prepare_runtime(
         self,
         pid: u32,
@@ -255,21 +262,21 @@ pub unsafe fn handle_register_provider(msg: &TronaMsg, reply: &mut TronaMsg) {
             }
         };
 
-        let err = trona::invoke::cnode_move(
+        let err = trona_kernel::invoke::cnode_move(
             crate::CAP_SELF_CSPACE,
             perm,
             crate::CAP_SELF_CSPACE,
             scratch,
         );
         if err != 0 {
-            let _ = trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, scratch);
+            let _ = trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, scratch);
             (&mut *(&raw mut crate::ALLOCATOR)).free_single_slot(perm);
-            reply.label = trona::TRONA_INVALID_CAPABILITY;
+            reply.label = trona_protocol::posix::TRONA_INVALID_CAPABILITY;
             return;
         }
 
         if kind.register_provider_cap(perm).is_err() {
-            trona::invoke::cnode_delete(crate::CAP_SELF_CSPACE, perm);
+            trona_kernel::invoke::cnode_delete(crate::CAP_SELF_CSPACE, perm);
             (&mut *(&raw mut crate::ALLOCATOR)).free_single_slot(perm);
             reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
